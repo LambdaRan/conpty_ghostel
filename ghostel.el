@@ -70,6 +70,13 @@
   :type 'boolean
   :group 'ghostel)
 
+(defcustom ghostel-exit-functions nil
+  "Hook run when the terminal process exits.
+Each function is called with two arguments: the buffer and the
+exit event string."
+  :type 'hook
+  :group 'ghostel)
+
 (defcustom ghostel-keymap-exceptions
   '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
@@ -801,21 +808,23 @@ PROCESS is the shell process, OUTPUT is the raw byte string."
         ;; Schedule redraw
         (ghostel--invalidate)))))
 
-(defun ghostel--sentinel (process _event)
+(defun ghostel--sentinel (process event)
   "Process sentinel: clean up when shell exits.
-PROCESS is the shell process."
-  (when (buffer-live-p (process-buffer process))
-    (with-current-buffer (process-buffer process)
-      (when ghostel--redraw-timer
-        (cancel-timer ghostel--redraw-timer)
-        (setq ghostel--redraw-timer nil))
-      (remove-hook 'focus-in-hook #'ghostel--focus-in)
-      (remove-hook 'focus-out-hook #'ghostel--focus-out)
-      (if ghostel-kill-buffer-on-exit
-          (kill-buffer (process-buffer process))
-        (let ((inhibit-read-only t))
-          (goto-char (point-max))
-          (insert "\n[Process exited]\n"))))))
+PROCESS is the shell process, EVENT describes the state change."
+  (let ((buf (process-buffer process)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when ghostel--redraw-timer
+          (cancel-timer ghostel--redraw-timer)
+          (setq ghostel--redraw-timer nil))
+        (remove-hook 'focus-in-hook #'ghostel--focus-in)
+        (remove-hook 'focus-out-hook #'ghostel--focus-out)
+        (run-hook-with-args 'ghostel-exit-functions buf event)
+        (if ghostel-kill-buffer-on-exit
+            (kill-buffer buf)
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (insert "\n[Process exited]\n")))))))
 
 (defun ghostel--start-process ()
   "Start the shell process with a PTY."
