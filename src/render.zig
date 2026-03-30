@@ -332,118 +332,118 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         return;
     }
 
-    // Check dirty state
+    // Check dirty state — cells are only redrawn when dirty, but cursor
+    // positioning always runs so that cursor-only movements are visible.
     var dirty: c_int = gt.DIRTY_FALSE;
-    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty)) != gt.SUCCESS) {
-        return;
-    }
-    if (dirty == gt.DIRTY_FALSE) return;
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty));
 
-    // Get default colors
-    var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
-    var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
-    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
-    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
+    if (dirty != gt.DIRTY_FALSE) {
+        // Get default colors
+        var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
+        var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
+        _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
+        _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
 
-    // Set buffer default face
-    var fg_hex: [7]u8 = undefined;
-    var bg_hex: [7]u8 = undefined;
-    _ = env.call2(
-        env.intern("ghostel--set-buffer-face"),
-        env.makeString(formatColor(default_fg, &fg_hex)),
-        env.makeString(formatColor(default_bg, &bg_hex)),
-    );
+        // Set buffer default face
+        var fg_hex: [7]u8 = undefined;
+        var bg_hex: [7]u8 = undefined;
+        _ = env.call2(
+            env.intern("ghostel--set-buffer-face"),
+            env.makeString(formatColor(default_fg, &fg_hex)),
+            env.makeString(formatColor(default_bg, &bg_hex)),
+        );
 
-    // Get row iterator
-    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
-        return;
-    }
-
-    // Incremental redraw: only update dirty rows when possible.
-    const partial = (dirty == gt.DIRTY_PARTIAL);
-    if (!partial) {
-        _ = env.call0(env.intern("erase-buffer"));
-    }
-
-    // Shared buffers for row content
-    var runs: [512]RunInfo = undefined;
-    var text_buf: [16384]u8 = undefined;
-
-    var row_count: usize = 0;
-    var prev_wrapped: bool = false;
-    while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
-        if (partial) {
-            // Only process dirty rows
-            var row_dirty: bool = false;
-            _ = gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_DIRTY, @ptrCast(&row_dirty));
-            if (!row_dirty) {
-                row_count += 1;
-                // Still need to track wrap state for next row
-                prev_wrapped = isRowWrapped(term);
-                continue;
-            }
+        // Get row iterator
+        if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+            return;
         }
 
-        // Get cells for this row
-        if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
-            row_count += 1;
-            prev_wrapped = false;
-            continue;
+        // Incremental redraw: only update dirty rows when possible.
+        const partial = (dirty == gt.DIRTY_PARTIAL);
+        if (!partial) {
+            _ = env.call0(env.intern("erase-buffer"));
         }
 
-        if (partial) {
-            // Navigate to this row and clear its content
-            _ = env.call1(env.intern("goto-char"), env.makeInteger(1));
-            const moved = env.extractInteger(
-                env.call1(env.intern("forward-line"), env.makeInteger(@as(i64, @intCast(row_count)))),
-            );
-            if (moved != 0) {
-                // Row doesn't exist yet — fall through to append
-                _ = env.call1(env.intern("goto-char"), env.call0(env.intern("point-max")));
-                _ = env.call1(env.intern("insert"), env.makeString("\n"));
-            } else {
-                _ = env.call2(
-                    env.intern("delete-region"),
-                    env.call0(env.intern("point")),
-                    env.call0(env.intern("line-end-position")),
-                );
-            }
-            // Clear per-row dirty flag
-            const row_clean: bool = false;
-            _ = gt.c.ghostty_render_state_row_set(term.row_iterator, gt.RS_ROW_OPT_DIRTY, @ptrCast(&row_clean));
-        } else {
-            // Full redraw: insert newline between rows
-            if (row_count > 0) {
-                const nl_start = env.call0(env.intern("point"));
-                _ = env.call1(env.intern("insert"), env.makeString("\n"));
-                // Mark newlines from soft-wrapped rows so copy mode can filter them
-                if (prev_wrapped) {
-                    _ = env.call4(
-                        env.intern("put-text-property"),
-                        nl_start,
-                        env.call0(env.intern("point")),
-                        env.intern("ghostel-wrap"),
-                        env.t(),
-                    );
+        // Shared buffers for row content
+        var runs: [512]RunInfo = undefined;
+        var text_buf: [16384]u8 = undefined;
+
+        var row_count: usize = 0;
+        var prev_wrapped: bool = false;
+        while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+            if (partial) {
+                // Only process dirty rows
+                var row_dirty: bool = false;
+                _ = gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_DIRTY, @ptrCast(&row_dirty));
+                if (!row_dirty) {
+                    row_count += 1;
+                    // Still need to track wrap state for next row
+                    prev_wrapped = isRowWrapped(term);
+                    continue;
                 }
             }
+
+            // Get cells for this row
+            if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+                row_count += 1;
+                prev_wrapped = false;
+                continue;
+            }
+
+            if (partial) {
+                // Navigate to this row and clear its content
+                _ = env.call1(env.intern("goto-char"), env.makeInteger(1));
+                const moved = env.extractInteger(
+                    env.call1(env.intern("forward-line"), env.makeInteger(@as(i64, @intCast(row_count)))),
+                );
+                if (moved != 0) {
+                    // Row doesn't exist yet — fall through to append
+                    _ = env.call1(env.intern("goto-char"), env.call0(env.intern("point-max")));
+                    _ = env.call1(env.intern("insert"), env.makeString("\n"));
+                } else {
+                    _ = env.call2(
+                        env.intern("delete-region"),
+                        env.call0(env.intern("point")),
+                        env.call0(env.intern("line-end-position")),
+                    );
+                }
+                // Clear per-row dirty flag
+                const row_clean: bool = false;
+                _ = gt.c.ghostty_render_state_row_set(term.row_iterator, gt.RS_ROW_OPT_DIRTY, @ptrCast(&row_clean));
+            } else {
+                // Full redraw: insert newline between rows
+                if (row_count > 0) {
+                    const nl_start = env.call0(env.intern("point"));
+                    _ = env.call1(env.intern("insert"), env.makeString("\n"));
+                    // Mark newlines from soft-wrapped rows so copy mode can filter them
+                    if (prev_wrapped) {
+                        _ = env.call4(
+                            env.intern("put-text-property"),
+                            nl_start,
+                            env.call0(env.intern("point")),
+                            env.intern("ghostel-wrap"),
+                            env.t(),
+                        );
+                    }
+                }
+            }
+
+            // Build row content
+            var run_count: usize = 0;
+            const text_len = buildRowContent(term, &text_buf, &runs, &run_count);
+
+            // Insert text and apply styles
+            insertAndStyle(env, &text_buf, text_len, &runs, run_count, default_fg, default_bg);
+
+            // Track whether this row is soft-wrapped for the next newline
+            prev_wrapped = isRowWrapped(term);
+            row_count += 1;
         }
 
-        // Build row content
-        var run_count: usize = 0;
-        const text_len = buildRowContent(term, &text_buf, &runs, &run_count);
-
-        // Insert text and apply styles
-        insertAndStyle(env, &text_buf, text_len, &runs, run_count, default_fg, default_bg);
-
-        // Track whether this row is soft-wrapped for the next newline
-        prev_wrapped = isRowWrapped(term);
-        row_count += 1;
+        // Reset dirty state
+        const dirty_false: c_int = gt.DIRTY_FALSE;
+        _ = gt.c.ghostty_render_state_set(term.render_state, gt.RS_OPT_DIRTY, @ptrCast(&dirty_false));
     }
-
-    // Reset dirty state
-    const dirty_false: c_int = gt.DIRTY_FALSE;
-    _ = gt.c.ghostty_render_state_set(term.render_state, gt.RS_OPT_DIRTY, @ptrCast(&dirty_false));
 
     // Position cursor
     var cursor_has_value: bool = false;
