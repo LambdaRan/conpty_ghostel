@@ -3,9 +3,5 @@
     .version = "0.1.0",
     .paths = .{""},
     .fingerprint = 0x5a44bdd1198a0f4b,
-    .dependencies = .{
-        .ghostty = .{
-            .path = "vendor/ghostty",
-        },
-    },
+    .dependencies = .{},
 }
