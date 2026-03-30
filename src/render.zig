@@ -215,6 +215,17 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
     );
 }
 
+/// Check if the current row in the iterator is soft-wrapped.
+fn isRowWrapped(term: *Terminal) bool {
+    var raw_row: gt.c.GhosttyRow = undefined;
+    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.c.GHOSTTY_RENDER_STATE_ROW_DATA_RAW, @ptrCast(&raw_row)) != gt.SUCCESS) {
+        return false;
+    }
+    var wrapped: bool = false;
+    _ = gt.c.ghostty_row_get(raw_row, gt.ROW_DATA_WRAP, @ptrCast(&wrapped));
+    return wrapped;
+}
+
 /// Build text content and style runs for the current row in the iterator.
 /// Returns the text length written to text_buf.
 fn buildRowContent(
@@ -359,6 +370,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
     var text_buf: [16384]u8 = undefined;
 
     var row_count: usize = 0;
+    var prev_wrapped: bool = false;
     while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
         if (partial) {
             // Only process dirty rows
@@ -366,6 +378,8 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
             _ = gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_DIRTY, @ptrCast(&row_dirty));
             if (!row_dirty) {
                 row_count += 1;
+                // Still need to track wrap state for next row
+                prev_wrapped = isRowWrapped(term);
                 continue;
             }
         }
@@ -373,6 +387,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         // Get cells for this row
         if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
             row_count += 1;
+            prev_wrapped = false;
             continue;
         }
 
@@ -399,7 +414,18 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         } else {
             // Full redraw: insert newline between rows
             if (row_count > 0) {
+                const nl_start = env.call0(env.intern("point"));
                 _ = env.call1(env.intern("insert"), env.makeString("\n"));
+                // Mark newlines from soft-wrapped rows so copy mode can filter them
+                if (prev_wrapped) {
+                    _ = env.call4(
+                        env.intern("put-text-property"),
+                        nl_start,
+                        env.call0(env.intern("point")),
+                        env.intern("ghostel-wrap"),
+                        env.t(),
+                    );
+                }
             }
         }
 
@@ -410,6 +436,8 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         // Insert text and apply styles
         insertAndStyle(env, &text_buf, text_len, &runs, run_count, default_fg, default_bg);
 
+        // Track whether this row is soft-wrapped for the next newline
+        prev_wrapped = isRowWrapped(term);
         row_count += 1;
     }
 

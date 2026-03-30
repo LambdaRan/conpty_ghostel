@@ -427,6 +427,63 @@
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
+;; Test: soft-wrap newline filtering in copy mode
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-soft-wrap-copy ()
+  "Test that soft-wrapped newlines are filtered during copy."
+  (message "--- soft-wrap copy ---")
+  (let ((buf (generate-new-buffer " *ghostel-test-wrap*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 20 100))
+                 (inhibit-read-only t))
+            ;; Write a line longer than 20 columns — should soft-wrap
+            (ghostel--write-input term "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            (ghostel--redraw term)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Should have a newline due to wrapping at col 20
+              (ghostel-test--assert-match "wrapped content has newline"
+                                          "ABCDEFGHIJKLMNOPQRST\n" content))
+            ;; The newline at the wrap point should have ghostel-wrap property
+            ;; Find the first newline
+            (goto-char (point-min))
+            (let ((nl-pos (search-forward "\n" nil t)))
+              (ghostel-test--assert "wrap newline exists" nl-pos)
+              (when nl-pos
+                (ghostel-test--assert "ghostel-wrap property set"
+                                      (get-text-property (1- nl-pos) 'ghostel-wrap))))
+            ;; Test the filter function
+            (let* ((raw (buffer-substring (point-min) (point-max)))
+                   (filtered (ghostel--filter-soft-wraps raw)))
+              (ghostel-test--assert "filtered has no wrapped newline"
+                                    (not (string-match-p "\n" (substring filtered 0 26)))))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel--filter-soft-wraps pure function
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-filter-soft-wraps ()
+  "Test the soft-wrap filter on synthetic propertized strings."
+  (message "--- filter-soft-wraps ---")
+  ;; String with a wrapped newline
+  (let ((s (concat "hello" (propertize "\n" 'ghostel-wrap t) "world")))
+    (ghostel-test--assert-equal "removes wrapped newline"
+                                "helloworld"
+                                (ghostel--filter-soft-wraps s)))
+  ;; String with a real (non-wrapped) newline
+  (let ((s "hello\nworld"))
+    (ghostel-test--assert-equal "keeps real newline"
+                                "hello\nworld"
+                                (ghostel--filter-soft-wraps s)))
+  ;; Mixed
+  (let ((s (concat "aaa" (propertize "\n" 'ghostel-wrap t) "bbb\nccc")))
+    (ghostel-test--assert-equal "mixed newlines"
+                                "aaabbb\nccc"
+                                (ghostel--filter-soft-wraps s))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -441,6 +498,7 @@
   (ghostel-test-raw-key-sequences)
   (ghostel-test-modifier-number)
   (ghostel-test-update-directory)
+  (ghostel-test-filter-soft-wraps)
 
   ;; Native module tests
   (ghostel-test-create)
@@ -455,6 +513,7 @@
   (ghostel-test-crlf)
   (ghostel-test-incremental-redraw)
   (ghostel-test-focus-events)
+  (ghostel-test-soft-wrap-copy)
 
   ;; Integration test (spawns a real shell)
   (ghostel-test-shell-integration)

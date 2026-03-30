@@ -467,12 +467,30 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (ghostel--invalidate)
     (message "Copy mode exited")))
 
+(defun ghostel--filter-soft-wraps (text)
+  "Remove newlines from TEXT that were inserted by soft line wrapping.
+These are newlines with the `ghostel-wrap' text property."
+  (let ((result "")
+        (pos 0)
+        (len (length text)))
+    (while (< pos len)
+      (if (and (eq (aref text pos) ?\n)
+               (get-text-property pos 'ghostel-wrap text))
+          (setq pos (1+ pos))
+        (setq result (concat result (substring text pos (1+ pos)))
+              pos (1+ pos))))
+    result))
+
 (defun ghostel-copy-mode-copy ()
-  "Copy the selected region and exit copy mode."
+  "Copy the selected region and exit copy mode.
+Soft-wrapped newlines are removed so the copied text matches
+the original terminal content."
   (interactive)
   (when (use-region-p)
-    (kill-ring-save (region-beginning) (region-end))
-    (message "Copied to kill ring"))
+    (let ((text (ghostel--filter-soft-wraps
+                 (buffer-substring (region-beginning) (region-end)))))
+      (kill-new text)
+      (message "Copied to kill ring")))
   (ghostel-copy-mode-exit))
 
 ;;; Callbacks from native module
