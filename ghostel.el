@@ -746,10 +746,14 @@ PROCESS is the shell process."
   "Start the shell process with a PTY."
   (let* ((height (max 1 (window-body-height)))
          (width (max 1 (window-max-chars-per-line)))
+         (ghostel-dir (file-name-directory
+                       (or load-file-name buffer-file-name
+                           default-directory)))
          (process-environment
           (append
            (list
             "INSIDE_EMACS=ghostel"
+            (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)
             (format "TERM=%s" "xterm-256color")
             (format "COLUMNS=%d" width)
             (format "LINES=%d" height))
