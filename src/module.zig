@@ -30,6 +30,7 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--write-input", 2, 2, &fnWriteInput, "Write raw bytes to the terminal.\n\n(ghostel--write-input TERM DATA)");
     env.bindFunction("ghostel--set-size", 3, 3, &fnSetSize, "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS)");
     env.bindFunction("ghostel--get-title", 1, 1, &fnGetTitle, "Get the terminal title.\n\n(ghostel--get-title TERM)");
+    env.bindFunction("ghostel--get-pwd", 1, 1, &fnGetPwd, "Get the terminal's working directory from OSC 7.\n\n(ghostel--get-pwd TERM)");
     env.bindFunction("ghostel--redraw", 1, 1, &fnRedraw, "Redraw dirty regions of the terminal into the current buffer.\n\n(ghostel--redraw TERM)");
     env.bindFunction("ghostel--scroll", 2, 2, &fnScroll, "Scroll the terminal viewport by DELTA lines.\n\n(ghostel--scroll TERM DELTA)");
     env.bindFunction("ghostel--encode-key", 3, 4, &fnEncodeKey, "Encode a key event using the terminal's key encoder.\n\n(ghostel--encode-key TERM KEY MODS &optional UTF8)");
@@ -133,8 +134,42 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
             npos += 1;
         }
     }
-    term.vtWrite(norm_buf[0..npos]);
+    const normalized = norm_buf[0..npos];
+    term.vtWrite(normalized);
+
+    // Scan for OSC 7 (report pwd) — libghostty-vt discards it, so we
+    // extract the URL ourselves and store it via OPT_PWD.
+    extractAndSetPwd(term, normalized);
+
     return env.nil();
+}
+
+/// Scan data for OSC 7 sequences and set the terminal PWD.
+/// OSC 7 format: ESC ] 7 ; <url> (ST | BEL)
+/// ST = ESC \   BEL = 0x07
+fn extractAndSetPwd(term: *Terminal, data: []const u8) void {
+    const prefix = "\x1b]7;";
+    var pos: usize = 0;
+    while (pos + prefix.len < data.len) {
+        if (std.mem.startsWith(u8, data[pos..], prefix)) {
+            const url_start = pos + prefix.len;
+            // Find the terminator: BEL (0x07) or ST (ESC \)
+            var url_end: usize = url_start;
+            while (url_end < data.len) {
+                if (data[url_end] == 0x07) break; // BEL
+                if (data[url_end] == 0x1b and url_end + 1 < data.len and data[url_end + 1] == '\\') break; // ST
+                url_end += 1;
+            }
+            if (url_end > url_start and url_end <= data.len) {
+                const url = data[url_start..url_end];
+                const gs = gt.GhosttyString{ .ptr = url.ptr, .len = url.len };
+                _ = gt.c.ghostty_terminal_set(term.terminal, gt.OPT_PWD, &gs);
+            }
+            pos = url_end;
+        } else {
+            pos += 1;
+        }
+    }
 }
 
 /// (ghostel--set-size TERM ROWS COLS)
@@ -163,6 +198,17 @@ fn fnGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*an
 
     if (term.getTitle()) |title| {
         return env.makeString(title);
+    }
+    return env.nil();
+}
+
+/// (ghostel--get-pwd TERM)
+fn fnGetPwd(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+
+    if (term.getPwd()) |pwd| {
+        return env.makeString(pwd);
     }
     return env.nil();
 }

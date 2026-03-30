@@ -361,6 +361,29 @@
       (ghostel-test--assert-equal "dedup" old ghostel--last-directory))))
 
 ;; -----------------------------------------------------------------------
+;; Test: OSC 7 end-to-end through libghostty
+;; -----------------------------------------------------------------------
+
+(defun ghostel-test-osc7-parsing ()
+  "Test that OSC 7 sequences are parsed by libghostty."
+  (message "--- OSC 7 parsing ---")
+  (let ((term (ghostel--new 25 80 1000)))
+    ;; No PWD initially
+    (ghostel-test--assert-equal "no pwd initially" nil (ghostel--get-pwd term))
+
+    ;; Feed OSC 7 with ST (ESC backslash) terminator
+    (ghostel--write-input term "\e]7;file:///tmp/testdir\e\\")
+    (ghostel-test--assert-equal "pwd after OSC 7 (ST)"
+                                "file:///tmp/testdir"
+                                (ghostel--get-pwd term))
+
+    ;; Feed OSC 7 with BEL terminator
+    (ghostel--write-input term "\e]7;file:///home/user\a")
+    (ghostel-test--assert-equal "pwd after OSC 7 (BEL)"
+                                "file:///home/user"
+                                (ghostel--get-pwd term))))
+
+;; -----------------------------------------------------------------------
 ;; Test: focus events gated by mode 1004
 ;; -----------------------------------------------------------------------
 
@@ -559,6 +582,7 @@
   (ghostel-test-scrollback)
   (ghostel-test-sgr)
   (ghostel-test-title)
+  (ghostel-test-osc7-parsing)
   (ghostel-test-crlf)
   (ghostel-test-incremental-redraw)
   (ghostel-test-focus-events)
