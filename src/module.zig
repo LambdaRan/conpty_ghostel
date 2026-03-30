@@ -37,6 +37,7 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--mouse-event", 6, 6, &fnMouseEvent, "Send a mouse event to the terminal.\n\n(ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)");
     env.bindFunction("ghostel--focus-event", 2, 2, &fnFocusEvent, "Send a focus event to the terminal.\n\n(ghostel--focus-event TERM GAINED)");
     env.bindFunction("ghostel--set-palette", 2, 2, &fnSetPalette, "Set the ANSI color palette.\n\n(ghostel--set-palette TERM COLORS-STRING)");
+    env.bindFunction("ghostel--mode-enabled", 2, 2, &fnModeEnabled, "Return t if terminal DEC private MODE is enabled.\n\n(ghostel--mode-enabled TERM MODE)");
     env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
     env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
 
@@ -361,6 +362,15 @@ fn fnFocusEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
 
     _ = env.call1(env.intern("ghostel--flush-output"), env.makeString(buf[0..written]));
     return env.t();
+}
+
+/// (ghostel--mode-enabled TERM MODE)
+/// Return t if terminal DEC private MODE is enabled, nil otherwise.
+fn fnModeEnabled(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const mode: gt.c.GhosttyMode = @intCast(env.extractInteger(args[1]));
+    return if (term.isModeEnabled(mode)) env.t() else env.nil();
 }
 
 /// (ghostel--set-palette TERM COLORS-STRING)

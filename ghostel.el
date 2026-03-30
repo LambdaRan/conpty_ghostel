@@ -541,11 +541,18 @@ Returns the sequence string, or nil for unknown keys."
 (defvar-local ghostel--yank-index 0
   "Current kill ring index for `ghostel-yank-pop'.")
 
+(defun ghostel--bracketed-paste-p ()
+  "Return non-nil if the terminal has bracketed paste mode (2004) enabled."
+  (and ghostel--terminal
+       (ghostel--mode-enabled ghostel--terminal 2004)))
+
 (defun ghostel--paste-text (text)
-  "Send TEXT to the terminal using bracketed paste."
+  "Send TEXT to the terminal, using bracketed paste if the terminal wants it."
   (when (and text ghostel--process (process-live-p ghostel--process))
     (process-send-string ghostel--process
-                         (concat "\e[200~" text "\e[201~"))))
+                         (if (ghostel--bracketed-paste-p)
+                             (concat "\e[200~" text "\e[201~")
+                           text))))
 
 (defun ghostel-paste ()
   "Paste text from the Emacs kill ring into the terminal.
@@ -599,8 +606,7 @@ pasted using bracketed paste."
           (ghostel--send-key (shell-quote-argument path))))
        ;; Text drop
        ((stringp payload)
-        (process-send-string ghostel--process
-                             (concat "\e[200~" payload "\e[201~")))
+        (ghostel--paste-text payload))
        ;; dnd-protocol-alist style: list of files
        ((and (listp payload) (cl-every #'stringp payload))
         (ghostel--send-key
