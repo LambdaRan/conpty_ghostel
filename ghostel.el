@@ -187,6 +187,8 @@ PROCESS is the shell process."
                 :filter #'ghostel--filter
                 :sentinel #'ghostel--sentinel)))
     (setq ghostel--process proc)
+    ;; Raw binary I/O — no encoding/decoding by Emacs
+    (set-process-coding-system proc 'binary 'binary)
     (set-process-query-on-exit-flag proc nil)
     proc))
 
