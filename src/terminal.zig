@@ -23,6 +23,9 @@ row_cells: gt.RenderStateRowCells,
 /// Key encoder for translating key events to escape sequences.
 key_encoder: gt.c.GhosttyKeyEncoder,
 
+/// Mouse encoder for translating mouse events to escape sequences.
+mouse_encoder: gt.c.GhosttyMouseEncoder,
+
 /// Terminal dimensions.
 cols: u16,
 rows: u16,
@@ -66,6 +69,12 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
     if (gt.c.ghostty_key_encoder_new(null, &key_encoder) != gt.SUCCESS) {
         return error.KeyEncoderCreateFailed;
     }
+    errdefer gt.c.ghostty_key_encoder_free(key_encoder);
+
+    var mouse_encoder: gt.c.GhosttyMouseEncoder = undefined;
+    if (gt.c.ghostty_mouse_encoder_new(null, &mouse_encoder) != gt.SUCCESS) {
+        return error.MouseEncoderCreateFailed;
+    }
 
     return .{
         .terminal = terminal,
@@ -73,6 +82,7 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
         .row_iterator = row_iterator,
         .row_cells = row_cells,
         .key_encoder = key_encoder,
+        .mouse_encoder = mouse_encoder,
         .cols = cols,
         .rows = rows,
     };
@@ -80,6 +90,7 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
 
 /// Free all ghostty resources.
 pub fn deinit(self: *Self) void {
+    gt.c.ghostty_mouse_encoder_free(self.mouse_encoder);
     gt.c.ghostty_key_encoder_free(self.key_encoder);
     gt.c.ghostty_render_state_row_cells_free(self.row_cells);
     gt.c.ghostty_render_state_row_iterator_free(self.row_iterator);
@@ -171,6 +182,16 @@ pub fn getTitle(self: *Self) ?[]const u8 {
     }
     if (title.len == 0) return null;
     return title.ptr[0..title.len];
+}
+
+/// Get the terminal's current working directory (from OSC 7).
+pub fn getPwd(self: *Self) ?[]const u8 {
+    var pwd: gt.GhosttyString = undefined;
+    if (gt.c.ghostty_terminal_get(self.terminal, gt.DATA_PWD, &pwd) != gt.SUCCESS) {
+        return null;
+    }
+    if (pwd.len == 0) return null;
+    return pwd.ptr[0..pwd.len];
 }
 
 /// Emacs finalizer — called when the user-ptr is garbage collected.

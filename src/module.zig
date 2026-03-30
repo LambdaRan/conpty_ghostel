@@ -33,6 +33,10 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--redraw", 1, 1, &fnRedraw, "Redraw dirty regions of the terminal into the current buffer.\n\n(ghostel--redraw TERM)");
     env.bindFunction("ghostel--scroll", 2, 2, &fnScroll, "Scroll the terminal viewport by DELTA lines.\n\n(ghostel--scroll TERM DELTA)");
     env.bindFunction("ghostel--encode-key", 3, 4, &fnEncodeKey, "Encode a key event using the terminal's key encoder.\n\n(ghostel--encode-key TERM KEY MODS &optional UTF8)");
+    env.bindFunction("ghostel--mouse-event", 6, 6, &fnMouseEvent, "Send a mouse event to the terminal.\n\n(ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)");
+    env.bindFunction("ghostel--focus-event", 2, 2, &fnFocusEvent, "Send a focus event to the terminal.\n\n(ghostel--focus-event TERM GAINED)");
+    env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
+    env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
 
     env.provide("ghostel-module");
     return 0;
@@ -110,7 +114,25 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     term.env = env;
     defer term.env = null;
 
-    term.vtWrite(data.?);
+    // Normalize CRLF: Emacs PTYs lack ONLCR, so bare \n arrives
+    // without \r.  Insert \r before every bare \n.
+    // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
+    const raw = data.?;
+    var norm_buf: [131072]u8 = undefined;
+    var npos: usize = 0;
+    for (0..raw.len) |i| {
+        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+            if (npos < norm_buf.len) {
+                norm_buf[npos] = '\r';
+                npos += 1;
+            }
+        }
+        if (npos < norm_buf.len) {
+            norm_buf[npos] = raw[i];
+            npos += 1;
+        }
+    }
+    term.vtWrite(norm_buf[0..npos]);
     return env.nil();
 }
 
@@ -195,6 +217,159 @@ fn fnEncodeKey(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _:
         return env.t();
     }
     return env.nil();
+}
+
+/// (ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)
+/// ACTION: 0=press, 1=release, 2=motion
+/// BUTTON: 0=none, 1=left, 2=right, 3=middle
+/// ROW, COL: 0-based cell coordinates
+/// MODS: modifier bitmask
+fn fnMouseEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+
+    const action = env.extractInteger(args[1]);
+    const button = env.extractInteger(args[2]);
+    const row = env.extractInteger(args[3]);
+    const col = env.extractInteger(args[4]);
+    const mods = env.extractInteger(args[5]);
+
+    if (input.encodeAndSendMouse(env, term, action, button, row, col, mods)) {
+        return env.t();
+    }
+    return env.nil();
+}
+
+/// (ghostel--focus-event TERM GAINED)
+/// Encode a focus gained/lost event and send to the PTY.
+fn fnFocusEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    _ = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+
+    const gained = env.isNotNil(args[1]);
+    const event: gt.c.GhosttyFocusEvent = if (gained) gt.c.GHOSTTY_FOCUS_GAINED else gt.c.GHOSTTY_FOCUS_LOST;
+
+    var buf: [8]u8 = undefined;
+    var written: usize = 0;
+    if (gt.c.ghostty_focus_encode(event, &buf, buf.len, &written) != gt.SUCCESS or written == 0) {
+        return env.nil();
+    }
+
+    _ = env.call1(env.intern("ghostel--flush-output"), env.makeString(buf[0..written]));
+    return env.t();
+}
+
+/// (ghostel--debug-state TERM)
+/// Returns a string with render state debug info.
+fn fnDebugState(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+
+    // Try update
+    const update_result = gt.c.ghostty_render_state_update(term.render_state, term.terminal);
+    pos += (std.fmt.bufPrint(buf[pos..], "update={d} ", .{update_result}) catch return env.nil()).len;
+
+    // Read first row via iterator
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+        pos += (std.fmt.bufPrint(buf[pos..], "iter=FAIL", .{}) catch return env.nil()).len;
+        return env.makeString(buf[0..pos]);
+    }
+
+    var row_idx: usize = 0;
+    while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) : (row_idx += 1) {
+        if (row_idx >= 3) break; // only first 3 rows
+
+        if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+            pos += (std.fmt.bufPrint(buf[pos..], "row{d}=FAIL ", .{row_idx}) catch break).len;
+            continue;
+        }
+
+        pos += (std.fmt.bufPrint(buf[pos..], "row{d}=\"", .{row_idx}) catch break).len;
+        var col: usize = 0;
+        while (gt.c.ghostty_render_state_row_cells_next(term.row_cells)) : (col += 1) {
+            if (col >= 40) break; // first 40 cols
+            var graphemes_len: u32 = 0;
+            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) != gt.SUCCESS) continue;
+
+            if (graphemes_len == 0) {
+                if (pos < buf.len) {
+                    buf[pos] = ' ';
+                    pos += 1;
+                }
+                continue;
+            }
+
+            var codepoints: [4]u32 = undefined;
+            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&codepoints)) != gt.SUCCESS) continue;
+            const cp: u21 = @intCast(codepoints[0]);
+            const remaining = buf[pos..];
+            if (remaining.len < 4) break;
+            const enc_len = std.unicode.utf8Encode(cp, remaining) catch continue;
+            pos += enc_len;
+        }
+        pos += (std.fmt.bufPrint(buf[pos..], "\" ", .{}) catch break).len;
+    }
+
+    return env.makeString(buf[0..pos]);
+}
+
+/// (ghostel--debug-feed TERM STR)
+/// Feed STR to the terminal, update render state, return first row.
+fn fnDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+
+    var stack_buf: [4096]u8 = undefined;
+    const data = env.extractString(args[1], &stack_buf) orelse return env.nil();
+
+    // Feed directly to terminal
+    gt.c.ghostty_terminal_vt_write(term.terminal, data.ptr, data.len);
+
+    // Update render state
+    _ = gt.c.ghostty_render_state_update(term.render_state, term.terminal);
+
+    // Read cursor position
+    var cx: u16 = 0;
+    var cy: u16 = 0;
+    _ = gt.c.ghostty_terminal_get(term.terminal, gt.c.GHOSTTY_TERMINAL_DATA_CURSOR_X, @ptrCast(&cx));
+    _ = gt.c.ghostty_terminal_get(term.terminal, gt.c.GHOSTTY_TERMINAL_DATA_CURSOR_Y, @ptrCast(&cy));
+
+    // Read first row from render state
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+        return env.makeString("iter-fail");
+    }
+
+    var buf: [2048]u8 = undefined;
+    var pos: usize = 0;
+    pos += (std.fmt.bufPrint(buf[pos..], "cur=({d},{d}) row0=\"", .{ cx, cy }) catch return env.nil()).len;
+
+    if (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+        if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) == gt.SUCCESS) {
+            var col: usize = 0;
+            while (gt.c.ghostty_render_state_row_cells_next(term.row_cells)) : (col += 1) {
+                if (col >= 60) break;
+                var gl: u32 = 0;
+                if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&gl)) != gt.SUCCESS) continue;
+                if (gl == 0) {
+                    if (pos < buf.len) { buf[pos] = ' '; pos += 1; }
+                    continue;
+                }
+                var cp: [4]u32 = undefined;
+                if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&cp)) != gt.SUCCESS) continue;
+                const c21: u21 = @intCast(cp[0]);
+                const rem = buf[pos..];
+                if (rem.len < 4) break;
+                const el = std.unicode.utf8Encode(c21, rem) catch continue;
+                pos += el;
+            }
+        }
+    }
+    pos += (std.fmt.bufPrint(buf[pos..], "\"", .{}) catch return env.nil()).len;
+
+    return env.makeString(buf[0..pos]);
 }
 
 // ---------------------------------------------------------------------------

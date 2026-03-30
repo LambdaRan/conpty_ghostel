@@ -3,6 +3,10 @@
 /// Reads dirty rows/cells from the ghostty render state, extracts
 /// text and style attributes, and inserts propertized text into the
 /// current Emacs buffer.
+///
+/// Supports two modes:
+/// - DIRTY_FULL: erase buffer and redraw everything
+/// - DIRTY_PARTIAL: only update dirty rows in-place
 const std = @import("std");
 const emacs = @import("emacs.zig");
 const gt = @import("ghostty.zig");
@@ -42,6 +46,13 @@ const CellStyle = struct {
             !self.strikethrough and
             !self.inverse;
     }
+};
+
+/// Track style runs for propertizing after insertion.
+const RunInfo = struct {
+    start_byte: usize,
+    end_byte: usize,
+    style: CellStyle,
 };
 
 fn colorEql(a: ?gt.ColorRgb, b: ?gt.ColorRgb) bool {
@@ -105,19 +116,15 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
     if (style.isDefault()) return;
     if (start >= end) return;
 
-    // Build face property list
-    // We construct it as: (list :foreground "..." :background "..." :weight 'bold ...)
     var props: [24]emacs.Value = undefined;
     var prop_count: usize = 0;
 
     var fg_buf: [7]u8 = undefined;
     var bg_buf: [7]u8 = undefined;
 
-    // Foreground color
     const effective_fg = if (style.inverse) (style.bg orelse default_bg) else (style.fg orelse default_fg);
     const effective_bg = if (style.inverse) (style.fg orelse default_fg) else (style.bg orelse default_bg);
 
-    // Only set FG if it differs from default (accounting for inverse)
     if (!colorEql(style.fg, null) or style.inverse) {
         const fg_str = formatColor(effective_fg, &fg_buf);
         props[prop_count] = env.intern(":foreground");
@@ -126,7 +133,6 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
         prop_count += 1;
     }
 
-    // Only set BG if it differs from default (accounting for inverse)
     if (!colorEql(style.bg, null) or style.inverse) {
         const bg_str = formatColor(effective_bg, &bg_buf);
         props[prop_count] = env.intern(":background");
@@ -135,7 +141,6 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
         prop_count += 1;
     }
 
-    // Bold
     if (style.bold) {
         props[prop_count] = env.intern(":weight");
         prop_count += 1;
@@ -143,7 +148,6 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
         prop_count += 1;
     }
 
-    // Faint/dim
     if (style.faint) {
         props[prop_count] = env.intern(":weight");
         prop_count += 1;
@@ -151,7 +155,6 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
         prop_count += 1;
     }
 
-    // Italic
     if (style.italic) {
         props[prop_count] = env.intern(":slant");
         prop_count += 1;
@@ -159,22 +162,19 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
         prop_count += 1;
     }
 
-    // Underline
     if (style.underline != 0) {
         props[prop_count] = env.intern(":underline");
         prop_count += 1;
-        // For simple single underline without color, use t
         if (style.underline == 1 and style.underline_color == null) {
             props[prop_count] = env.t();
         } else {
-            // Build underline spec: (:style wave/line :color "...")
             var ul_props: [4]emacs.Value = undefined;
             var ul_count: usize = 0;
 
             ul_props[ul_count] = env.intern(":style");
             ul_count += 1;
             ul_props[ul_count] = switch (style.underline) {
-                3 => env.intern("wave"), // curly
+                3 => env.intern("wave"),
                 2 => env.intern("double-line"),
                 4 => env.intern("dot"),
                 5 => env.intern("dash"),
@@ -195,7 +195,6 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
         prop_count += 1;
     }
 
-    // Strikethrough
     if (style.strikethrough) {
         props[prop_count] = env.intern(":strike-through");
         prop_count += 1;
@@ -205,10 +204,8 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
 
     if (prop_count == 0) return;
 
-    // Create the face plist: (list :foreground "..." ...)
     const face = env.funcall(env.intern("list"), props[0..prop_count]);
 
-    // (put-text-property START END 'face FACE)
     _ = env.call4(
         env.intern("put-text-property"),
         env.makeInteger(start),
@@ -216,6 +213,105 @@ fn applyStyle(env: emacs.Env, start: i64, end: i64, style: CellStyle, default_fg
         env.intern("face"),
         face,
     );
+}
+
+/// Build text content and style runs for the current row in the iterator.
+/// Returns the text length written to text_buf.
+fn buildRowContent(
+    term: *Terminal,
+    text_buf: []u8,
+    runs: []RunInfo,
+    run_count: *usize,
+) usize {
+    var text_len: usize = 0;
+    run_count.* = 0;
+    var current_style: CellStyle = .{};
+    var run_start: usize = 0;
+
+    while (gt.c.ghostty_render_state_row_cells_next(term.row_cells)) {
+        var graphemes_len: u32 = 0;
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) != gt.SUCCESS) {
+            continue;
+        }
+
+        const cell_style = readCellStyle(term.row_cells);
+
+        // Flush run on style change
+        if (text_len > run_start and !cell_style.eql(current_style)) {
+            if (run_count.* < runs.len) {
+                runs[run_count.*] = .{
+                    .start_byte = run_start,
+                    .end_byte = text_len,
+                    .style = current_style,
+                };
+                run_count.* += 1;
+            }
+            run_start = text_len;
+            current_style = cell_style;
+        } else if (text_len == run_start) {
+            current_style = cell_style;
+        }
+
+        if (graphemes_len == 0) {
+            if (text_len < text_buf.len) {
+                text_buf[text_len] = ' ';
+                text_len += 1;
+            }
+            continue;
+        }
+
+        var codepoints: [16]u32 = undefined;
+        const cp_count = @min(graphemes_len, 16);
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&codepoints)) != gt.SUCCESS) {
+            continue;
+        }
+
+        for (0..cp_count) |i| {
+            const cp: u21 = @intCast(codepoints[i]);
+            const remaining = text_buf[text_len..];
+            if (remaining.len < 4) break;
+            const encoded_len = std.unicode.utf8Encode(cp, remaining) catch continue;
+            text_len += encoded_len;
+        }
+    }
+
+    // Close final run
+    if (text_len > run_start and run_count.* < runs.len) {
+        runs[run_count.*] = .{
+            .start_byte = run_start,
+            .end_byte = text_len,
+            .style = current_style,
+        };
+        run_count.* += 1;
+    }
+
+    return text_len;
+}
+
+/// Insert row text and apply style runs.
+fn insertAndStyle(
+    env: emacs.Env,
+    text_buf: []const u8,
+    text_len: usize,
+    runs: []const RunInfo,
+    run_count: usize,
+    default_fg: gt.ColorRgb,
+    default_bg: gt.ColorRgb,
+) void {
+    if (text_len == 0) return;
+
+    const insert_start = env.extractInteger(env.call0(env.intern("point")));
+    _ = env.call1(env.intern("insert"), env.makeString(text_buf[0..text_len]));
+
+    for (runs[0..run_count]) |run| {
+        if (run.start_byte >= text_len) break;
+        const run_end = @min(run.end_byte, text_len);
+        if (run_end <= run.start_byte) continue;
+
+        const prop_start = insert_start + @as(i64, @intCast(run.start_byte));
+        const prop_end = insert_start + @as(i64, @intCast(run_end));
+        applyStyle(env, prop_start, prop_end, run.style, default_fg, default_bg);
+    }
 }
 
 /// Redraw the terminal into the current Emacs buffer.
@@ -230,20 +326,15 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
     if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty)) != gt.SUCCESS) {
         return;
     }
+    if (dirty == gt.DIRTY_FALSE) return;
 
-    if (dirty == gt.DIRTY_FALSE) {
-        return; // Nothing to redraw
-    }
-
-    // Get default colors for inverse video fallback
+    // Get default colors
     var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
     var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
 
-    // Set the buffer's default face to terminal colors so that
-    // unstyled text (default fg/bg) is always visible regardless
-    // of the user's Emacs theme.
+    // Set buffer default face
     var fg_hex: [7]u8 = undefined;
     var bg_hex: [7]u8 = undefined;
     _ = env.call2(
@@ -252,125 +343,62 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         env.makeString(formatColor(default_bg, &bg_hex)),
     );
 
-    // Erase buffer and redraw everything
-    _ = env.call0(env.intern("erase-buffer"));
-
     // Get row iterator
     if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
         return;
     }
 
-    // Track style runs for propertizing after insertion
-    const RunInfo = struct {
-        start_byte: usize, // byte offset in the row's text buffer
-        end_byte: usize,
-        style: CellStyle,
-    };
+    // Always do full redraw for now — incremental (DIRTY_PARTIAL) needs
+    // more testing to verify per-row dirty detection works reliably.
+    _ = env.call0(env.intern("erase-buffer"));
+    const partial = false;
+
+    // Shared buffers for row content
     var runs: [512]RunInfo = undefined;
     var text_buf: [16384]u8 = undefined;
 
     var row_count: usize = 0;
     while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+        if (partial) {
+            // Only process dirty rows
+            var row_dirty: bool = false;
+            _ = gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_DIRTY, @ptrCast(&row_dirty));
+            if (!row_dirty) {
+                row_count += 1;
+                continue;
+            }
+        }
+
         // Get cells for this row
         if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+            row_count += 1;
             continue;
         }
 
-        // Insert newline between rows (not before first row)
-        if (row_count > 0) {
-            _ = env.call1(env.intern("insert"), env.makeString("\n"));
+        if (partial) {
+            // Navigate to this row and clear its content
+            _ = env.call1(env.intern("goto-char"), env.makeInteger(1));
+            _ = env.call1(env.intern("forward-line"), env.makeInteger(@as(i64, @intCast(row_count))));
+            _ = env.call2(
+                env.intern("delete-region"),
+                env.call0(env.intern("point")),
+                env.call0(env.intern("line-end-position")),
+            );
+        } else {
+            // Full redraw: insert newline between rows
+            if (row_count > 0) {
+                _ = env.call1(env.intern("insert"), env.makeString("\n"));
+            }
         }
-        row_count += 1;
 
-        // Build text and track style runs for this row
-        var text_len: usize = 0;
+        // Build row content
         var run_count: usize = 0;
-        var current_style: CellStyle = .{};
-        var run_start: usize = 0;
+        const text_len = buildRowContent(term, &text_buf, &runs, &run_count);
 
-        while (gt.c.ghostty_render_state_row_cells_next(term.row_cells)) {
-            // Get grapheme length
-            var graphemes_len: u32 = 0;
-            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) != gt.SUCCESS) {
-                continue;
-            }
+        // Insert text and apply styles
+        insertAndStyle(env, &text_buf, text_len, &runs, run_count, default_fg, default_bg);
 
-            // Read style for this cell
-            const cell_style = readCellStyle(term.row_cells);
-
-            // Check if style changed — flush current run
-            if (text_len > run_start and !cell_style.eql(current_style)) {
-                if (run_count < runs.len) {
-                    runs[run_count] = .{
-                        .start_byte = run_start,
-                        .end_byte = text_len,
-                        .style = current_style,
-                    };
-                    run_count += 1;
-                }
-                run_start = text_len;
-                current_style = cell_style;
-            } else if (text_len == run_start) {
-                current_style = cell_style;
-            }
-
-            if (graphemes_len == 0) {
-                // Empty cell — render as space
-                if (text_len < text_buf.len) {
-                    text_buf[text_len] = ' ';
-                    text_len += 1;
-                }
-                continue;
-            }
-
-            // Get grapheme codepoints
-            var codepoints: [16]u32 = undefined;
-            const cp_count = @min(graphemes_len, 16);
-            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&codepoints)) != gt.SUCCESS) {
-                continue;
-            }
-
-            // Encode codepoints to UTF-8
-            for (0..cp_count) |i| {
-                const cp: u21 = @intCast(codepoints[i]);
-                const remaining = text_buf[text_len..];
-                if (remaining.len < 4) break;
-                const encoded_len = std.unicode.utf8Encode(cp, remaining) catch continue;
-                text_len += encoded_len;
-            }
-        }
-
-        // Close final run
-        if (text_len > run_start and run_count < runs.len) {
-            runs[run_count] = .{
-                .start_byte = run_start,
-                .end_byte = text_len,
-                .style = current_style,
-            };
-            run_count += 1;
-        }
-
-        // Don't trim trailing spaces — terminal content is column-aligned
-        // and the cursor must be positionable at any column.
-        if (text_len == 0) continue;
-
-        // Record buffer position before insertion for property offsets
-        const insert_start = env.extractInteger(env.call0(env.intern("point")));
-
-        // Insert the row text (full width, no trimming)
-        _ = env.call1(env.intern("insert"), env.makeString(text_buf[0..text_len]));
-
-        // Apply face properties to each style run
-        for (runs[0..run_count]) |run| {
-            if (run.start_byte >= text_len) break;
-            const run_end = @min(run.end_byte, text_len);
-            if (run_end <= run.start_byte) continue;
-
-            const prop_start = insert_start + @as(i64, @intCast(run.start_byte));
-            const prop_end = insert_start + @as(i64, @intCast(run_end));
-
-            applyStyle(env, prop_start, prop_end, run.style, default_fg, default_bg);
-        }
+        row_count += 1;
     }
 
     // Reset dirty state
@@ -403,4 +431,9 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
         env.makeInteger(@as(i64, cursor_style)),
         if (cursor_visible) env.t() else env.nil(),
     );
+
+    // Update working directory from OSC 7
+    if (term.getPwd()) |pwd| {
+        _ = env.call1(env.intern("ghostel--update-directory"), env.makeString(pwd));
+    }
 }

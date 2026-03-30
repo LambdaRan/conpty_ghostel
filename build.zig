@@ -21,9 +21,10 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(b.path("vendor/ghostty/zig-out/include"));
     mod.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libghostty-vt.a"));
 
-    // libghostty-vt bundled dependencies (built by ghostty's zig build)
-    mod.addObjectFile(.{ .cwd_relative = "vendor/ghostty/.zig-cache/o/a24e184e2a99205eae8505b6856500ae/libsimdutf.a" });
-    mod.addObjectFile(.{ .cwd_relative = "vendor/ghostty/.zig-cache/o/7d65643d9998f245b2e274b7ff8d3516/libhighway.a" });
+    // libghostty-vt bundled dependencies.
+    // These are copied from .zig-cache to stable paths by build.sh.
+    mod.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libsimdutf.a"));
+    mod.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libhighway.a"));
 
     // libghostty-vt depends on libc++
     mod.linkSystemLibrary("c++", .{});

@@ -50,6 +50,64 @@ pub fn encodeAndSend(env: emacs.Env, term: *Terminal, key: Key, mods: Mods, utf8
     return true;
 }
 
+/// Encode a mouse event and send the result to the PTY.
+/// Returns true if the event was encoded and sent.
+pub fn encodeAndSendMouse(env: emacs.Env, term: *Terminal, action: i64, button: i64, row: i64, col: i64, mods_val: i64) bool {
+    // Sync encoder options (tracking mode, format) from terminal
+    gt.c.ghostty_mouse_encoder_setopt_from_terminal(term.mouse_encoder, term.terminal);
+
+    // Set size: 1 pixel = 1 cell so Emacs cell coords map directly
+    var size: gt.c.GhosttyMouseEncoderSize = .{
+        .size = @sizeOf(gt.c.GhosttyMouseEncoderSize),
+        .screen_width = term.cols,
+        .screen_height = term.rows,
+        .cell_width = 1,
+        .cell_height = 1,
+        .padding_top = 0,
+        .padding_bottom = 0,
+        .padding_right = 0,
+        .padding_left = 0,
+    };
+    gt.c.ghostty_mouse_encoder_setopt(term.mouse_encoder, gt.c.GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size);
+
+    // Create event
+    var event: gt.c.GhosttyMouseEvent = undefined;
+    if (gt.c.ghostty_mouse_event_new(null, &event) != gt.SUCCESS) return false;
+    defer gt.c.ghostty_mouse_event_free(event);
+
+    gt.c.ghostty_mouse_event_set_action(event, @intCast(action));
+
+    if (button > 0) {
+        gt.c.ghostty_mouse_event_set_button(event, @intCast(button));
+    } else {
+        gt.c.ghostty_mouse_event_clear_button(event);
+    }
+
+    gt.c.ghostty_mouse_event_set_mods(event, @intCast(mods_val));
+    gt.c.ghostty_mouse_event_set_position(event, .{
+        .x = @floatFromInt(col),
+        .y = @floatFromInt(row),
+    });
+
+    // Encode
+    var buf: [128]u8 = undefined;
+    var written: usize = 0;
+    const result = gt.c.ghostty_mouse_encoder_encode(
+        term.mouse_encoder,
+        event,
+        &buf,
+        buf.len,
+        &written,
+    );
+
+    if (result != gt.SUCCESS or written == 0) return false;
+
+    // Send to PTY
+    const str = env.makeString(buf[0..written]);
+    _ = env.call1(env.intern("ghostel--flush-output"), str);
+    return true;
+}
+
 /// Map an Emacs key name to a GhosttyKey.
 /// Returns GHOSTTY_KEY_UNIDENTIFIED for unknown keys.
 pub fn mapKey(key_name: []const u8) Key {
