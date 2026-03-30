@@ -20,6 +20,9 @@ row_iterator: gt.RenderStateRowIterator,
 /// Reusable row cells handle (populated during redraw).
 row_cells: gt.RenderStateRowCells,
 
+/// Key encoder for translating key events to escape sequences.
+key_encoder: gt.c.GhosttyKeyEncoder,
+
 /// Terminal dimensions.
 cols: u16,
 rows: u16,
@@ -57,12 +60,19 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
     if (gt.c.ghostty_render_state_row_cells_new(null, &row_cells) != gt.SUCCESS) {
         return error.RowCellsCreateFailed;
     }
+    errdefer gt.c.ghostty_render_state_row_cells_free(row_cells);
+
+    var key_encoder: gt.c.GhosttyKeyEncoder = undefined;
+    if (gt.c.ghostty_key_encoder_new(null, &key_encoder) != gt.SUCCESS) {
+        return error.KeyEncoderCreateFailed;
+    }
 
     return .{
         .terminal = terminal,
         .render_state = render_state,
         .row_iterator = row_iterator,
         .row_cells = row_cells,
+        .key_encoder = key_encoder,
         .cols = cols,
         .rows = rows,
     };
@@ -70,6 +80,7 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize) !Self {
 
 /// Free all ghostty resources.
 pub fn deinit(self: *Self) void {
+    gt.c.ghostty_key_encoder_free(self.key_encoder);
     gt.c.ghostty_render_state_row_cells_free(self.row_cells);
     gt.c.ghostty_render_state_row_iterator_free(self.row_iterator);
     gt.c.ghostty_render_state_free(self.render_state);

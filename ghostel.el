@@ -81,28 +81,43 @@ These keys pass through to Emacs instead."
     (define-key map (kbd "TAB")       #'ghostel--send-tab)
     (define-key map (kbd "DEL")       #'ghostel--send-backspace)
     (define-key map (kbd "<backspace>") #'ghostel--send-backspace)
-    (define-key map (kbd "C-d")       (lambda () (interactive) (ghostel--send-key "\C-d")))
-    (define-key map (kbd "C-a")       (lambda () (interactive) (ghostel--send-key "\C-a")))
-    (define-key map (kbd "C-e")       (lambda () (interactive) (ghostel--send-key "\C-e")))
-    (define-key map (kbd "C-k")       (lambda () (interactive) (ghostel--send-key "\C-k")))
-    (define-key map (kbd "C-l")       (lambda () (interactive) (ghostel--send-key "\C-l")))
-    (define-key map (kbd "C-n")       (lambda () (interactive) (ghostel--send-key "\C-n")))
-    (define-key map (kbd "C-p")       (lambda () (interactive) (ghostel--send-key "\C-p")))
-    (define-key map (kbd "C-r")       (lambda () (interactive) (ghostel--send-key "\C-r")))
-    (define-key map (kbd "C-w")       (lambda () (interactive) (ghostel--send-key "\C-w")))
-    (define-key map (kbd "C-y")       (lambda () (interactive) (ghostel--send-key "\C-y")))
-    (define-key map (kbd "C-z")       (lambda () (interactive) (ghostel--send-key "\C-z")))
-    (define-key map (kbd "<escape>")  (lambda () (interactive) (ghostel--send-key "\e")))
-    (define-key map (kbd "<up>")      (lambda () (interactive) (ghostel--send-key "\e[A")))
-    (define-key map (kbd "<down>")    (lambda () (interactive) (ghostel--send-key "\e[B")))
-    (define-key map (kbd "<right>")   (lambda () (interactive) (ghostel--send-key "\e[C")))
-    (define-key map (kbd "<left>")    (lambda () (interactive) (ghostel--send-key "\e[D")))
-    (define-key map (kbd "<home>")    (lambda () (interactive) (ghostel--send-key "\e[H")))
-    (define-key map (kbd "<end>")     (lambda () (interactive) (ghostel--send-key "\e[F")))
-    (define-key map (kbd "<prior>")   (lambda () (interactive) (ghostel--send-key "\e[5~")))
-    (define-key map (kbd "<next>")    (lambda () (interactive) (ghostel--send-key "\e[6~")))
-    (define-key map (kbd "<deletechar>") (lambda () (interactive) (ghostel--send-key "\e[3~")))
-    (define-key map (kbd "<insert>")  (lambda () (interactive) (ghostel--send-key "\e[2~")))
+    ;; Control keys
+    (define-key map (kbd "C-d")       (lambda () (interactive) (ghostel--send-encoded "d" "ctrl")))
+    (define-key map (kbd "C-a")       (lambda () (interactive) (ghostel--send-encoded "a" "ctrl")))
+    (define-key map (kbd "C-e")       (lambda () (interactive) (ghostel--send-encoded "e" "ctrl")))
+    (define-key map (kbd "C-k")       (lambda () (interactive) (ghostel--send-encoded "k" "ctrl")))
+    (define-key map (kbd "C-l")       (lambda () (interactive) (ghostel--send-encoded "l" "ctrl")))
+    (define-key map (kbd "C-n")       (lambda () (interactive) (ghostel--send-encoded "n" "ctrl")))
+    (define-key map (kbd "C-p")       (lambda () (interactive) (ghostel--send-encoded "p" "ctrl")))
+    (define-key map (kbd "C-r")       (lambda () (interactive) (ghostel--send-encoded "r" "ctrl")))
+    (define-key map (kbd "C-w")       (lambda () (interactive) (ghostel--send-encoded "w" "ctrl")))
+    (define-key map (kbd "C-y")       (lambda () (interactive) (ghostel--send-encoded "y" "ctrl")))
+    (define-key map (kbd "C-z")       (lambda () (interactive) (ghostel--send-encoded "z" "ctrl")))
+    ;; Special keys (encoded via GhosttyKeyEncoder)
+    (define-key map (kbd "<escape>")  (lambda () (interactive) (ghostel--send-encoded "escape" "")))
+    (define-key map (kbd "<up>")      (lambda () (interactive) (ghostel--send-encoded "up" "")))
+    (define-key map (kbd "<down>")    (lambda () (interactive) (ghostel--send-encoded "down" "")))
+    (define-key map (kbd "<right>")   (lambda () (interactive) (ghostel--send-encoded "right" "")))
+    (define-key map (kbd "<left>")    (lambda () (interactive) (ghostel--send-encoded "left" "")))
+    (define-key map (kbd "<home>")    (lambda () (interactive) (ghostel--send-encoded "home" "")))
+    (define-key map (kbd "<end>")     (lambda () (interactive) (ghostel--send-encoded "end" "")))
+    (define-key map (kbd "<prior>")   (lambda () (interactive) (ghostel--send-encoded "prior" "")))
+    (define-key map (kbd "<next>")    (lambda () (interactive) (ghostel--send-encoded "next" "")))
+    (define-key map (kbd "<deletechar>") (lambda () (interactive) (ghostel--send-encoded "delete" "")))
+    (define-key map (kbd "<insert>")  (lambda () (interactive) (ghostel--send-encoded "insert" "")))
+    ;; Function keys
+    (define-key map (kbd "<f1>")      (lambda () (interactive) (ghostel--send-encoded "f1" "")))
+    (define-key map (kbd "<f2>")      (lambda () (interactive) (ghostel--send-encoded "f2" "")))
+    (define-key map (kbd "<f3>")      (lambda () (interactive) (ghostel--send-encoded "f3" "")))
+    (define-key map (kbd "<f4>")      (lambda () (interactive) (ghostel--send-encoded "f4" "")))
+    (define-key map (kbd "<f5>")      (lambda () (interactive) (ghostel--send-encoded "f5" "")))
+    (define-key map (kbd "<f6>")      (lambda () (interactive) (ghostel--send-encoded "f6" "")))
+    (define-key map (kbd "<f7>")      (lambda () (interactive) (ghostel--send-encoded "f7" "")))
+    (define-key map (kbd "<f8>")      (lambda () (interactive) (ghostel--send-encoded "f8" "")))
+    (define-key map (kbd "<f9>")      (lambda () (interactive) (ghostel--send-encoded "f9" "")))
+    (define-key map (kbd "<f10>")     (lambda () (interactive) (ghostel--send-encoded "f10" "")))
+    (define-key map (kbd "<f11>")     (lambda () (interactive) (ghostel--send-encoded "f11" "")))
+    (define-key map (kbd "<f12>")     (lambda () (interactive) (ghostel--send-encoded "f12" "")))
     map)
   "Keymap for `ghostel-mode'.")
 
@@ -113,26 +128,39 @@ These keys pass through to Emacs instead."
   (when (and ghostel--process (process-live-p ghostel--process))
     (process-send-string ghostel--process key)))
 
+(defun ghostel--send-encoded (key-name mods &optional utf8)
+  "Encode KEY-NAME with MODS via the terminal's key encoder and send.
+KEY-NAME is a string like \"a\", \"return\", \"up\".
+MODS is a string like \"ctrl\", \"shift,ctrl\", or \"\".
+UTF8 is optional text generated by the key."
+  (when ghostel--term
+    (ghostel--encode-key ghostel--term key-name mods utf8)))
+
 (defun ghostel--self-insert ()
   "Send the last typed character to the terminal."
   (interactive)
-  (let ((char (this-command-keys)))
-    (ghostel--send-key char)))
+  (let* ((keys (this-command-keys))
+         (char (aref keys (1- (length keys)))))
+    (if (and (characterp char) (< char 128))
+        ;; ASCII: send directly for simplicity
+        (ghostel--send-key (string char))
+      ;; Non-ASCII: encode as UTF-8 and send
+      (ghostel--send-key (encode-coding-string (string char) 'utf-8)))))
 
 (defun ghostel--send-return ()
   "Send return to the terminal."
   (interactive)
-  (ghostel--send-key "\r"))
+  (ghostel--send-encoded "return" ""))
 
 (defun ghostel--send-tab ()
   "Send tab to the terminal."
   (interactive)
-  (ghostel--send-key "\t"))
+  (ghostel--send-encoded "tab" ""))
 
 (defun ghostel--send-backspace ()
   "Send backspace to the terminal."
   (interactive)
-  (ghostel--send-key "\x7f"))
+  (ghostel--send-encoded "backspace" ""))
 
 ;;; Callbacks from native module
 
