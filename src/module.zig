@@ -33,6 +33,8 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--get-pwd", 1, 1, &fnGetPwd, "Get the terminal's working directory from OSC 7.\n\n(ghostel--get-pwd TERM)");
     env.bindFunction("ghostel--redraw", 1, 1, &fnRedraw, "Redraw dirty regions of the terminal into the current buffer.\n\n(ghostel--redraw TERM)");
     env.bindFunction("ghostel--scroll", 2, 2, &fnScroll, "Scroll the terminal viewport by DELTA lines.\n\n(ghostel--scroll TERM DELTA)");
+    env.bindFunction("ghostel--scroll-top", 1, 1, &fnScrollTop, "Scroll the terminal viewport to the top of scrollback.\n\n(ghostel--scroll-top TERM)");
+    env.bindFunction("ghostel--scroll-bottom", 1, 1, &fnScrollBottom, "Scroll the terminal viewport to the bottom.\n\n(ghostel--scroll-bottom TERM)");
     env.bindFunction("ghostel--encode-key", 3, 4, &fnEncodeKey, "Encode a key event using the terminal's key encoder.\n\n(ghostel--encode-key TERM KEY MODS &optional UTF8)");
     env.bindFunction("ghostel--mouse-event", 6, 6, &fnMouseEvent, "Send a mouse event to the terminal.\n\n(ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)");
     env.bindFunction("ghostel--focus-event", 2, 2, &fnFocusEvent, "Send a focus event to the terminal.\n\n(ghostel--focus-event TERM GAINED)");
@@ -340,6 +342,22 @@ fn fnScroll(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyo
     const delta = env.extractInteger(args[1]);
     term.scrollViewport(gt.SCROLL_DELTA, @intCast(delta));
 
+    return env.nil();
+}
+
+/// (ghostel--scroll-top TERM)
+fn fnScrollTop(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+    return env.nil();
+}
+
+/// (ghostel--scroll-bottom TERM)
+fn fnScrollBottom(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
     return env.nil();
 }
 

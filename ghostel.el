@@ -733,6 +733,24 @@ pasted using bracketed paste."
           (move-to-column col)))
     (forward-line 1)))
 
+(defun ghostel-copy-mode-beginning-of-buffer ()
+  "Scroll to the top of scrollback in copy mode."
+  (interactive)
+  (when ghostel--term
+    (ghostel--scroll-top ghostel--term)
+    (let ((inhibit-read-only t))
+      (ghostel--redraw ghostel--term))
+    (goto-char (point-min))))
+
+(defun ghostel-copy-mode-end-of-buffer ()
+  "Scroll to the bottom of scrollback in copy mode."
+  (interactive)
+  (when ghostel--term
+    (ghostel--scroll-bottom ghostel--term)
+    (let ((inhibit-read-only t))
+      (ghostel--redraw ghostel--term))
+    (goto-char (point-max))))
+
 ;;; Mouse input
 
 (defun ghostel--mouse-button-number (event)
@@ -814,6 +832,8 @@ pasted using bracketed paste."
     (define-key map (kbd "C-v")             #'ghostel-copy-mode-scroll-down)
     (define-key map (kbd "C-n")             #'ghostel-copy-mode-next-line)
     (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
+    (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
+    (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
