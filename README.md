@@ -45,9 +45,14 @@ Then `M-x ghostel` to open a terminal.
 
 ## Shell Integration
 
-For directory tracking and other features, source the appropriate shell
-integration script. Ghostel sets `INSIDE_EMACS=ghostel` and
-`EMACS_GHOSTEL_PATH` in the shell environment.
+Shell integration (directory tracking via OSC 7, etc.) is **automatic** for
+bash, zsh, and fish.  No changes to your shell configuration files are needed.
+
+This is controlled by `ghostel-shell-integration` (default `t`).  Set it to
+`nil` to disable auto-injection and source the scripts manually instead:
+
+<details>
+<summary>Manual shell integration</summary>
 
 **bash** — add to `~/.bashrc`:
 ```bash
@@ -63,6 +68,7 @@ integration script. Ghostel sets `INSIDE_EMACS=ghostel` and
 ```fish
 test "$INSIDE_EMACS" = 'ghostel'; and source "$EMACS_GHOSTEL_PATH/etc/ghostel.fish"
 ```
+</details>
 
 ## Key Bindings
 
@@ -150,6 +156,7 @@ individual faces with `M-x customize-face`.
 | Variable                      | Default             | Description                            |
 |-------------------------------|---------------------|----------------------------------------|
 | `ghostel-shell`               | `$SHELL`            | Shell program to run                   |
+| `ghostel-shell-integration`   | `t`                 | Auto-inject shell integration          |
 | `ghostel-buffer-name`         | `"*ghostel*"`       | Default buffer name                    |
 | `ghostel-max-scrollback`      | `10000`             | Maximum scrollback lines               |
 | `ghostel-timer-delay`         | `0.033`             | Redraw delay in seconds (~30fps)       |

@@ -165,6 +165,14 @@ opening the file at the given line in another window."
   :type 'boolean
   :group 'ghostel)
 
+(defcustom ghostel-shell-integration t
+  "Automatically inject shell integration on startup.
+When non-nil, ghostel modifies the shell invocation to automatically
+load shell integration scripts without requiring changes to the user's
+shell configuration files.  Supports bash, zsh, and fish."
+  :type 'boolean
+  :group 'ghostel)
+
 (defcustom ghostel-keymap-exceptions
   '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
@@ -1016,6 +1024,50 @@ PROCESS is the shell process, EVENT describes the state change."
          (ghostel-dir (file-name-directory
                        (or load-file-name buffer-file-name
                            default-directory)))
+         (shell-type (and ghostel-shell-integration
+                          (ghostel--detect-shell ghostel-shell)))
+         (integration-env
+          (pcase shell-type
+            ('bash
+             (let ((inject-script (expand-file-name
+                                   "etc/shell-integration/bash/ghostel-inject.bash"
+                                   ghostel-dir))
+                   (env (list "GHOSTEL_BASH_INJECT=1")))
+               (when (file-readable-p inject-script)
+                 (let ((old-env (getenv "ENV")))
+                   (when old-env
+                     (push (format "GHOSTEL_BASH_ENV=%s" old-env) env)))
+                 (push (format "ENV=%s" inject-script) env)
+                 (unless (getenv "HISTFILE")
+                   (push (format "HISTFILE=%s/.bash_history"
+                                 (expand-file-name "~"))
+                         env)
+                   (push "GHOSTEL_BASH_UNEXPORT_HISTFILE=1" env))
+                 env)))
+            ('zsh
+             (let ((zsh-dir (expand-file-name
+                             "etc/shell-integration/zsh" ghostel-dir)))
+               (when (file-directory-p zsh-dir)
+                 (let ((env nil)
+                       (old-zdotdir (getenv "ZDOTDIR")))
+                   (when old-zdotdir
+                     (push (format "GHOSTEL_ZSH_ZDOTDIR=%s" old-zdotdir) env))
+                   (push (format "ZDOTDIR=%s" zsh-dir) env)
+                   env))))
+            ('fish
+             (let ((integ-dir (expand-file-name
+                               "etc/shell-integration" ghostel-dir)))
+               (when (file-directory-p integ-dir)
+                 (let ((xdg (or (getenv "XDG_DATA_DIRS")
+                                "/usr/local/share:/usr/share")))
+                   (list
+                    (format "XDG_DATA_DIRS=%s:%s" integ-dir xdg)
+                    (format "GHOSTEL_SHELL_INTEGRATION_XDG_DIR=%s"
+                            integ-dir))))))))
+         ;; Only add --posix when bash injection actually succeeded.
+         (shell-command (if (and (eq shell-type 'bash) integration-env)
+                            (list ghostel-shell "--posix")
+                          (list ghostel-shell)))
          (process-environment
           (append
            (list
@@ -1025,11 +1077,12 @@ PROCESS is the shell process, EVENT describes the state change."
             "COLORTERM=truecolor"
             (format "COLUMNS=%d" width)
             (format "LINES=%d" height))
+           integration-env
            process-environment))
          (proc (make-process
                 :name "ghostel"
                 :buffer (current-buffer)
-                :command (list ghostel-shell)
+                :command shell-command
                 :connection-type 'pty
                 :filter #'ghostel--filter
                 :sentinel #'ghostel--sentinel)))
@@ -1040,11 +1093,15 @@ PROCESS is the shell process, EVENT describes the state change."
     ;; the shell's line editor (readline/ZLE) can render properly.
     (set-process-window-size proc height width)
     (set-process-query-on-exit-flag proc nil)
-    ;; Enable PTY echo.  Shells like bash's readline buffer their own
-    ;; echo output so it never reaches our process filter.  Enabling
-    ;; PTY-level echo makes the kernel echo input immediately.  Shells
-    ;; that manage echo themselves (zsh/ZLE) override this on each prompt.
-    (process-send-string proc "stty echo\n")
+    ;; iutf8: kernel-level UTF-8 awareness so backspace correctly
+    ;; erases multi-byte characters.  Useful for all shells.
+    ;; stty echo: bash-only — readline buffers its own echo, so we
+    ;; need PTY-level echo.  When bash integration is active, the
+    ;; integration script handles echo; we still set iutf8 here.
+    (if (and (eq (ghostel--detect-shell ghostel-shell) 'bash)
+             (not integration-env))
+        (process-send-string proc "stty iutf8 echo\n")
+      (process-send-string proc "stty iutf8\n"))
     proc))
 
 ;;; Rendering
