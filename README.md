@@ -10,11 +10,52 @@ process, keymap, and buffer.
 
 ## Requirements
 
-- Emacs 25.1+ with dynamic module support
-- [Zig](https://ziglang.org/) 0.14+
+- Emacs 27.1+ with dynamic module support
 - macOS or Linux
 
-## Building
+The native module is **automatically downloaded** on first use (pre-built
+binaries are available for macOS and Linux).  If you prefer to build from
+source, you'll also need [Zig](https://ziglang.org/) 0.14+ and the ghostty
+submodule (see [Building from source](#building-from-source)).
+
+## Installation
+
+### use-package with vc (Emacs 30+)
+
+```elisp
+(use-package ghostel
+  :vc (:url "https://github.com/dakra/ghostel" :rev :newest))
+```
+
+### use-package with load-path
+
+```elisp
+(use-package ghostel
+  :load-path "/path/to/ghostel")
+```
+
+### Manual
+
+```elisp
+(add-to-list 'load-path "/path/to/ghostel")
+(require 'ghostel)
+```
+
+Then `M-x ghostel` to open a terminal.
+
+### Native module
+
+When the native module is missing, Ghostel will offer to **download a
+pre-built binary** or **compile from source** (controlled by
+`ghostel-module-auto-install`, default `ask`).  You can also trigger these
+manually:
+
+- `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
+- `M-x ghostel-module-compile` — build from source via `build.sh`
+
+## Building from source
+
+Building is only needed if you don't want to use the pre-built binaries.
 
 ```sh
 # Clone with submodule
@@ -31,17 +72,6 @@ If you already have the repo, initialize the submodule and build:
 git submodule update --init vendor/ghostty
 ./build.sh
 ```
-
-## Installation
-
-Add to your Emacs config:
-
-```elisp
-(add-to-list 'load-path "/path/to/ghostel")
-(require 'ghostel)
-```
-
-Then `M-x ghostel` to open a terminal.
 
 ## Shell Integration
 
@@ -109,7 +139,7 @@ Normal letter keys exit copy mode and send the key to the terminal.
 | `M-<` / `M->` | Jump to top / bottom of buffer  |
 | `C-c C-n`     | Jump to next prompt             |
 | `C-c C-p`     | Jump to previous prompt         |
-| `C-t`         | Exit without copying            |
+| `C-c C-t`     | Exit without copying            |
 | `a`–`z`       | Exit and send key to terminal   |
 
 Soft-wrapped newlines are automatically stripped from copied text.
@@ -118,32 +148,41 @@ Soft-wrapped newlines are automatically stripped from copied text.
 
 ### Terminal Emulation
 - Full VT terminal emulation via libghostty-vt
-- 256-color and RGB color support
+- 256-color and RGB (24-bit true color) support
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
 - Cursor styles: block, bar, underline, hollow block
 - Alternate screen buffer (for TUI apps like htop, vim, etc.)
 - Scrollback buffer (configurable, default 10,000 lines)
 
-### Rendering
-- Incremental redraw — only dirty rows are re-rendered
-- Timer-based batched updates (~30fps) to avoid flicker
-- Cursor position updates even without cell changes
+### Links and File Detection
+- **OSC 8 hyperlinks** — clickable URLs emitted by terminal programs (click or `RET` to open)
+- **Plain-text URL detection** — automatically linkifies `http://` and `https://` URLs even without OSC 8 (toggle with `ghostel-enable-url-detection`)
+- **File path detection** — patterns like `/path/to/file.el:42` become clickable, opening the file at the given line (toggle with `ghostel-enable-file-detection`)
+
+### Clipboard
+- **OSC 52 clipboard** — terminal programs can set the Emacs kill ring and system clipboard (opt-in via `ghostel-enable-osc52`, useful for remote SSH sessions)
+- **Bracketed paste** — yank from kill ring sends text as a bracketed paste so shells handle it correctly
 
 ### Input
-- Full keyboard input with GhosttyKeyEncoder (respects terminal modes)
-- Mouse tracking with GhosttyMouseEncoder (press, release, drag)
+- Full keyboard input with Ghostty key encoder (respects terminal modes, Kitty keyboard protocol)
+- Mouse tracking (press, release, drag) via SGR mouse protocol — TUI apps receive full mouse input
 - Focus events gated by DEC mode 1004
-- Bracketed paste
 - Drag-and-drop (file paths and text)
 
 ### Shell Integration
-- Directory tracking via OSC 7
-- Prompt navigation via OSC 133 — jump between prompts with `C-c C-n` / `C-c C-p`
-- Title tracking (buffer renamed from OSC 2)
-- OSC 8 hyperlinks — clickable URLs in terminal output (click or `RET` to open)
-- Elisp eval from shell via OSC 51 — call whitelisted Emacs functions from shell scripts
-- OSC 52 clipboard support (opt-in, for remote sessions)
+- Automatic injection for bash, zsh, and fish — no shell RC edits needed
+- **OSC 7** — directory tracking (`default-directory` follows the shell's cwd)
+- **OSC 133** — semantic prompt markers, enabling prompt-to-prompt navigation with `C-c C-n` / `C-c C-p`
+- **OSC 2** — title tracking (buffer is renamed from the terminal title)
+- **OSC 51** — call whitelisted Emacs functions from shell scripts (see [Calling Elisp from the Shell](#calling-elisp-from-the-shell))
+- **OSC 52** — clipboard support (opt-in, for remote sessions)
 - `INSIDE_EMACS` and `EMACS_GHOSTEL_PATH` environment variables
+
+### Rendering
+- Incremental redraw — only dirty rows are re-rendered
+- Timer-based batched updates with adaptive frame rate
+- Cursor position updates even without cell changes
+- Theme-aware color palette (syncs with Emacs theme via `ghostel-sync-theme`)
 
 ### Calling Elisp from the Shell
 
@@ -203,34 +242,41 @@ individual faces with `M-x customize-face`.
 
 ## Configuration
 
-| Variable                           | Default             | Description                                |
-|------------------------------------|---------------------|--------------------------------------------|
-| `ghostel-shell`                    | `$SHELL`            | Shell program to run                       |
-| `ghostel-shell-integration`        | `t`                 | Auto-inject shell integration              |
-| `ghostel-buffer-name`              | `"*ghostel*"`       | Default buffer name                        |
-| `ghostel-max-scrollback`           | `10000`             | Maximum scrollback lines                   |
-| `ghostel-timer-delay`              | `0.033`             | Redraw delay in seconds (~30fps)           |
-| `ghostel-kill-buffer-on-exit`      | `t`                 | Kill buffer when shell exits               |
-| `ghostel-eval-cmds`                | `(see above)`       | Whitelisted functions for OSC 51 eval      |
-| `ghostel-enable-osc52`             | `nil`               | Allow apps to set clipboard via OSC 52     |
-| `ghostel-prompt-reapply-on-redraw` | `nil`               | Re-apply prompt markers after full redraws |
-| `ghostel-keymap-exceptions`        | `("C-c" "C-x" ...)` | Keys passed through to Emacs               |
-| `ghostel-exit-functions`           | `nil`               | Hook run when the shell process exits      |
+| Variable                         | Default              | Description                                              |
+|----------------------------------|----------------------|----------------------------------------------------------|
+| `ghostel-module-auto-install`    | `ask`                | What to do when native module is missing (`ask`, `download`, `compile`, `nil`) |
+| `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
+| `ghostel-shell-integration`      | `t`                  | Auto-inject shell integration                            |
+| `ghostel-buffer-name`            | `"*ghostel*"`        | Default buffer name                                      |
+| `ghostel-max-scrollback`         | `10000`              | Maximum scrollback lines                                 |
+| `ghostel-timer-delay`            | `0.033`              | Base redraw delay in seconds (~30fps)                    |
+| `ghostel-adaptive-fps`           | `t`                  | Adaptive frame rate (shorter delay after idle, stop timer when idle) |
+| `ghostel-full-redraw`            | `nil`                | Always do full redraws instead of incremental updates    |
+| `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
+| `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
+| `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
+| `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
+| `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
+| `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)` | Keys passed through to Emacs                             |
+| `ghostel-exit-functions`         | `nil`                | Hook run when the shell process exits                    |
 
 ## Commands
 
-| Command                        | Description                           |
-|--------------------------------|---------------------------------------|
-| `M-x ghostel`                  | Open a new terminal                   |
-| `M-x ghostel-other`            | Switch to next terminal or create one |
-| `M-x ghostel-clear`            | Clear screen and scrollback           |
-| `M-x ghostel-clear-scrollback` | Clear scrollback only                 |
-| `M-x ghostel-copy-mode`        | Enter copy mode                       |
-| `M-x ghostel-paste`            | Paste from kill ring                  |
-| `M-x ghostel-send-next-key`    | Send next key literally               |
-| `M-x ghostel-next-prompt`      | Jump to next shell prompt             |
-| `M-x ghostel-previous-prompt`  | Jump to previous shell prompt         |
-| `M-x ghostel-force-redraw`     | Force a full terminal redraw          |
+| Command                        | Description                                  |
+|--------------------------------|----------------------------------------------|
+| `M-x ghostel`                  | Open a new terminal                          |
+| `M-x ghostel-other`            | Switch to next terminal or create one        |
+| `M-x ghostel-clear`            | Clear screen and scrollback                  |
+| `M-x ghostel-clear-scrollback` | Clear scrollback only                        |
+| `M-x ghostel-copy-mode`        | Enter copy mode                              |
+| `M-x ghostel-paste`            | Paste from kill ring                         |
+| `M-x ghostel-send-next-key`    | Send next key literally                      |
+| `M-x ghostel-next-prompt`      | Jump to next shell prompt                    |
+| `M-x ghostel-previous-prompt`  | Jump to previous shell prompt                |
+| `M-x ghostel-force-redraw`     | Force a full terminal redraw                 |
+| `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
+| `M-x ghostel-download-module`  | Download pre-built native module             |
+| `M-x ghostel-module-compile`   | Compile native module from source            |
 
 ## Running Tests
 
@@ -314,6 +360,7 @@ powering Neovim's built-in terminal.
 | OSC 52 clipboard              | Yes       | Yes     |
 | Copy mode                     | Yes       | Yes     |
 | Drag-and-drop                 | Yes       | No      |
+| Auto module download          | Yes       | No      |
 | Scrollback default            | 10,000    | 1,000   |
 | PTY throughput (plain ASCII)  | 72 MB/s   | 33 MB/s |
 | Default redraw rate           | ~30 fps   | ~10 fps |
@@ -350,9 +397,10 @@ but with detection disabled ghostel reaches 74 MB/s.  See the
 [Performance](#performance) section above for full numbers and how to run the
 benchmark suite yourself.
 
-**Build.**  Ghostel requires the [Zig](https://ziglang.org/) toolchain and
-links libghostty-vt (static) plus C++ dependencies.  vterm uses CMake with a
-single C dependency (libvterm) and can auto-compile on first load from Elisp.
+**Installation.**  Ghostel can automatically download a pre-built native
+module or compile from source with [Zig](https://ziglang.org/).  vterm uses
+CMake with a single C dependency (libvterm) and can auto-compile on first
+load from Elisp.
 
 For a detailed architectural comparison, see [design.org](design.org).
 
@@ -362,7 +410,7 @@ For a detailed architectural comparison, see [design.org](design.org).
 ghostel.el          Elisp: keymap, process management, mode, commands
 src/module.zig      Entry point: emacs_module_init, function registration
 src/terminal.zig    Terminal struct wrapping ghostty handles
-src/render.zig      RenderState → Emacs buffer with styled text
+src/render.zig      RenderState -> Emacs buffer with styled text
 src/input.zig       Key and mouse encoding via ghostty encoders
 src/emacs.zig       Zig wrapper for the Emacs module C API
 src/ghostty.zig     Re-exports and constants for the ghostty C API
