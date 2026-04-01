@@ -17,7 +17,7 @@ fi
 
 # Build libghostty-vt
 echo "Building libghostty-vt..."
-(cd vendor/ghostty && zig build -Demit-lib-vt=true)
+(cd vendor/ghostty && zig build -Demit-lib-vt=true -Doptimize=ReleaseFast)
 
 # Copy bundled C++ dependencies to stable paths.
 # These are built by ghostty's zig build into a cache directory with
@@ -52,7 +52,7 @@ echo "  libhighway.a <- $HIGHWAY"
 
 # Build ghostel module
 echo "Building ghostel module..."
-zig build
+zig build -Doptimize=ReleaseFast
 
 echo "Done! ghostel-module$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or ".so")' 2>/dev/null || echo '.dylib') is ready."
 echo "Load in Emacs with: (require 'ghostel)"
