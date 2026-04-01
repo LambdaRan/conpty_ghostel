@@ -1562,14 +1562,22 @@ frame after idle to improve interactive responsiveness."
           (let ((inhibit-read-only t)
                 (inhibit-redisplay t)
                 (inhibit-modification-hooks t))
-            (ghostel--redraw ghostel--term)))))))
+            (ghostel--redraw ghostel--term)
+            (ghostel--pin-window-start)))))))
+
+(defun ghostel--pin-window-start ()
+  "Pin the window so terminal row 1 stays at the top."
+  (let ((win (get-buffer-window)))
+    (when win
+      (set-window-start win (point-min) t))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
   (interactive)
   (when ghostel--term
     (let ((inhibit-read-only t))
-      (ghostel--redraw ghostel--term))))
+      (ghostel--redraw ghostel--term)
+      (ghostel--pin-window-start))))
 
 ;;; Window resize
 
@@ -1615,7 +1623,8 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
         (let ((inhibit-read-only t)
               (inhibit-redisplay t)
               (inhibit-modification-hooks t))
-          (ghostel--redraw ghostel--term))))))
+          (ghostel--redraw ghostel--term)
+          (ghostel--pin-window-start))))))
 
 ;;; Major mode
 
@@ -1628,6 +1637,7 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
   (setq-local hscroll-margin 0)
   (setq-local truncate-lines t)
   (setq-local scroll-conservatively 101)
+  (setq-local line-spacing 0)
   (setq-local window-adjust-process-window-size-function
               #'ghostel--window-adjust-process-window-size)
   (add-function :after after-focus-change-function #'ghostel--focus-change))

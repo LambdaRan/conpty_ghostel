@@ -729,6 +729,16 @@ pub fn redraw(env: emacs.Env, term: *Terminal) void {
             row_count += 1;
         }
 
+        // Trim excess buffer lines beyond the terminal's row count.
+        // Partial redraws don't erase the buffer, so stale trailing
+        // lines can accumulate after a resize or mode switch.
+        if (partial and row_count > 0) {
+            env.gotoCharN(1);
+            if (env.forwardLine(@as(i64, @intCast(row_count))) == 0) {
+                env.deleteRegion(env.point(), env.pointMax());
+            }
+        }
+
         // Reset dirty state
         const dirty_false: c_int = gt.DIRTY_FALSE;
         _ = gt.c.ghostty_render_state_set(term.render_state, gt.RS_OPT_DIRTY, @ptrCast(&dirty_false));
