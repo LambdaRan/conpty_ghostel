@@ -37,3 +37,15 @@ __ghostel_preexec() {
 
 precmd_functions=(__ghostel_save_status __ghostel_prompt_start __ghostel_osc7 "${precmd_functions[@]}" __ghostel_prompt_end)
 preexec_functions=(__ghostel_preexec "${preexec_functions[@]}")
+
+# Call an Emacs Elisp function from the shell.
+# Usage: ghostel_cmd FUNCTION [ARGS...]
+# The function must be in `ghostel-eval-cmds'.
+ghostel_cmd() {
+    local payload=""
+    while (( $# )); do
+        payload="$payload\"${1//\\/\\\\}\" "
+        shift
+    done
+    printf '\e]51;E%s\e\\' "$payload"
+}

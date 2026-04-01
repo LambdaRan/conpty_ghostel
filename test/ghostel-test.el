@@ -820,6 +820,28 @@
           (kill-buffer other))))))
 
 ;; -----------------------------------------------------------------------
+;; OSC 51 elisp eval
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-osc51-eval ()
+  "Test that OSC 51;E dispatches to whitelisted functions."
+  (let* ((called-with nil)
+         (ghostel-eval-cmds
+          `(("test-fn" ,(lambda (&rest args) (setq called-with args))))))
+    (ghostel--osc51-eval "\"test-fn\" \"hello\" \"world\"")
+    (should (equal '("hello" "world") called-with))))
+
+(ert-deftest ghostel-test-osc51-eval-unknown ()
+  "Test that unknown OSC 51;E commands produce a message."
+  (let ((ghostel-eval-cmds nil)
+        (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (ghostel--osc51-eval "\"unknown-fn\" \"arg\"")
+      (should (car messages))
+      (should (string-match-p "unknown eval command" (car messages))))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -831,7 +853,9 @@
     ghostel-test-update-directory
     ghostel-test-filter-soft-wraps
     ghostel-test-prompt-navigation
-    ghostel-test-sync-theme)
+    ghostel-test-sync-theme
+    ghostel-test-osc51-eval
+    ghostel-test-osc51-eval-unknown)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()

@@ -176,6 +176,7 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
 
     // Scan for OSC sequences that libghostty-vt discards.
     extractAndSetPwd(term, raw);
+    extractOsc51(env, raw);
     extractOsc52(env, raw);
     extractOsc133(env, raw);
 
@@ -226,6 +227,23 @@ const OscScanner = struct {
         return null;
     }
 };
+
+/// Scan data for OSC 51;E elisp eval sequences.
+/// OSC 51 format: ESC ] 51 ; E <quoted-args> (ST | BEL)
+/// Passes the payload (after 'E') to ghostel--osc51-eval for dispatch.
+fn extractOsc51(env: emacs.Env, data: []const u8) void {
+    var scanner = OscScanner{ .data = data, .prefix = "\x1b]51;" };
+    while (scanner.next()) |match| {
+        const payload = match.payload;
+        if (payload.len < 2) continue;
+        // Sub-command must be 'E'
+        if (payload[0] != 'E') continue;
+        _ = env.call1(
+            emacs.sym.@"ghostel--osc51-eval",
+            env.makeString(payload[1..]),
+        );
+    }
+}
 
 /// Scan data for OSC 7 sequences and set the terminal PWD.
 /// OSC 7 format: ESC ] 7 ; <url> (ST | BEL)

@@ -36,3 +36,16 @@ end
 function __ghostel_preexec --on-event fish_preexec
     printf '\e]133;C\e\\'
 end
+
+# Call an Emacs Elisp function from the shell.
+# Usage: ghostel_cmd FUNCTION [ARGS...]
+# The function must be in `ghostel-eval-cmds'.
+function ghostel_cmd
+    set -l payload ""
+    for arg in $argv
+        set arg (string replace -a '\\' '\\\\' -- $arg)
+        set arg (string replace -a '"' '\\"' -- $arg)
+        set payload "$payload\"$arg\" "
+    end
+    printf '\e]51;E%s\e\\' "$payload"
+end

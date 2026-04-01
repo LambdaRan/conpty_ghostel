@@ -333,6 +333,18 @@ exit event string."
   :type 'hook
   :group 'ghostel)
 
+(defcustom ghostel-eval-cmds '(("find-file" find-file)
+                                ("find-file-other-window" find-file-other-window)
+                                ("dired" dired)
+                                ("dired-other-window" dired-other-window)
+                                ("message" message))
+  "Whitelisted Emacs functions callable from the terminal via OSC 51.
+Each entry is (NAME FUNCTION) where NAME is the string sent from
+the shell and FUNCTION is the Elisp function to invoke.
+All arguments are passed as strings."
+  :type '(alist :key-type string :value-type function)
+  :group 'ghostel)
+
 (defcustom ghostel-enable-osc52 nil
   "Allow terminal applications to set the clipboard via OSC 52.
 When non-nil, programs running in the terminal can copy text to the
@@ -1295,6 +1307,20 @@ the last non-whitespace+whitespace boundary (e.g. after `$ ' or `# ')."
   (ghostel--navigate-previous-prompt n))
 
 ;;; Callbacks from native module
+
+(defun ghostel--osc51-eval (str)
+  "Handle an OSC 51;E command from the terminal.
+STR is the payload after the E sub-command.
+Parses the command and arguments, looks up the command in
+`ghostel-eval-cmds', and calls it if whitelisted."
+  (let* ((parts (split-string-and-unquote str))
+         (command (car parts))
+         (args (cdr parts))
+         (entry (assoc command ghostel-eval-cmds)))
+    (if entry
+        (apply (cadr entry) args)
+      (message "ghostel: unknown eval command %S (add to `ghostel-eval-cmds' to allow)"
+               command))))
 
 (defun ghostel--osc52-handle (_selection base64-data)
   "Handle an OSC 52 clipboard set request.

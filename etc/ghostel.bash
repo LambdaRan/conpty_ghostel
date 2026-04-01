@@ -60,3 +60,15 @@ __ghostel_original_prompt_command="${PROMPT_COMMAND:+$PROMPT_COMMAND}"
 PROMPT_COMMAND="__ghostel_wrapped_prompt_command"
 
 trap '__ghostel_preexec' DEBUG
+
+# Call an Emacs Elisp function from the shell.
+# Usage: ghostel_cmd FUNCTION [ARGS...]
+# The function must be in `ghostel-eval-cmds'.
+ghostel_cmd() {
+    local payload=""
+    while [ $# -gt 0 ]; do
+        payload="$payload\"$(printf '%s' "$1" | sed -e 's|\\|\\\\|g' -e 's|"|\\"|g')\" "
+        shift
+    done
+    printf '\e]51;E%s\e\\' "$payload"
+}

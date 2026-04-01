@@ -302,6 +302,7 @@ pub const Sym = struct {
     @"ghostel--detect-urls": Value,
     @"ghostel--set-cursor-style": Value,
     @"ghostel--update-directory": Value,
+    @"ghostel--osc51-eval": Value,
     @"ghostel--osc52-handle": Value,
     @"ghostel--osc133-marker": Value,
     @"ghostel--flush-output": Value,

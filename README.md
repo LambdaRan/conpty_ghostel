@@ -141,8 +141,47 @@ Soft-wrapped newlines are automatically stripped from copied text.
 - Prompt navigation via OSC 133 — jump between prompts with `C-c C-n` / `C-c C-p`
 - Title tracking (buffer renamed from OSC 2)
 - OSC 8 hyperlinks — clickable URLs in terminal output (click or `RET` to open)
+- Elisp eval from shell via OSC 51 — call whitelisted Emacs functions from shell scripts
 - OSC 52 clipboard support (opt-in, for remote sessions)
 - `INSIDE_EMACS` and `EMACS_GHOSTEL_PATH` environment variables
+
+### Calling Elisp from the Shell
+
+Shell scripts running inside ghostel can call whitelisted Elisp functions
+via the `ghostel_cmd` helper (provided by the shell integration scripts):
+
+```sh
+ghostel_cmd find-file "/path/to/file"
+ghostel_cmd message "Hello from the shell"
+```
+
+This uses OSC 51 escape sequences (the same protocol as vterm).  Only
+functions listed in `ghostel-eval-cmds` are allowed.
+
+Default whitelisted commands:
+
+`find-file`, `find-file-other-window`, `dired`, `dired-other-window`, `message`.
+
+Add your own with:
+
+```elisp
+(add-to-list 'ghostel-eval-cmds '("magit-status-setup-buffer" magit-status-setup-buffer))
+```
+
+Example shell aliases (add to your `.bashrc` / `.zshrc`):
+
+```sh
+if [[ "$INSIDE_EMACS" = 'ghostel' ]]; then
+    # Open a file in Emacs from the terminal
+    e()   { ghostel_cmd find-file-other-window "$@"; }
+
+    # Open dired in another window
+    dow() { ghostel_cmd dired-other-window "$@"; }
+
+    # Open magit for the current directory
+    gst() { ghostel_cmd magit-status-setup-buffer "$(pwd)"; }
+fi
+```
 
 ### Color Palette
 
@@ -164,18 +203,19 @@ individual faces with `M-x customize-face`.
 
 ## Configuration
 
-| Variable                      | Default             | Description                            |
-|-------------------------------|---------------------|----------------------------------------|
-| `ghostel-shell`               | `$SHELL`            | Shell program to run                   |
-| `ghostel-shell-integration`   | `t`                 | Auto-inject shell integration          |
-| `ghostel-buffer-name`         | `"*ghostel*"`       | Default buffer name                    |
-| `ghostel-max-scrollback`      | `10000`             | Maximum scrollback lines               |
-| `ghostel-timer-delay`         | `0.033`             | Redraw delay in seconds (~30fps)       |
-| `ghostel-kill-buffer-on-exit` | `t`                 | Kill buffer when shell exits           |
-| `ghostel-enable-osc52`        | `nil`               | Allow apps to set clipboard via OSC 52 |
-| `ghostel-prompt-reapply-on-redraw` | `nil`          | Re-apply prompt markers after full redraws |
-| `ghostel-keymap-exceptions`   | `("C-c" "C-x" ...)` | Keys passed through to Emacs           |
-| `ghostel-exit-functions`      | `nil`               | Hook run when the shell process exits  |
+| Variable                           | Default             | Description                                |
+|------------------------------------|---------------------|--------------------------------------------|
+| `ghostel-shell`                    | `$SHELL`            | Shell program to run                       |
+| `ghostel-shell-integration`        | `t`                 | Auto-inject shell integration              |
+| `ghostel-buffer-name`              | `"*ghostel*"`       | Default buffer name                        |
+| `ghostel-max-scrollback`           | `10000`             | Maximum scrollback lines                   |
+| `ghostel-timer-delay`              | `0.033`             | Redraw delay in seconds (~30fps)           |
+| `ghostel-kill-buffer-on-exit`      | `t`                 | Kill buffer when shell exits               |
+| `ghostel-eval-cmds`                | `(see above)`       | Whitelisted functions for OSC 51 eval      |
+| `ghostel-enable-osc52`             | `nil`               | Allow apps to set clipboard via OSC 52     |
+| `ghostel-prompt-reapply-on-redraw` | `nil`               | Re-apply prompt markers after full redraws |
+| `ghostel-keymap-exceptions`        | `("C-c" "C-x" ...)` | Keys passed through to Emacs               |
+| `ghostel-exit-functions`           | `nil`               | Hook run when the shell process exits      |
 
 ## Commands
 
@@ -269,7 +309,7 @@ powering Neovim's built-in terminal.
 | Alternate screen              | Yes       | Yes     |
 | Shell integration auto-inject | Yes       | No      |
 | Prompt navigation (OSC 133)   | Yes       | Yes     |
-| Elisp eval from shell         | No        | Yes     |
+| Elisp eval from shell         | Yes       | Yes     |
 | Tramp-aware directory         | No        | Yes     |
 | OSC 52 clipboard              | Yes       | Yes     |
 | Copy mode                     | Yes       | Yes     |
