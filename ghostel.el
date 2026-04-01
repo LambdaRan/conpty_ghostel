@@ -1011,7 +1011,8 @@ pasted using bracketed paste."
 
 (defvar ghostel-copy-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "q") #'ghostel-copy-mode-exit)
+    ;; Normal letter keys exit copy mode and send the key to the terminal
+    (define-key map [remap self-insert-command] #'ghostel-copy-mode-exit-and-send)
     (define-key map (kbd "C-c C-t") #'ghostel-copy-mode-exit)
     (define-key map (kbd "M-w") #'ghostel-copy-mode-copy)
     (define-key map (kbd "C-w") #'ghostel-copy-mode-copy)
@@ -1071,6 +1072,13 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (force-mode-line-update)
     (ghostel--invalidate)
     (message "Copy mode exited")))
+
+(defun ghostel-copy-mode-exit-and-send ()
+  "Exit copy mode and send the key that triggered exit to the terminal."
+  (interactive)
+  (ghostel-copy-mode-exit)
+  (when ghostel--term
+    (ghostel--self-insert)))
 
 (defun ghostel--filter-soft-wraps (text)
   "Remove newlines from TEXT that were inserted by soft line wrapping.

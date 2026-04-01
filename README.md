@@ -82,7 +82,7 @@ test "$INSIDE_EMACS" = 'ghostel'; and source "$EMACS_GHOSTEL_PATH/etc/ghostel.fi
 | `C-c C-z`   | Send suspend (C-z)                     |
 | `C-c C-d`   | Send EOF (C-d)                         |
 | `C-c C-\`   | Send quit (C-\)                        |
-| `C-c C-k`   | Enter copy mode                        |
+| `C-c C-t`   | Enter copy mode                        |
 | `C-y`       | Yank from kill ring (bracketed paste)  |
 | `M-y`       | Yank-pop (cycle through kill ring)     |
 | `C-c C-y`   | Paste from kill ring                   |
@@ -97,15 +97,20 @@ Keys listed in `ghostel-keymap-exceptions` (default: `C-c`, `C-x`, `C-u`,
 
 ### Copy mode
 
-Enter with `C-c C-k`. Standard Emacs navigation works.
+Enter with `C-c C-t`. Standard Emacs navigation works.
+Normal letter keys exit copy mode and send the key to the terminal.
 
-| Key           | Action                  |
-|---------------|-------------------------|
-| `C-SPC`       | Set mark                |
-| `M-w` / `C-w` | Copy selection and exit |
-| `C-c C-n`     | Jump to next prompt     |
-| `C-c C-p`     | Jump to previous prompt |
-| `q`           | Exit without copying    |
+| Key           | Action                          |
+|---------------|---------------------------------|
+| `C-SPC`       | Set mark                        |
+| `M-w` / `C-w` | Copy selection and exit         |
+| `C-n` / `C-p` | Move line (scrolls at edges)    |
+| `M-v` / `C-v` | Scroll page up / down           |
+| `M-<` / `M->` | Jump to top / bottom of buffer  |
+| `C-c C-n`     | Jump to next prompt             |
+| `C-c C-p`     | Jump to previous prompt         |
+| `C-t`         | Exit without copying            |
+| `a`–`z`       | Exit and send key to terminal   |
 
 Soft-wrapped newlines are automatically stripped from copied text.
 
