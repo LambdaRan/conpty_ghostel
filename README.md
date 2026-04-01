@@ -194,8 +194,22 @@ individual faces with `M-x customize-face`.
 
 ## Running Tests
 
+Tests use ERT.  The Makefile provides convenient targets:
+
 ```sh
-emacs --batch -Q -L . -l test/ghostel-test.el -f ghostel-test-run
+make test        # pure Elisp tests (no native module required)
+make all         # build + test + lint
+make bench-quick # quick benchmark sanity check
+```
+
+You can also run tests directly:
+
+```sh
+# Pure Elisp tests (no native module required)
+emacs --batch -Q -L . -l ert -l test/ghostel-test.el -f ghostel-test-run-elisp
+
+# Full test suite (requires built native module)
+emacs --batch -Q -L . -l ert -l test/ghostel-test.el -f ghostel-test-run
 ```
 
 ## Performance
@@ -228,6 +242,79 @@ Run the benchmarks yourself:
 bench/run-bench.sh              # full suite
 bench/run-bench.sh --quick      # quick sanity check
 ```
+
+## Ghostel vs vterm
+
+Both ghostel and [vterm](https://github.com/akermu/emacs-libvterm) are native
+module terminal emulators for Emacs.  Ghostel uses
+[libghostty-vt](https://ghostty.org/) (Zig) as its VT engine; vterm uses
+[libvterm](https://www.leonerd.org.uk/code/libvterm/) (C), the same library
+powering Neovim's built-in terminal.
+
+### Feature comparison
+
+| Feature                       | ghostel   | vterm   |
+|-------------------------------|-----------|---------|
+| True color (24-bit)           | Yes       | Yes     |
+| Bold / italic / faint         | Yes       | Yes     |
+| Underline styles (5 types)    | Yes       | No      |
+| Underline color               | Yes       | No      |
+| Strikethrough                 | Yes       | Yes     |
+| Cursor styles                 | 4 types   | 3 types |
+| OSC 8 hyperlinks              | Yes       | No      |
+| Plain-text URL/file detection | Yes       | No      |
+| Kitty keyboard protocol       | Yes       | No      |
+| Mouse passthrough (SGR)       | Yes       | No      |
+| Bracketed paste               | Yes       | Yes     |
+| Alternate screen              | Yes       | Yes     |
+| Shell integration auto-inject | Yes       | No      |
+| Prompt navigation (OSC 133)   | Yes       | Yes     |
+| Elisp eval from shell         | No        | Yes     |
+| Tramp-aware directory         | No        | Yes     |
+| OSC 52 clipboard              | Yes       | Yes     |
+| Copy mode                     | Yes       | Yes     |
+| Drag-and-drop                 | Yes       | No      |
+| Scrollback default            | 10,000    | 1,000   |
+| PTY throughput (plain ASCII)  | 72 MB/s   | 33 MB/s |
+| Default redraw rate           | ~30 fps   | ~10 fps |
+
+### Key differences
+
+**Terminal engine.**  libghostty-vt comes from
+[Ghostty](https://ghostty.org/), a modern GPU-accelerated terminal, and
+supports Kitty keyboard/mouse protocols, rich underline styles, and OSC 8
+hyperlinks.  libvterm targets VT220/xterm emulation and is more conservative
+in protocol support.
+
+**Mouse handling.**  Ghostel encodes mouse events (press, release, drag) and
+passes them through to the terminal via SGR mouse protocol.  TUI apps like
+htop or lazygit receive full mouse input.  vterm intercepts mouse clicks for
+Emacs point movement and does not forward them to the terminal.
+
+**Rendering.**  Both use text properties (not overlays) and batch consecutive
+cells with identical styles.  Ghostel's engine provides three-level dirty
+tracking (none / partial / full) with per-row granularity.  vterm uses
+damage-rectangle callbacks and redraws entire invalidated rows.  Ghostel
+defaults to ~30 fps redraw; vterm defaults to ~10 fps.
+
+**Shell integration.**  Ghostel auto-injects shell integration scripts for
+bash, zsh, and fish — no shell RC changes needed.  vterm requires manually
+sourcing scripts in your shell configuration.  vterm's shell integration is
+more featureful: it supports executing Elisp from the shell (`vterm_cmd`) and
+Tramp-aware remote directory tracking.
+
+**Performance.**  In PTY throughput benchmarks (1 MB streamed through `cat`),
+ghostel is roughly 2x faster than vterm on plain ASCII data (72 vs 33 MB/s).
+On URL-heavy output the gap narrows as ghostel's link detection adds overhead,
+but with detection disabled ghostel reaches 74 MB/s.  See the
+[Performance](#performance) section above for full numbers and how to run the
+benchmark suite yourself.
+
+**Build.**  Ghostel requires the [Zig](https://ziglang.org/) toolchain and
+links libghostty-vt (static) plus C++ dependencies.  vterm uses CMake with a
+single C dependency (libvterm) and can auto-compile on first load from Elisp.
+
+For a detailed architectural comparison, see [design.org](design.org).
 
 ## Architecture
 
