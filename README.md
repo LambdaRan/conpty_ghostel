@@ -8,6 +8,22 @@ Ghostel is inspired by
 module handles terminal state and rendering, while Elisp manages the shell
 process, keymap, and buffer.
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Building from source](#building-from-source)
+- [Shell Integration](#shell-integration)
+- [Key Bindings](#key-bindings)
+- [Features](#features)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Running Tests](#running-tests)
+- [Performance](#performance)
+- [Ghostel vs vterm](#ghostel-vs-vterm)
+- [Architecture](#architecture)
+- [License](#license)
+
 ## Requirements
 
 - Emacs 27.1+ with dynamic module support
