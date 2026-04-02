@@ -1048,6 +1048,9 @@ Set mark, navigate to select, then \\[ghostel-copy-mode-copy] to copy.")
 (defvar-local ghostel--saved-local-map nil
   "Saved keymap before entering copy mode.")
 
+(defvar-local ghostel--saved-cursor-type nil
+  "Saved `cursor-type' before entering copy mode.")
+
 (defun ghostel-copy-mode ()
   "Enter copy mode for selecting and copying terminal text.
 The display is frozen and standard Emacs navigation keys work.
@@ -1061,6 +1064,9 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (when ghostel--redraw-timer
       (cancel-timer ghostel--redraw-timer)
       (setq ghostel--redraw-timer nil))
+    ;; Ensure cursor is visible for navigation
+    (setq ghostel--saved-cursor-type cursor-type)
+    (setq cursor-type (default-value 'cursor-type))
     ;; Switch to copy mode keymap (standard Emacs keys work by default)
     (setq ghostel--saved-local-map (current-local-map))
     (use-local-map ghostel-copy-mode-map)
@@ -1074,6 +1080,7 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
   (interactive)
   (when ghostel--copy-mode-active
     (setq ghostel--copy-mode-active nil)
+    (setq cursor-type ghostel--saved-cursor-type)
     (deactivate-mark)
     (use-local-map ghostel--saved-local-map)
     (setq buffer-read-only nil)

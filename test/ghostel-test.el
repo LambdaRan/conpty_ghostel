@@ -842,6 +842,32 @@
       (should (string-match-p "unknown eval command" (car messages))))))
 
 ;; -----------------------------------------------------------------------
+;; Test: copy-mode cursor visibility
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-copy-mode-cursor ()
+  "Test that copy-mode restores cursor visibility when terminal hid it."
+  (let ((buf (generate-new-buffer " *ghostel-test-copy-cursor*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          ;; Simulate a terminal app hiding the cursor
+          (ghostel--set-cursor-style 1 nil)
+          (should (null cursor-type))                       ; cursor hidden
+          ;; Enter copy mode — cursor should become visible
+          (let ((ghostel--copy-mode-active nil)
+                (ghostel--redraw-timer nil))
+            (ghostel-copy-mode)
+            (should ghostel--copy-mode-active)              ; in copy mode
+            (should cursor-type)                            ; cursor visible
+            (should (equal cursor-type (default-value 'cursor-type))) ; uses user default
+            ;; Exit copy mode — cursor should be hidden again
+            (ghostel-copy-mode-exit)
+            (should-not ghostel--copy-mode-active)          ; exited copy mode
+            (should (null cursor-type))))                   ; cursor hidden again
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -855,7 +881,8 @@
     ghostel-test-prompt-navigation
     ghostel-test-sync-theme
     ghostel-test-osc51-eval
-    ghostel-test-osc51-eval-unknown)
+    ghostel-test-osc51-eval-unknown
+    ghostel-test-copy-mode-cursor)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()
