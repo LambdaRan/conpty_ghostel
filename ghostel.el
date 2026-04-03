@@ -1710,22 +1710,14 @@ frame after idle to improve interactive responsiveness."
           (let ((inhibit-read-only t)
                 (inhibit-redisplay t)
                 (inhibit-modification-hooks t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw)
-            (ghostel--pin-window-start)))))))
-
-(defun ghostel--pin-window-start ()
-  "Pin the window so terminal row 1 stays at the top."
-  (let ((win (get-buffer-window)))
-    (when win
-      (set-window-start win (point-min)))))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
   (interactive)
   (when ghostel--term
     (let ((inhibit-read-only t))
-      (ghostel--redraw ghostel--term ghostel-full-redraw)
-      (ghostel--pin-window-start))))
+      (ghostel--redraw ghostel--term ghostel-full-redraw))))
 
 
 ;;; Window resize
@@ -1772,8 +1764,7 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
         (let ((inhibit-read-only t)
               (inhibit-redisplay t)
               (inhibit-modification-hooks t))
-          (ghostel--redraw ghostel--term ghostel-full-redraw)
-          (ghostel--pin-window-start))))))
+          (ghostel--redraw ghostel--term ghostel-full-redraw))))))
 
 
 
