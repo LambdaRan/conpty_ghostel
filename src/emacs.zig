@@ -5,6 +5,9 @@
 const std = @import("std");
 
 pub const c = @cImport({
+    // Ensure struct timespec is fully defined on Linux (glibc gates it
+    // behind _POSIX_C_SOURCE).  Harmless on macOS/BSDs.
+    @cDefine("_POSIX_C_SOURCE", "199309L");
     @cInclude("emacs-module.h");
 });
 
