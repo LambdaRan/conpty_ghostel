@@ -1394,6 +1394,18 @@ cell, so the visual line width must equal the terminal column count."
         ;; send-key sets last-send-time via the fallback path
         (should ghostel--last-send-time)))))
 
+(ert-deftest ghostel-test-control-key-bindings ()
+  "All non-exception C-<letter> keys should be bound in ghostel-mode-map."
+  (dolist (c (number-sequence ?a ?z))
+    (let* ((key-str (format "C-%c" c))
+           (key-vec (kbd key-str))
+           (binding (lookup-key ghostel-mode-map key-vec)))
+      ;; Skip exceptions (may have sub-keymaps like C-c C-c)
+      (unless (member key-str ghostel-keymap-exceptions)
+        (should binding))))
+  ;; C-@ should also be bound (sends NUL)
+  (should (lookup-key ghostel-mode-map (kbd "C-@"))))
+
 (defconst ghostel-test--elisp-tests
   '(ghostel-test-raw-key-sequences
     ghostel-test-modifier-number
@@ -1420,7 +1432,8 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-input-coalesce-disabled
     ghostel-test-input-flush-sends-buffered
     ghostel-test-send-encoded-sets-send-time
-    ghostel-test-send-encoded-no-send-time-on-fallback)
+    ghostel-test-send-encoded-no-send-time-on-fallback
+    ghostel-test-control-key-bindings)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()

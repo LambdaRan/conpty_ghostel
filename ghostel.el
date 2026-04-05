@@ -620,21 +620,26 @@ Used for prompt navigation and optional re-application after full redraws.")
     (define-key map (kbd "DEL") #'ghostel--send-event)
     ;; Emacs reports S-TAB as <backtab>
     (define-key map (kbd "<backtab>") #'ghostel--send-event)
-    ;; Control keys
-    (define-key map (kbd "C-d")       (lambda () (interactive) (ghostel--send-key "\x04")))
-    (define-key map (kbd "C-a")       (lambda () (interactive) (ghostel--send-key "\x01")))
-    (define-key map (kbd "C-e")       (lambda () (interactive) (ghostel--send-key "\x05")))
-    (define-key map (kbd "C-k")       (lambda () (interactive) (ghostel--send-key "\x0b")))
-    (define-key map (kbd "C-l")       (lambda () (interactive) (ghostel--send-key "\x0c")))
-    (define-key map (kbd "C-n")       (lambda () (interactive) (ghostel--send-key "\x0e")))
-    (define-key map (kbd "C-p")       (lambda () (interactive) (ghostel--send-key "\x10")))
-    (define-key map (kbd "C-r")       (lambda () (interactive) (ghostel--send-key "\x12")))
-    (define-key map (kbd "C-w")       (lambda () (interactive) (ghostel--send-key "\x17")))
+    ;; Control keys — bind all C-<letter> to send ASCII control codes,
+    ;; except keys in ghostel-keymap-exceptions and special cases.
+    ;; C-i = TAB and C-m = RET are equivalent to <tab>/<return> (bound above).
+    (let ((skip '(?i ?m ?y)))  ; i=TAB, m=RET already bound; y=ghostel-yank below
+      (dolist (c (number-sequence ?a ?z))
+        (let ((key-str (format "C-%c" c)))
+          (unless (or (member key-str ghostel-keymap-exceptions)
+                      (memq c skip))
+            (define-key map (kbd key-str)
+                        (let ((code (- c 96)))
+                          (lambda () (interactive)
+                            (ghostel--send-key (string code)))))))))
+    ;; C-@ (NUL, same as C-SPC) — used by programs like Emacs-in-terminal
+    (define-key map (kbd "C-@")
+                (lambda () (interactive) (ghostel--send-key "\x00")))
+    ;; C-y: yank from Emacs kill ring into the terminal
     (define-key map (kbd "C-y")       #'ghostel-yank)
     (when (eq system-type 'darwin)
       (define-key map (kbd "s-v")     #'ghostel-yank))
     (define-key map (kbd "M-y")       #'ghostel-yank-pop)
-    (define-key map (kbd "C-z")       (lambda () (interactive) (ghostel--send-key "\x1a")))
     ;; Terminal control via C-c prefix (pass through to Emacs, then handled here)
     (define-key map (kbd "C-c C-c")   #'ghostel-send-C-c)
     (define-key map (kbd "C-c C-z")   #'ghostel-send-C-z)
