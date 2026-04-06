@@ -29,12 +29,26 @@ process, keymap, and buffer.
 - Emacs 27.1+ with dynamic module support
 - macOS or Linux
 
-The native module is **automatically downloaded** on first use (pre-built
-binaries are available for macOS and Linux).  If you prefer to build from
-source, you'll also need [Zig](https://ziglang.org/) 0.14+ and the ghostty
-submodule (see [Building from source](#building-from-source)).
+The native module is **automatically downloaded** on first use.  Pre-built
+binaries are available for:
+
+- `aarch64-macos` (Apple Silicon)
+- `x86_64-macos` (Intel Mac)
+- `x86_64-linux`
+- `aarch64-linux`
+
+If you prefer to build from source or need a different platform, you'll also
+need [Zig](https://ziglang.org/) 0.14+ and the ghostty submodule (see
+[Building from source](#building-from-source)).
 
 ## Installation
+
+### MELPA
+
+```elisp
+(use-package ghostel
+  :ensure t)
+```
 
 ### use-package with vc (Emacs 30+)
 
@@ -87,6 +101,29 @@ If you already have the repo, initialize the submodule and build:
 ```sh
 git submodule update --init vendor/ghostty
 ./build.sh
+```
+
+### Building from source (MELPA install)
+
+MELPA packages only include `.el` files — the build script, Zig sources, and
+ghostty submodule are not included.  This means `M-x ghostel-module-compile`
+is not available when installed from MELPA.
+
+The recommended approach is to download a **pre-built binary** via
+`M-x ghostel-download-module` (this works regardless of install method).
+
+If you prefer to compile from source, clone the repository, build, and copy
+the resulting module into your MELPA package directory:
+
+```sh
+git clone --recurse-submodules https://github.com/dakra/ghostel.git
+cd ghostel
+./build.sh
+
+# Copy the module into your MELPA package directory
+# (adjust the path to match your Emacs package directory and ghostel version)
+cp ghostel-module.dylib ~/.emacs.d/elpa/ghostel-*/    # macOS
+cp ghostel-module.so    ~/.emacs.d/elpa/ghostel-*/    # Linux
 ```
 
 ## Shell Integration
@@ -168,7 +205,7 @@ Soft-wrapped newlines are automatically stripped from copied text.
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
 - Cursor styles: block, bar, underline, hollow block
 - Alternate screen buffer (for TUI apps like htop, vim, etc.)
-- Scrollback buffer (configurable, default 10,000 lines)
+- Scrollback buffer (configurable, default 20MB (~10,000 lines))
 
 ### Links and File Detection
 - **OSC 8 hyperlinks** — clickable URLs emitted by terminal programs (click or `RET` to open)
@@ -286,6 +323,7 @@ individual faces with `M-x customize-face`.
 | Command                        | Description                                  |
 |--------------------------------|----------------------------------------------|
 | `M-x ghostel`                  | Open a new terminal                          |
+| `M-x ghostel-project`          | Open a terminal in the current project root  |
 | `M-x ghostel-other`            | Switch to next terminal or create one        |
 | `M-x ghostel-clear`            | Clear screen and scrollback                  |
 | `M-x ghostel-clear-scrollback` | Clear scrollback only                        |
@@ -299,6 +337,16 @@ individual faces with `M-x customize-face`.
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
 | `M-x ghostel-download-module`  | Download pre-built native module             |
 | `M-x ghostel-module-compile`   | Compile native module from source            |
+
+### Project integration
+
+`ghostel-project` opens a terminal in the current project's root directory
+with a project-prefixed buffer name.  To make it available from
+`project-switch-project` (`C-x p p`):
+
+```elisp
+(add-to-list 'project-switch-commands '(ghostel-project "Ghostel") t)
+```
 
 ## Running Tests
 
@@ -399,7 +447,7 @@ powering Neovim's built-in terminal.
 | Copy mode                     | Yes       | Yes     |
 | Drag-and-drop                 | Yes       | No      |
 | Auto module download          | Yes       | No      |
-| Scrollback default            | 10,000    | 1,000   |
+| Scrollback default            | ~10,000   | 1,000   |
 | PTY throughput (plain ASCII)  | 72 MB/s   | 33 MB/s |
 | Default redraw rate           | ~30 fps   | ~10 fps |
 

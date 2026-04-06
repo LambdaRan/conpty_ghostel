@@ -4,9 +4,9 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.7.0
+;; Version: 0.7.1
 ;; Keywords: terminals
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; This file is NOT part of GNU Emacs.
@@ -78,6 +78,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'project)
 (require 'term)
 (require 'url-parse)
 (require 'face-remap)
@@ -98,8 +99,11 @@
   "Shell program to run in the terminal."
   :type 'string)
 
-(defcustom ghostel-max-scrollback 10000
-  "Maximum number of scrollback lines."
+(defcustom ghostel-max-scrollback (* 20 1024 1024)  ; 20MB
+  "Maximum scrollback size in bytes.
+Memory is allocated lazily, so a large value does not consume
+memory at startup.  The default of 20 MB holds roughly 10,000
+lines at typical terminal widths."
   :type 'integer)
 
 (defcustom ghostel-timer-delay 0.033
@@ -328,7 +332,7 @@ If nil, search in PATH then in the ghostel package directory."
   "https://github.com/dakra/ghostel/releases"
   "Base URL for ghostel GitHub releases.")
 
-(defconst ghostel--minimum-module-version "0.7.0"
+(defconst ghostel--minimum-module-version "0.7.1"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -450,15 +454,17 @@ Choice: " url)
       (?s nil))))
 
 (defun ghostel--package-version ()
-  "Return ghostel package version string, or nil.
-Returns nil without error when `package.el' is unavailable."
-  (when (and (require 'package nil t)
-             (boundp 'package-alist)
-             (fboundp 'package-desc-version)
-             (fboundp 'package-version-join))
-    (let ((pkg (car (alist-get 'ghostel package-alist))))
-      (when pkg
-        (package-version-join (package-desc-version pkg))))))
+  "Return ghostel release version string, or nil.
+Reads the Version header from ghostel.el so the download URL
+matches the GitHub release tag even when MELPA rewrites the
+version to a date-based string."
+  (require 'lisp-mnt nil t)
+  (when (fboundp 'lm-header)
+    (let ((lib (or load-file-name (locate-library "ghostel.el" t))))
+      (when lib
+        (with-temp-buffer
+          (insert-file-contents lib nil 0 1024)
+          (lm-header "Version"))))))
 
 (defun ghostel--download-file (url dest)
   "Download URL to DEST.  Return non-nil on success."
@@ -508,22 +514,6 @@ The output is shown in a *ghostel-build* compilation buffer."
                                                     default-directory))))
     (compile (expand-file-name "build.sh") t)))
 
-(defun ghostel--elisp-version ()
-  "Return the ghostel Elisp version from the package header."
-  (or (ghostel--package-version)
-      ;; Fall back to parsing the header from the source file.
-      (let ((file (or load-file-name
-                      (locate-library "ghostel")
-                      buffer-file-name)))
-        (when file
-          ;; Ensure we read the .el source, not a .elc byte-compiled file.
-          (when (string-suffix-p ".elc" file)
-            (setq file (substring file 0 -1)))
-          (when (file-exists-p file)
-            (with-temp-buffer
-              (insert-file-contents file nil 0 512)
-              (when (re-search-forward "^;; Version: \\([0-9.]+\\)" nil t)
-                (match-string 1))))))))
 
 (defun ghostel--check-module-version (dir)
   "Check if the loaded module is older than required.
@@ -1996,11 +1986,11 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
               #'ghostel--window-adjust-process-window-size)
   (add-function :after after-focus-change-function #'ghostel--focus-change))
 
-(defun ghostel--suppress-hl-line-mode ()
-  "Disable hl-line highlighting to prevent redraw flicker.
-Handles both `global-hl-line-mode' (which manages its own overlay via
-`post-command-hook', independent of the buffer-local `hl-line-mode')
-and buffer-local `hl-line-mode'."
+(defun ghostel--suppress-interfering-modes ()
+  "Disable global minor modes that interfere with ghostel.
+Suppresses `global-hl-line-mode' (and buffer-local `hl-line-mode') to
+prevent redraw flicker, and `pixel-scroll-precision-mode' so that
+wheel events reach ghostel's own scroll commands."
   ;; global-hl-line-mode: opt this buffer out by setting the variable
   ;; buffer-locally to nil (as documented in the hl-line.el commentary).
   (when (bound-and-true-p global-hl-line-mode)
@@ -2011,9 +2001,14 @@ and buffer-local `hl-line-mode'."
   ;; Buffer-local hl-line-mode
   (when (bound-and-true-p hl-line-mode)
     (setq ghostel--saved-hl-line-mode t)
-    (hl-line-mode -1)))
+    (hl-line-mode -1))
+  ;; pixel-scroll-precision-mode: setting the variable buffer-locally to nil
+  ;; makes Emacs skip its minor-mode-map-alist entry for this buffer, so
+  ;; wheel-up/wheel-down reach ghostel-mode-map instead.
+  (when (bound-and-true-p pixel-scroll-precision-mode)
+    (setq-local pixel-scroll-precision-mode nil)))
 
-(add-hook 'ghostel-mode-hook #'ghostel--suppress-hl-line-mode)
+(add-hook 'ghostel-mode-hook #'ghostel--suppress-interfering-modes)
 
 
 ;;; Entry point
@@ -2044,6 +2039,18 @@ and buffer-local `hl-line-mode'."
         (ghostel--apply-palette ghostel--term))
       (ghostel--start-process))
     (switch-to-buffer buffer)))
+
+;;;###autoload
+(defun ghostel-project ()
+  "Create a new Ghostel terminal in the current project's root.
+The buffer name is prefixed with the project name.
+To add this to `project-switch-commands':
+  (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)"
+  (interactive)
+  (let ((default-directory (project-root (project-current t)))
+        (ghostel-buffer-name (project-prefixed-buffer-name
+                              (string-trim ghostel-buffer-name "*" "*"))))
+    (ghostel)))
 
 (defun ghostel-other ()
   "Switch to the next ghostel terminal buffer, or create one."

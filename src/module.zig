@@ -14,7 +14,7 @@ const input = @import("input.zig");
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.7.0";
+const version = "0.7.1";
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -72,7 +72,7 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
     const max_scrollback: usize = if (nargs > 2 and env.isNotNil(args[2]))
         @intCast(env.extractInteger(args[2]))
     else
-        10000;
+        25_000_000; // ~25 MB, roughly 10k lines at standard page density
 
     const term = std.heap.c_allocator.create(Terminal) catch {
         env.signalError("ghostel: out of memory");

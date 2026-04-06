@@ -1136,7 +1136,7 @@ cell, so the visual line width must equal the terminal column count."
           (let ((global-hl-line-mode t))
             (should global-hl-line-mode)
             ;; Suppress should opt this buffer out
-            (ghostel--suppress-hl-line-mode)
+            (ghostel--suppress-interfering-modes)
             (should ghostel--saved-hl-line-mode)
             ;; Buffer-local global-hl-line-mode must be nil — this is the
             ;; mechanism that prevents global-hl-line-highlight (on
@@ -1156,6 +1156,30 @@ cell, so the visual line width must equal the terminal column count."
         (kill-buffer buf)))))
 
 ;; -----------------------------------------------------------------------
+;; Test: ghostel-project buffer naming
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-project-buffer-name ()
+  "Test that `ghostel-project' derives the buffer name correctly."
+  (require 'project)
+  (let ((ghostel-buffer-name "*ghostel*")
+        result)
+    ;; Stub project-current, project-root, and ghostel to capture args
+    (cl-letf (((symbol-function 'project-current)
+               (lambda (_maybe-prompt) '(transient . "/tmp/myproj/")))
+              ((symbol-function 'project-root)
+               (lambda (proj) (cdr proj)))
+              ((symbol-function 'ghostel)
+               (lambda ()
+                 (setq result (cons default-directory ghostel-buffer-name)))))
+      (ghostel-project)
+      ;; default-directory should be the project root
+      (should (equal "/tmp/myproj/" (car result)))
+      ;; Buffer name should be project-prefixed (no raw asterisks passed)
+      (should (string-match-p "ghostel" (cdr result)))
+      (should-not (string-match-p "\\*\\*" (cdr result))))))
+
+;; -----------------------------------------------------------------------
 ;; Runner
 ;; -----------------------------------------------------------------------
 
@@ -1163,11 +1187,11 @@ cell, so the visual line width must equal the terminal column count."
 ;; Test: module version check
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-elisp-version ()
-  "Test that `ghostel--elisp-version' returns a version string."
-  (let ((ver (ghostel--elisp-version)))
+(ert-deftest ghostel-test-package-version ()
+  "Test that `ghostel--package-version' returns a version string."
+  (let ((ver (ghostel--package-version)))
     (should (stringp ver))
-    (should (string-match-p "^[0-9]+\\.[0-9]+" ver))))
+    (should (string-match-p "^[0-9]+\\.[0-9]+\\.[0-9]+" ver))))
 
 (ert-deftest ghostel-test-module-version-match ()
   "Test that version check does nothing when module meets minimum."
@@ -1420,7 +1444,8 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-osc51-eval-unknown
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
-    ghostel-test-elisp-version
+    ghostel-test-project-buffer-name
+    ghostel-test-package-version
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
