@@ -1920,11 +1920,11 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
               #'ghostel--window-adjust-process-window-size)
   (add-function :after after-focus-change-function #'ghostel--focus-change))
 
-(defun ghostel--suppress-hl-line-mode ()
-  "Disable hl-line highlighting to prevent redraw flicker.
-Handles both `global-hl-line-mode' (which manages its own overlay via
-`post-command-hook', independent of the buffer-local `hl-line-mode')
-and buffer-local `hl-line-mode'."
+(defun ghostel--suppress-interfering-modes ()
+  "Disable global minor modes that interfere with ghostel.
+Suppresses `global-hl-line-mode' (and buffer-local `hl-line-mode') to
+prevent redraw flicker, and `pixel-scroll-precision-mode' so that
+wheel events reach ghostel's own scroll commands."
   ;; global-hl-line-mode: opt this buffer out by setting the variable
   ;; buffer-locally to nil (as documented in the hl-line.el commentary).
   (when (bound-and-true-p global-hl-line-mode)
@@ -1935,9 +1935,14 @@ and buffer-local `hl-line-mode'."
   ;; Buffer-local hl-line-mode
   (when (bound-and-true-p hl-line-mode)
     (setq ghostel--saved-hl-line-mode t)
-    (hl-line-mode -1)))
+    (hl-line-mode -1))
+  ;; pixel-scroll-precision-mode: setting the variable buffer-locally to nil
+  ;; makes Emacs skip its minor-mode-map-alist entry for this buffer, so
+  ;; wheel-up/wheel-down reach ghostel-mode-map instead.
+  (when (bound-and-true-p pixel-scroll-precision-mode)
+    (setq-local pixel-scroll-precision-mode nil)))
 
-(add-hook 'ghostel-mode-hook #'ghostel--suppress-hl-line-mode)
+(add-hook 'ghostel-mode-hook #'ghostel--suppress-interfering-modes)
 
 
 ;;; Entry point
