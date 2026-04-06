@@ -4,6 +4,7 @@
 /// It exports emacs_module_init (the C entry point Emacs calls on load)
 /// and registers all Elisp-callable functions.
 const std = @import("std");
+const builtin = @import("builtin");
 const emacs = @import("emacs.zig");
 const Terminal = @import("terminal.zig");
 const gt = @import("ghostty.zig");
@@ -135,49 +136,63 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     term.env = env;
     defer term.env = null;
 
-    // Normalize CRLF: Emacs PTYs lack ONLCR, so bare \n arrives
-    // without \r.  Insert \r before every bare \n.
-    // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
     const raw = data.?;
 
-    // Count bare \n to determine output size.
-    var extra_cr: usize = 0;
-    for (0..raw.len) |i| {
-        if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-            extra_cr += 1;
-        }
-    }
-
-    if (extra_cr == 0) {
-        // No normalization needed — feed raw data directly.
+    if (comptime builtin.os.tag == .windows) {
+        // Windows ConPTY handles line discipline (CRLF conversion),
+        // so data already has proper \r\n.  Pass through directly.
         term.vtWrite(raw);
     } else {
-        // Need to insert \r before bare \n.
-        const out_len = raw.len + extra_cr;
-        var norm_stack: [131072]u8 = undefined;
-        var norm_heap: ?[]u8 = null;
-        defer if (norm_heap) |nh| std.heap.c_allocator.free(nh);
+        // Unix: Emacs PTYs lack ONLCR, so bare \n arrives without \r.
+        // Insert \r before every bare \n.
+        // Done here in Zig to avoid Elisp unibyte→multibyte corruption.
 
-        const norm_buf: []u8 = if (out_len <= norm_stack.len)
-            &norm_stack
-        else blk: {
-            norm_heap = std.heap.c_allocator.alloc(u8, out_len) catch {
-                // Fall back to stack buffer, truncating if needed.
-                break :blk &norm_stack;
-            };
-            break :blk norm_heap.?;
-        };
-
-        var npos: usize = 0;
+        // Count bare \n to determine output size.
+        var extra_cr: usize = 0;
         for (0..raw.len) |i| {
             if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
-                norm_buf[npos] = '\r';
-                npos += 1;
+                extra_cr += 1;
             }
-            norm_buf[npos] = raw[i];
-            npos += 1;
         }
-        term.vtWrite(norm_buf[0..npos]);
+
+        if (extra_cr == 0) {
+            // No normalization needed — feed raw data directly.
+            term.vtWrite(raw);
+        } else {
+            // Need to insert \r before bare \n.
+            const out_len = raw.len + extra_cr;
+            var norm_stack: [131072]u8 = undefined;
+            var norm_heap: ?[]u8 = null;
+            defer if (norm_heap) |nh| std.heap.c_allocator.free(nh);
+
+            const norm_buf: []u8 = if (out_len <= norm_stack.len)
+                &norm_stack
+            else blk: {
+                norm_heap = std.heap.c_allocator.alloc(u8, out_len) catch {
+                    // Cannot allocate — feed raw data without normalization
+                    // rather than risking a buffer overflow.
+                    term.vtWrite(raw);
+                    break :blk undefined;
+                };
+                break :blk norm_heap.?;
+            };
+
+            // If heap alloc failed, vtWrite was already called above.
+            if (norm_heap == null and out_len > norm_stack.len) {
+                // Skip normalization — raw data already sent.
+            } else {
+                var npos: usize = 0;
+                for (0..raw.len) |i| {
+                    if (raw[i] == '\n' and (i == 0 or raw[i - 1] != '\r')) {
+                        norm_buf[npos] = '\r';
+                        npos += 1;
+                    }
+                    norm_buf[npos] = raw[i];
+                    npos += 1;
+                }
+                term.vtWrite(norm_buf[0..npos]);
+            }
+        }
     }
 
     // Scan for OSC sequences that libghostty-vt discards.
@@ -674,10 +689,18 @@ fn fnDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*a
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
     var stack_buf: [4096]u8 = undefined;
-    const data = env.extractString(args[1], &stack_buf) orelse return env.nil();
+    var heap_buf: ?[]const u8 = null;
+    defer if (heap_buf) |hb| std.heap.c_allocator.free(hb);
+
+    const data = env.extractString(args[1], &stack_buf) orelse blk: {
+        heap_buf = env.extractStringAlloc(args[1], std.heap.c_allocator);
+        break :blk heap_buf;
+    };
+    if (data == null) return env.nil();
+    const feed_data = data.?;
 
     // Feed directly to terminal
-    gt.c.ghostty_terminal_vt_write(term.terminal, data.ptr, data.len);
+    gt.c.ghostty_terminal_vt_write(term.terminal, feed_data.ptr, feed_data.len);
 
     // Update render state
     _ = gt.c.ghostty_render_state_update(term.render_state, term.terminal);

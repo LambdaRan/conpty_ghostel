@@ -90,7 +90,11 @@
   :group 'terminals
   :prefix "ghostel-")
 
-(defcustom ghostel-shell (or (getenv "SHELL") "/bin/sh")
+(defcustom ghostel-shell (if (eq system-type 'windows-nt)
+                             (or (getenv "SHELL")
+                                 (getenv "COMSPEC")
+                                 "cmd.exe")
+                           (or (getenv "SHELL") "/bin/sh"))
   "Shell program to run in the terminal."
   :type 'string)
 
@@ -211,6 +215,13 @@ shell configuration files.  Supports bash, zsh, and fish."
   "Key sequences that should not be sent to the terminal.
 These keys pass through to Emacs instead."
   :type '(repeat string))
+
+(defcustom ghostel-conpty-proxy-path nil
+  "Path to conpty_proxy.exe for Windows terminal support.
+If nil, search in PATH then in the ghostel package directory."
+  :type '(choice (const :tag "Auto-detect" nil)
+                 (file :tag "Custom path"))
+  :group 'ghostel)
 
 ;;; ANSI color faces
 
@@ -350,6 +361,7 @@ Returns nil if the platform is not recognized."
          (os (cond
               ((eq system-type 'darwin) "macos")
               ((eq system-type 'gnu/linux) "linux")
+              ((eq system-type 'windows-nt) "windows")
               (t nil))))
     (when os
       (format "%s-%s" arch os))))
@@ -1698,6 +1710,51 @@ PROCESS is the shell process, EVENT describes the state change."
             (goto-char (point-max))
             (insert "\n[Process exited]\n")))))))
 
+;;; Windows ConPTY support
+
+(defun ghostel--conpty-proxy-path ()
+  "Find conpty_proxy.exe.
+Search order: `ghostel-conpty-proxy-path', PATH, ghostel package directory."
+  (or ghostel-conpty-proxy-path
+      (executable-find "conpty_proxy.exe")
+      (expand-file-name "conpty_proxy.exe"
+                        (file-name-directory
+                         (or (locate-library "ghostel")
+                             load-file-name
+                             buffer-file-name)))))
+
+(defun ghostel--conpty-proxy-make-process (width height)
+  "Start a shell process via conpty-proxy for Windows.
+WIDTH and HEIGHT are the terminal dimensions in characters."
+  (let* ((proxy-path (ghostel--conpty-proxy-path)))
+    (unless proxy-path
+      (error "conpty_proxy.exe not found; set `ghostel-conpty-proxy-path' or add it to PATH"))
+    (let* ((conpty-id (format "ghostel_%s_%s"
+                              (format-time-string "%s")
+                              (emacs-pid)))
+           (proc (make-process
+                  :name "ghostel"
+                  :buffer (current-buffer)
+                  :command `(,proxy-path
+                             "new" ,conpty-id
+                             ,(number-to-string width)
+                             ,(number-to-string height)
+                             ,ghostel-shell)
+                  :filter #'ghostel--filter
+                  :sentinel #'ghostel--sentinel)))
+      (process-put proc 'conpty-id conpty-id)
+      proc)))
+
+(defun ghostel--conpty-proxy-resize (process width height)
+  "Resize the ConPTY terminal for PROCESS to WIDTH x HEIGHT."
+  (when-let* ((conpty-id (process-get process 'conpty-id)))
+    (let ((exit-code (call-process (ghostel--conpty-proxy-path) nil nil nil
+                                   "resize" conpty-id
+                                   (number-to-string width)
+                                   (number-to-string height))))
+      (unless (eql exit-code 0)
+        (message "ghostel: conpty_proxy resize failed (exit code %s)" exit-code)))))
+
 (defun ghostel--detect-shell (shell)
   "Return shell type symbol (bash, zsh, fish) from SHELL path, or nil."
   (let ((base (file-name-nondirectory shell)))
@@ -1792,19 +1849,23 @@ PROCESS is the shell process, EVENT describes the state change."
             (format "LINES=%d" height))
            integration-env
            process-environment))
-         (proc (make-process
-                :name "ghostel"
-                :buffer (current-buffer)
-                :command shell-command
-                :connection-type 'pty
-                :filter #'ghostel--filter
-                :sentinel #'ghostel--sentinel)))
+         (proc (if (eq system-type 'windows-nt)
+                   (ghostel--conpty-proxy-make-process width height)
+                 (make-process
+                  :name "ghostel"
+                  :buffer (current-buffer)
+                  :command shell-command
+                  :connection-type 'pty
+                  :filter #'ghostel--filter
+                  :sentinel #'ghostel--sentinel))))
     (setq ghostel--process proc)
     ;; Raw binary I/O — no encoding/decoding by Emacs
     (set-process-coding-system proc 'binary 'binary)
-    ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
-    ;; the shell's line editor (readline/ZLE) can render properly.
-    (set-process-window-size proc height width)
+    (unless (eq system-type 'windows-nt)
+      ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
+      ;; the shell's line editor (readline/ZLE) can render properly.
+      ;; On Windows, conpty-proxy sets size via its command line args.
+      (set-process-window-size proc height width))
     (set-process-query-on-exit-flag proc nil)
     proc))
 
@@ -1889,7 +1950,9 @@ PROCESS is the shell process, WINDOWS is the list of windows."
         ;; Primary screen: resize + SIGWINCH + render immediately.
         (ghostel--set-size ghostel--term height width)
         (when (process-live-p process)
-          (set-process-window-size process height width))
+          (if (eq system-type 'windows-nt)
+              (ghostel--conpty-proxy-resize process width height)
+            (set-process-window-size process height width)))
         (setq ghostel--force-next-redraw t)
         (ghostel--invalidate)))
     (cons width height)))
@@ -1905,7 +1968,9 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
       (when ghostel--term
         (ghostel--set-size ghostel--term height width)
         (when (and process (process-live-p process))
-          (set-process-window-size process height width))
+          (if (eq system-type 'windows-nt)
+              (ghostel--conpty-proxy-resize process width height)
+            (set-process-window-size process height width)))
         ;; Render NOW, before returning to the event loop.
         ;; The app's BSU response can't arrive until we return.
         (let ((inhibit-read-only t)

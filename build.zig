@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
             mod.addSystemIncludePath(.{
                 .cwd_relative = "/Applications/Emacs.app/Contents/Resources/include",
             });
+        } else if (resolved.os.tag == .windows) {
+            // Windows: user should set EMACS_INCLUDE_DIR; this is a fallback
+            mod.addSystemIncludePath(.{
+                .cwd_relative = "C:/Program Files/Emacs/emacs-30.2/include",
+            });
         } else {
             mod.addSystemIncludePath(.{
                 .cwd_relative = "/usr/include",
@@ -44,9 +49,16 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
 
-    lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libghostty-vt.a"));
-    lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libsimdutf.a"));
-    lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libhighway.a"));
+    const target_os = target.result.os.tag;
+    if (target_os == .windows) {
+        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/ghostty-vt-static.lib"));
+        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/simdutf.lib"));
+        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/highway.lib"));
+    } else {
+        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libghostty-vt.a"));
+        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libsimdutf.a"));
+        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libhighway.a"));
+    }
     lib.linkSystemLibrary("c++");
 
     // Release optimizations: dead-code elimination and symbol visibility
@@ -64,11 +76,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // Copy the shared library to project root for easy Emacs loading.
-    const target_os = target.result.os.tag;
-    const lib_name = if (target_os == .macos)
-        "../ghostel-module.dylib"
-    else
-        "../ghostel-module.so";
+    const lib_name = switch (target_os) {
+        .macos => "../ghostel-module.dylib",
+        .windows => "../ghostel-module.dll",
+        else => "../ghostel-module.so",
+    };
     const copy_step = b.addInstallFile(
         lib.getEmittedBin(),
         lib_name,
@@ -93,13 +105,16 @@ pub fn build(b: *std.Build) void {
             check_mod.addSystemIncludePath(.{
                 .cwd_relative = "/Applications/Emacs.app/Contents/Resources/include",
             });
+        } else if (check_resolved.os.tag == .windows) {
+            check_mod.addSystemIncludePath(.{
+                .cwd_relative = "C:/Program Files/Emacs/include",
+            });
         } else {
             check_mod.addSystemIncludePath(.{
                 .cwd_relative = "/usr/include",
             });
         }
     }
-
     check_mod.addIncludePath(b.path("src"));
     check_mod.addIncludePath(b.path("vendor/ghostty/include"));
     check_mod.addIncludePath(b.path("vendor/ghostty/zig-out/include"));

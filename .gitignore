@@ -4,3 +4,4 @@ zig-out/
 *.so
 ghostel-module.*
 !ghostel-module.zig
+.zig-global-cache/
