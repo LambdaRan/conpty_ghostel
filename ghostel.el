@@ -336,6 +336,7 @@ Bump this only when the Elisp code requires a newer native module
 
 ;; Declare native module functions for the byte compiler
 
+(declare-function ghostel--cursor-position "ghostel-module")
 (declare-function ghostel--encode-key "ghostel-module")
 (declare-function ghostel--focus-event "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
@@ -2017,8 +2018,8 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
   "Start a new Ghostel terminal in the current project's root.
 The buffer name is prefixed with the project name.
 If a buffer already exists for this project, switch to it.
-Otherwise create a new Ghostel buffer. This function accepts the same
-universal arguments that `ghostel' does.
+Otherwise create a new Ghostel buffer.  ARG is passed through to
+`ghostel' and accepts the same universal argument conventions.
 To add this to `project-switch-commands':
   (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)"
   (interactive "P")

@@ -99,6 +99,32 @@
     (should (equal '(5 . 3) (ghostel-test--cursor term)))))   ; cursor to (5,3)
 
 ;; -----------------------------------------------------------------------
+;; Test: cursor-position query
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-cursor-position ()
+  "Test `ghostel--cursor-position' returns correct (COL . ROW)."
+  (let ((term (ghostel--new 25 80 1000)))
+    ;; Origin
+    (should (equal '(0 . 0) (ghostel--cursor-position term)))
+
+    ;; After writing text
+    (ghostel--write-input term "hello")
+    (should (equal '(5 . 0) (ghostel--cursor-position term)))
+
+    ;; After cursor movement
+    (ghostel--write-input term "\e[3D")
+    (should (equal '(2 . 0) (ghostel--cursor-position term)))
+
+    ;; After newline — cursor on row 1
+    (ghostel--write-input term "\nworld")
+    (should (equal '(5 . 1) (ghostel--cursor-position term)))
+
+    ;; Absolute positioning
+    (ghostel--write-input term "\e[4;6H")
+    (should (equal '(5 . 3) (ghostel--cursor-position term)))))
+
+;; -----------------------------------------------------------------------
 ;; Test: erase sequences
 ;; -----------------------------------------------------------------------
 
