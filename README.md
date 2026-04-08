@@ -204,6 +204,15 @@ After `C-c C-a`, the entire scrollback history is loaded into the buffer
 as styled text. Standard Emacs commands work across the full content:
 `C-x h` to select all, `C-s` to search, mark/region spanning any distance.
 
+Set `ghostel-copy-mode-auto-load-scrollback` to `t` to skip the
+viewport-only step and load the full scrollback immediately when
+entering copy mode. Advantages: produces a pure Emacs buffer where
+all standard commands work (incremental search, `occur`, `M-x
+flush-lines`, etc.) without an extra keystroke. Disadvantages: entering
+copy mode takes longer for large scrollback buffers, clickable links
+(URLs, file references, OSC 8 hyperlinks) are not detected in the
+loaded scrollback.
+
 ## Features
 
 ### Terminal Emulation
@@ -323,6 +332,7 @@ individual faces with `M-x customize-face`.
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
 | `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
 | `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)` | Keys passed through to Emacs                             |
+| `ghostel-copy-mode-auto-load-scrollback` | `nil`        | Load full scrollback automatically when entering copy mode |
 | `ghostel-exit-functions`         | `nil`                | Hook run when the shell process exits                    |
 
 ## Commands

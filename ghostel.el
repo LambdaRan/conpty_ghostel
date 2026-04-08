@@ -223,6 +223,15 @@ into the scrollback will first jump to the bottom of the terminal
 before sending the input."
   :type 'boolean)
 
+(defcustom ghostel-copy-mode-auto-load-scrollback nil
+  "Automatically load the full scrollback when entering copy mode.
+When non-nil, entering copy mode immediately loads the entire
+scrollback history into the buffer, producing a plain Emacs buffer
+that supports all standard commands (search, select-all, etc.).
+When nil (the default), copy mode shows only the current viewport
+and scrollback can be loaded on demand with \\[ghostel-copy-mode-load-all]."
+  :type 'boolean)
+
 ;;; ANSI color faces
 
 (defface ghostel-color-black
@@ -1282,9 +1291,11 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     (when ghostel--saved-hl-line-mode
       (hl-line-mode 1))
     (setq buffer-read-only t)
-    (setq mode-line-process ":Copy")
-    (force-mode-line-update)
-    (message "Copy mode: C-SPC to mark, navigate to select, M-w to copy, q to exit")))
+    (if ghostel-copy-mode-auto-load-scrollback
+        (ghostel-copy-mode-load-all)
+      (setq mode-line-process ":Copy")
+      (force-mode-line-update)
+      (message "Copy mode: C-SPC to mark, navigate to select, M-w to copy, q to exit"))))
 
 (defun ghostel-copy-mode-exit ()
   "Exit copy mode and return to terminal mode."
@@ -1368,6 +1379,8 @@ the full scrollback history."
       (move-to-column saved-col)
       (recenter saved-line))
     (setq ghostel--copy-mode-full-buffer t)
+    (setq mode-line-process ":Emacs")
+    (force-mode-line-update)
     (message "Scrollback loaded")))
 
 (defun ghostel-copy-all ()
