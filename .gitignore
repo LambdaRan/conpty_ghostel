@@ -2,6 +2,7 @@ zig-out/
 .zig-cache/
 *.dylib
 *.so
+*.elc
 ghostel-module.*
 !ghostel-module.zig
 .zig-global-cache/

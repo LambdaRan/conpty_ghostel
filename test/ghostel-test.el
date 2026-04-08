@@ -99,6 +99,32 @@
     (should (equal '(5 . 3) (ghostel-test--cursor term)))))   ; cursor to (5,3)
 
 ;; -----------------------------------------------------------------------
+;; Test: cursor-position query
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-cursor-position ()
+  "Test `ghostel--cursor-position' returns correct (COL . ROW)."
+  (let ((term (ghostel--new 25 80 1000)))
+    ;; Origin
+    (should (equal '(0 . 0) (ghostel--cursor-position term)))
+
+    ;; After writing text
+    (ghostel--write-input term "hello")
+    (should (equal '(5 . 0) (ghostel--cursor-position term)))
+
+    ;; After cursor movement
+    (ghostel--write-input term "\e[3D")
+    (should (equal '(2 . 0) (ghostel--cursor-position term)))
+
+    ;; After newline — cursor on row 1
+    (ghostel--write-input term "\nworld")
+    (should (equal '(5 . 1) (ghostel--cursor-position term)))
+
+    ;; Absolute positioning
+    (ghostel--write-input term "\e[4;6H")
+    (should (equal '(5 . 3) (ghostel--cursor-position term)))))
+
+;; -----------------------------------------------------------------------
 ;; Test: erase sequences
 ;; -----------------------------------------------------------------------
 
@@ -316,6 +342,35 @@ cell, so the visual line width must equal the terminal column count."
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-input term "\e]2;My Title\e\\")
     (should (equal "My Title" (ghostel--get-title term))))) ; title set via OSC 2
+
+(ert-deftest ghostel-test-title-does-not-overwrite-manual-rename ()
+  "Test that title updates do not overwrite a manual buffer rename."
+  (let (buf)
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--new)
+                   (lambda (&rest _args) 'fake-term))
+                  ((symbol-function 'ghostel--apply-palette)
+                   (lambda (&rest _args) nil))
+                  ((symbol-function 'ghostel--start-process)
+                   (lambda () nil)))
+          (let ((ghostel--buffer-counter 0))
+            (ghostel)
+            (setq buf (current-buffer)))
+          (with-current-buffer buf
+            (should (equal "*ghostel*" (buffer-name)))
+            (should (equal "*ghostel*" ghostel--managed-buffer-name))
+            (ghostel--set-title "Title A")
+            (should (equal "*ghostel: Title A*" (buffer-name)))
+            (should (equal "*ghostel: Title A*" ghostel--managed-buffer-name))
+            (ghostel--set-title "Title A2")
+            (should (equal "*ghostel: Title A2*" (buffer-name)))
+            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))
+            (rename-buffer "ghostel manual title test" t)
+            (ghostel--set-title "Title B")
+            (should (equal "ghostel manual title test" (buffer-name)))
+            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: CRLF normalization in Zig
@@ -1170,7 +1225,7 @@ cell, so the visual line width must equal the terminal column count."
               ((symbol-function 'project-root)
                (lambda (proj) (cdr proj)))
               ((symbol-function 'ghostel)
-               (lambda ()
+               (lambda (&optional _)
                  (setq result (cons default-directory ghostel-buffer-name)))))
       (ghostel-project)
       ;; default-directory should be the project root
@@ -1178,6 +1233,38 @@ cell, so the visual line width must equal the terminal column count."
       ;; Buffer name should be project-prefixed (no raw asterisks passed)
       (should (string-match-p "ghostel" (cdr result)))
       (should-not (string-match-p "\\*\\*" (cdr result))))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel-project passes universal args to ghostel
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-project-universal-arg ()
+  "Test that `ghostel-project' passes the universal arg to `ghostel'."
+  (require 'project)
+  ;; Numeric prefix arg (C-5 M-x ghostel-project)
+  (let ((ghostel-buffer-name "*ghostel*")
+        result)
+    (cl-letf (((symbol-function 'project-current)
+               (lambda (_maybe-prompt) '(transient . "/tmp/myproj/")))
+              ((symbol-function 'project-root)
+               (lambda (proj) (cdr proj)))
+              ((symbol-function 'ghostel)
+               (lambda (&optional arg)
+                 (setq result arg))))
+      (ghostel-project 4)
+      (should (equal 4 result))))
+  ;; Universal prefix arg (C-u M-x ghostel-project)
+  (let ((ghostel-buffer-name "*ghostel*")
+        result)
+    (cl-letf (((symbol-function 'project-current)
+               (lambda (_maybe-prompt) '(transient . "/tmp/myproj/")))
+              ((symbol-function 'project-root)
+               (lambda (proj) (cdr proj)))
+              ((symbol-function 'ghostel)
+               (lambda (&optional arg)
+                 (setq result arg))))
+      (ghostel-project '(4))
+      (should (equal '(4) result)))))
 
 ;; -----------------------------------------------------------------------
 ;; Runner
@@ -1418,6 +1505,55 @@ cell, so the visual line width must equal the terminal column count."
         ;; send-key sets last-send-time via the fallback path
         (should ghostel--last-send-time)))))
 
+(ert-deftest ghostel-test-scroll-on-input-self-insert ()
+  "Self-insert scrolls to bottom when `ghostel-scroll-on-input' is non-nil."
+  (let ((ghostel--term 'fake)
+        (ghostel--force-next-redraw nil)
+        (ghostel-scroll-on-input t)
+        (scroll-bottom-called nil)
+        (sent-key nil))
+    (cl-letf (((symbol-function 'ghostel--scroll-bottom)
+               (lambda (_term) (setq scroll-bottom-called t)))
+              ((symbol-function 'ghostel--send-key)
+               (lambda (str) (setq sent-key str))))
+      (let ((last-command-event ?a))
+        (cl-letf (((symbol-function 'this-command-keys) (lambda () "a")))
+          (ghostel--self-insert)))
+      (should scroll-bottom-called)
+      (should ghostel--force-next-redraw)
+      (should (equal "a" sent-key)))))
+
+(ert-deftest ghostel-test-scroll-on-input-send-event ()
+  "Send-event scrolls to bottom when `ghostel-scroll-on-input' is non-nil."
+  (let ((ghostel--term 'fake)
+        (ghostel--force-next-redraw nil)
+        (ghostel-scroll-on-input t)
+        (scroll-bottom-called nil))
+    (cl-letf (((symbol-function 'ghostel--scroll-bottom)
+               (lambda (_term) (setq scroll-bottom-called t)))
+              ((symbol-function 'ghostel--send-encoded)
+               (lambda (_key _mods &optional _utf8) nil)))
+      (let ((last-command-event (aref (kbd "<return>") 0)))
+        (ghostel--send-event))
+      (should scroll-bottom-called)
+      (should ghostel--force-next-redraw))))
+
+(ert-deftest ghostel-test-scroll-on-input-disabled ()
+  "Self-insert does not scroll when `ghostel-scroll-on-input' is nil."
+  (let ((ghostel--term 'fake)
+        (ghostel--force-next-redraw nil)
+        (ghostel-scroll-on-input nil)
+        (scroll-bottom-called nil))
+    (cl-letf (((symbol-function 'ghostel--scroll-bottom)
+               (lambda (_term) (setq scroll-bottom-called t)))
+              ((symbol-function 'ghostel--send-key)
+               (lambda (_str) nil)))
+      (cl-letf (((symbol-function 'this-command-keys) (lambda () "a")))
+        (let ((last-command-event ?a))
+          (ghostel--self-insert)))
+      (should-not scroll-bottom-called)
+      (should-not ghostel--force-next-redraw))))
+
 (ert-deftest ghostel-test-control-key-bindings ()
   "All non-exception C-<letter> keys should be bound in ghostel-mode-map."
   (dolist (c (number-sequence ?a ?z))
@@ -1429,6 +1565,86 @@ cell, so the visual line width must equal the terminal column count."
         (should binding))))
   ;; C-@ should also be bound (sends NUL)
   (should (lookup-key ghostel-mode-map (kbd "C-@"))))
+
+(ert-deftest ghostel-test-meta-key-bindings ()
+  "All non-exception M-<letter> keys should be bound in ghostel-mode-map."
+  (dolist (c (number-sequence ?a ?z))
+    (let* ((key-str (format "M-%c" c))
+           (key-vec (kbd key-str))
+           (binding (lookup-key ghostel-mode-map key-vec)))
+      (unless (eq c ?y)  ; M-y is ghostel-yank-pop
+        (if (member key-str ghostel-keymap-exceptions)
+            (should-not (eq binding #'ghostel--send-event))
+          (should (eq binding #'ghostel--send-event))))))
+  ;; M-y should be bound to ghostel-yank-pop, not send-event
+  (should (eq (lookup-key ghostel-mode-map (kbd "M-y")) #'ghostel-yank-pop)))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel-copy-mode-recenter
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-copy-mode-recenter ()
+  "Recenter scrolls terminal viewport to center the current line."
+  (let ((buf (generate-new-buffer " *ghostel-test-copy-mode-recenter*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (dotimes (i 20) (insert (format "line-%02d" i) (make-string 33 ?x) "\n"))
+          (setq ghostel--term 'fake-term)
+          (setq ghostel--copy-mode-active t)
+          (setq buffer-read-only t)
+          (let ((scroll-delta nil)
+                (redraw-called nil)
+                (recenter-called nil))
+            ;; Mock redraw that changes the first line (simulates viewport shift).
+            (cl-letf (((symbol-function 'ghostel--scroll)
+                       (lambda (_term delta) (setq scroll-delta delta)))
+                      ((symbol-function 'ghostel--redraw)
+                       (lambda (_term _full)
+                         (setq redraw-called t)
+                         (save-excursion
+                           (goto-char (point-min))
+                           (delete-char 1)
+                           (insert "!"))))
+                      ((symbol-function 'window-body-height)
+                       (lambda (&rest _) 20))
+                      ((symbol-function 'recenter)
+                       (lambda (&rest _) (setq recenter-called t))))
+              ;; Point on line 5 (above center 10) → scroll viewport up
+              (goto-char (point-min))
+              (forward-line 4)
+              (ghostel-copy-mode-recenter)
+              (should (equal -5 scroll-delta))
+              (should redraw-called)
+              (should recenter-called))
+
+            ;; Mock redraw that does NOT change buffer (simulates clamped scroll).
+            (cl-letf (((symbol-function 'ghostel--scroll)
+                       (lambda (_term delta) (setq scroll-delta delta)))
+                      ((symbol-function 'ghostel--redraw)
+                       (lambda (_term _full) (setq redraw-called t)))
+                      ((symbol-function 'window-body-height)
+                       (lambda (&rest _) 20))
+                      ((symbol-function 'recenter)
+                       (lambda (&rest _) (setq recenter-called t))))
+              ;; Point on line 15 (below center), scroll clamped → no-op
+              (setq scroll-delta nil redraw-called nil recenter-called nil)
+              (goto-char (point-min))
+              (forward-line 14)
+              (ghostel-copy-mode-recenter)
+              (should (equal 5 scroll-delta))
+              (should redraw-called)
+              (should-not recenter-called)
+              (should (= 15 (line-number-at-pos)))
+
+              ;; Point on line 10 (at center) → no scroll at all
+              (setq scroll-delta nil redraw-called nil recenter-called nil)
+              (goto-char (point-min))
+              (forward-line 9)
+              (ghostel-copy-mode-recenter)
+              (should-not scroll-delta)
+              (should-not redraw-called)
+              (should-not recenter-called))))
+      (kill-buffer buf))))
 
 (defconst ghostel-test--elisp-tests
   '(ghostel-test-raw-key-sequences
@@ -1445,10 +1661,12 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
     ghostel-test-project-buffer-name
+    ghostel-test-project-universal-arg
     ghostel-test-package-version
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
+    ghostel-test-title-does-not-overwrite-manual-rename
     ghostel-test-immediate-redraw-triggers-on-small-echo
     ghostel-test-immediate-redraw-skips-large-output
     ghostel-test-immediate-redraw-skips-stale-send
@@ -1458,7 +1676,12 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-input-flush-sends-buffered
     ghostel-test-send-encoded-sets-send-time
     ghostel-test-send-encoded-no-send-time-on-fallback
-    ghostel-test-control-key-bindings)
+    ghostel-test-scroll-on-input-self-insert
+    ghostel-test-scroll-on-input-send-event
+    ghostel-test-scroll-on-input-disabled
+    ghostel-test-control-key-bindings
+    ghostel-test-meta-key-bindings
+    ghostel-test-copy-mode-recenter)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()

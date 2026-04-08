@@ -277,6 +277,7 @@ pub const Sym = struct {
     line: Value,
 
     // Built-in functions
+    cons: Value,
     list: Value,
     @"symbol-value": Value,
     @"put-text-property": Value,

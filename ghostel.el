@@ -227,6 +227,13 @@ If nil, search in PATH then in the ghostel package directory."
                  (file :tag "Custom path"))
   :group 'ghostel)
 
+(defcustom ghostel-scroll-on-input t
+  "Automatically scroll to the bottom when typing in the terminal.
+When non-nil, any character typed while the viewport is scrolled
+into the scrollback will first jump to the bottom of the terminal
+before sending the input."
+  :type 'boolean)
+
 ;;; ANSI color faces
 
 (defface ghostel-color-black
@@ -340,6 +347,7 @@ Bump this only when the Elisp code requires a newer native module
 
 ;; Declare native module functions for the byte compiler
 
+(declare-function ghostel--cursor-position "ghostel-module")
 (declare-function ghostel--encode-key "ghostel-module")
 (declare-function ghostel--focus-event "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
@@ -581,19 +589,17 @@ DIR is the module directory."
 (defvar-local ghostel--input-timer nil
   "Timer for flushing coalesced input.")
 
-
-
-
 (defvar-local ghostel--last-directory nil
   "Last known working directory from OSC 7, used for dedup.")
+
+(defvar-local ghostel--managed-buffer-name nil
+  "Last buffer name managed by Ghostel title tracking.
+Nil means title tracking has not claimed the buffer yet.  Clearing this
+variable re-enables automatic renaming for the next title update.")
 
 (defvar-local ghostel--prompt-positions nil
   "List of prompt positions as (buffer-line . exit-status) pairs.
 Used for prompt navigation and optional re-application after full redraws.")
-
-
-(defvar ghostel--buffer-counter 0
-  "Counter for generating unique terminal buffer names.")
 
 
 ;;; Keymap
@@ -633,6 +639,12 @@ Used for prompt navigation and optional re-application after full redraws.")
                         (let ((code (- c 96)))
                           (lambda () (interactive)
                             (ghostel--send-key (string code)))))))))
+    ;; Meta keys — bind all M-<letter> so they reach the terminal
+    ;; instead of running Emacs commands like forward-word.
+    (dolist (c (number-sequence ?a ?z))
+      (let ((key-str (format "M-%c" c)))
+        (unless (member key-str ghostel-keymap-exceptions)
+          (define-key map (kbd key-str) #'ghostel--send-event))))
     ;; C-@ (NUL, same as C-SPC) — used by programs like Emacs-in-terminal
     (define-key map (kbd "C-@")
                 (lambda () (interactive) (ghostel--send-key "\x00")))
@@ -761,6 +773,11 @@ Returns the sequence string, or nil for unknown keys."
            (<= ?a (aref key-name 0)) (<= (aref key-name 0) ?z)
            (> (logand mod-num 4) 0))        ; ctrl bit
       (string (- (aref key-name 0) 96)))    ; ctrl-a=1, ctrl-z=26
+     ;; Meta + single letter → ESC + char
+     ((and (= (length key-name) 1)
+           (<= ?a (aref key-name 0)) (<= (aref key-name 0) ?z)
+           (> (logand mod-num 2) 0))        ; alt/meta bit
+      (format "\e%c" (aref key-name 0)))
      ;; Simple special keys (CSI u encoding for modified variants)
      ((string= key-name "backspace") (if (> mod-num 0) (format "\e[127;%du" (1+ mod-num)) "\x7f"))
      ((string= key-name "return")    (if (> mod-num 0) (format "\e[13;%du" (1+ mod-num)) "\r"))
@@ -817,6 +834,9 @@ Returns the sequence string, or nil for unknown keys."
 (defun ghostel--self-insert ()
   "Send the last typed character to the terminal."
   (interactive)
+  (when (and ghostel-scroll-on-input ghostel--term)
+    (ghostel--scroll-bottom ghostel--term)
+    (setq ghostel--force-next-redraw t))
   (let* ((keys (this-command-keys))
          (char (aref keys (1- (length keys))))
          (str (if (and (characterp char) (< char 128))
@@ -830,6 +850,9 @@ Extracts the base key name and modifiers from `last-command-event'
 and routes through the ghostty key encoder, which respects terminal
 modes (application cursor keys, Kitty keyboard protocol, etc.)."
   (interactive)
+  (when (and ghostel-scroll-on-input ghostel--term)
+    (ghostel--scroll-bottom ghostel--term)
+    (setq ghostel--force-next-redraw t))
   (let* ((event last-command-event)
          (base (event-basic-type event))
          (mods (event-modifiers event))
@@ -1083,6 +1106,37 @@ pasted using bracketed paste."
   (end-of-line)
   (skip-chars-backward " \t"))
 
+(defun ghostel-copy-mode-recenter ()
+  "Recenter the terminal viewport around the current line in copy mode.
+Scrolls the terminal viewport so the current line is vertically
+centered, then redraws.  When the scroll is clamped at a scrollback
+boundary (nothing to scroll into), does nothing."
+  (interactive)
+  (when ghostel--term
+    (let* ((current-line (line-number-at-pos))
+           (win-height (window-body-height))
+           (center (/ win-height 2))
+           (col (current-column)))
+      (unless (= current-line center)
+        ;; Hash the buffer to detect whether the scroll was clamped.
+        (let ((old-hash (buffer-hash)))
+          (ghostel--scroll ghostel--term (- current-line center))
+          (let ((inhibit-read-only t))
+            (ghostel--redraw ghostel--term ghostel-full-redraw))
+          ;; If the buffer changed the viewport actually moved —
+          ;; reposition point at center.  Otherwise the scroll was
+          ;; clamped; restore point since redraw moved it to the
+          ;; terminal cursor.
+          (if (equal old-hash (buffer-hash))
+              (progn
+                (goto-char (point-min))
+                (forward-line (1- current-line))
+                (move-to-column col))
+            (goto-char (point-min))
+            (forward-line (1- (min center (line-number-at-pos (point-max)))))
+            (move-to-column col)
+            (recenter)))))))
+
 
 ;;; Mouse input
 
@@ -1171,6 +1225,7 @@ pasted using bracketed paste."
     (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
     (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
     (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
+    (define-key map (kbd "C-l")             #'ghostel-copy-mode-recenter)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
@@ -1532,8 +1587,14 @@ This ensures terminal text is visible regardless of the Emacs theme."
                                  :background bg)))
 
 (defun ghostel--set-title (title)
-  "Update the buffer name with TITLE from the terminal."
-  (rename-buffer (format "*ghostel: %s*" title) t))
+  "Update the buffer name with TITLE from the terminal.
+Do not overwrite a manual buffer rename."
+  (let ((new-name (format "*ghostel: %s*" title)))
+    (when (or (null ghostel--managed-buffer-name)
+              (equal (buffer-name) ghostel--managed-buffer-name))
+      (rename-buffer new-name t)
+      ;; Keep the actual name because `rename-buffer' may uniquify it.
+      (setq ghostel--managed-buffer-name (buffer-name)))))
 
 (defun ghostel--set-cursor-style (style visible)
   "Set the cursor style based on terminal state.
@@ -1968,7 +2029,6 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
               (inhibit-modification-hooks t))
           (ghostel--redraw ghostel--term ghostel-full-redraw))))))
 
-
 
 ;;; Major mode
 
@@ -1984,7 +2044,8 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
   (setq-local line-spacing 0)
   (setq-local window-adjust-process-window-size-function
               #'ghostel--window-adjust-process-window-size)
-  (add-function :after after-focus-change-function #'ghostel--focus-change))
+  (add-function :after after-focus-change-function #'ghostel--focus-change)
+  (ghostel--suppress-interfering-modes))
 
 (defun ghostel--suppress-interfering-modes ()
   "Disable global minor modes that interfere with ghostel.
@@ -2008,15 +2069,17 @@ wheel events reach ghostel's own scroll commands."
   (when (bound-and-true-p pixel-scroll-precision-mode)
     (setq-local pixel-scroll-precision-mode nil)))
 
-(add-hook 'ghostel-mode-hook #'ghostel--suppress-interfering-modes)
-
 
 ;;; Entry point
 
 ;;;###autoload
-(defun ghostel ()
-  "Create a new Ghostel terminal buffer."
-  (interactive)
+(defun ghostel (&optional arg)
+  "Start a new Ghostel terminal.  If the buffer already exists, switch to it.
+With a non-numeric prefix arg, create a new buffer.
+With a numeric prefix ARG, switch to the buffer with that number or
+create it if it doesn't exist yet.
+The name of the buffer is determined by the value of `ghostel-buffer-name'."
+  (interactive "P")
   (unless (fboundp 'ghostel--new)
     (let ((dir (file-name-directory (locate-library "ghostel"))))
       (ghostel--ensure-module dir)
@@ -2025,32 +2088,40 @@ wheel events reach ghostel's own scroll commands."
         (if (file-exists-p mod)
             (module-load mod)
           (user-error "Ghostel native module not available")))))
-  (let* ((index (cl-incf ghostel--buffer-counter))
-         (buf-name (if (= index 1)
-                       ghostel-buffer-name
-                     (format "%s<%d>" ghostel-buffer-name index)))
-         (buffer (generate-new-buffer buf-name)))
-    (with-current-buffer buffer
+  (let ((buffer (cond ((numberp arg)
+                       (get-buffer-create (format "%s<%d>"
+                                                  ghostel-buffer-name
+                                                  arg)))
+                      (arg
+                       (generate-new-buffer ghostel-buffer-name))
+                      (t
+                       (get-buffer-create ghostel-buffer-name)))))
+    (pop-to-buffer buffer (append display-buffer--same-window-action
+                                  '((category . comint))))
+    (unless (derived-mode-p 'ghostel-mode)
       (ghostel-mode)
+      (setq ghostel--managed-buffer-name (buffer-name))
       (let* ((height (window-body-height))
              (width (window-max-chars-per-line)))
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
         (ghostel--apply-palette ghostel--term))
-      (ghostel--start-process))
-    (switch-to-buffer buffer)))
+      (ghostel--start-process))))
 
 ;;;###autoload
-(defun ghostel-project ()
-  "Create a new Ghostel terminal in the current project's root.
+(defun ghostel-project (&optional arg)
+  "Start a new Ghostel terminal in the current project's root.
 The buffer name is prefixed with the project name.
+If a buffer already exists for this project, switch to it.
+Otherwise create a new Ghostel buffer.  ARG is passed through to
+`ghostel' and accepts the same universal argument conventions.
 To add this to `project-switch-commands':
   (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)"
-  (interactive)
+  (interactive "P")
   (let ((default-directory (project-root (project-current t)))
         (ghostel-buffer-name (project-prefixed-buffer-name
                               (string-trim ghostel-buffer-name "*" "*"))))
-    (ghostel)))
+    (ghostel arg)))
 
 (defun ghostel-other ()
   "Switch to the next ghostel terminal buffer, or create one."
@@ -2063,7 +2134,8 @@ To add this to `project-switch-commands':
          (current (current-buffer))
          (others (cl-remove current bufs)))
     (if others
-        (switch-to-buffer (car others))
+        (pop-to-buffer (car others) (append display-buffer--same-window-action
+                                            '((category . comint))))
       (ghostel))))
 
 (provide 'ghostel)
