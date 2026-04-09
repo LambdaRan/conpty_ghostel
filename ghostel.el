@@ -625,8 +625,6 @@ DIR is the module directory."
 Cleared before each redraw; checked afterwards to decide whether
 pixel-based trailing-space compensation is needed.")
 
-(defvar-local ghostel--resize-timer nil
-  "Timer for debounced SIGWINCH on alt screen.")
 
 (defvar-local ghostel--last-send-time nil
   "Time of the last `ghostel--send-key' call, for immediate-redraw detection.")
@@ -1925,9 +1923,6 @@ PROCESS is the shell process, EVENT describes the state change."
         (when ghostel--redraw-timer
           (cancel-timer ghostel--redraw-timer)
           (setq ghostel--redraw-timer nil))
-        (when ghostel--resize-timer
-          (cancel-timer ghostel--resize-timer)
-          (setq ghostel--resize-timer nil))
         (when ghostel--input-timer
           (cancel-timer ghostel--input-timer)
           (setq ghostel--input-timer nil))
@@ -2268,6 +2263,8 @@ on the remote host."
       ;; On Windows, conpty-proxy sets size via its command line args.
       (set-process-window-size proc height width))
     (set-process-query-on-exit-flag proc nil)
+    (process-put proc 'adjust-window-size-function
+                 #'ghostel--window-adjust-process-window-size)
     proc))
 
 
@@ -2340,50 +2337,28 @@ frame after idle to improve interactive responsiveness."
 (defun ghostel--window-adjust-process-window-size (process windows)
   "Resize the terminal to match the new Emacs window dimensions.
 PROCESS is the shell process, WINDOWS is the list of windows."
-  (let* ((window (car windows))
-         (width (window-max-chars-per-line window))
-         (height (window-body-height window)))
-    (when ghostel--term
-      (if (ghostel--mode-enabled ghostel--term 1049)
-          ;; Alt screen: debounce the entire resize (terminal + SIGWINCH)
-          ;; so we never interrupt a BSU/ESU cycle mid-render.
-          (progn
-            (when ghostel--resize-timer
-              (cancel-timer ghostel--resize-timer))
-            (setq ghostel--resize-timer
-                  (run-with-timer 0.05 nil
-                                  #'ghostel--resize-settled
-                                  (current-buffer) process height width)))
-        ;; Primary screen: resize + SIGWINCH + render immediately.
-        (ghostel--set-size ghostel--term height width)
-        (when (process-live-p process)
-          (if (eq system-type 'windows-nt)
-              (ghostel--conpty-proxy-resize process width height)
-            (set-process-window-size process height width)))
-        (setq ghostel--force-next-redraw t)
-        (ghostel--invalidate)))
-    (cons width height)))
-
-(defun ghostel--resize-settled (buffer process height width)
-  "Resize terminal in BUFFER and send SIGWINCH after debounce settles.
-Renders synchronously before returning to the event loop so the
-reflowed content is visible before the app's BSU can arrive.
-PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (setq ghostel--resize-timer nil)
-      (when ghostel--term
-        (ghostel--set-size ghostel--term height width)
-        (when (and process (process-live-p process))
-          (if (eq system-type 'windows-nt)
-              (ghostel--conpty-proxy-resize process width height)
-            (set-process-window-size process height width)))
-        ;; Render NOW, before returning to the event loop.
-        ;; The app's BSU response can't arrive until we return.
-        (let ((inhibit-read-only t)
-              (inhibit-redisplay t)
-              (inhibit-modification-hooks t))
-          (ghostel--redraw ghostel--term ghostel-full-redraw))))))
+  (let* ((adjust-fn (default-value 'window-adjust-process-window-size-function))
+         (adjust-fn (if (and (functionp adjust-fn)
+                             (not (eq adjust-fn
+                                      #'ghostel--window-adjust-process-window-size)))
+                        adjust-fn
+                      #'window-adjust-process-window-size-smallest))
+         (size (funcall adjust-fn process windows))
+         (width (car size))
+         (height (cdr size))
+         (buffer (process-buffer process)))
+    (when (and size (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (when ghostel--term
+          (ghostel--set-size ghostel--term height width)
+          (when (and (eq system-type 'windows-nt) (process-live-p process))
+            (ghostel--conpty-proxy-resize process width height))
+          (setq ghostel--force-next-redraw t)
+          (ghostel--invalidate))))
+    ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
+    ;; after this function returns, matching eat/vterm timing.
+    ;; On Windows, ConPTY resize is handled above instead.
+    size))
 
 
 ;;; Major mode
@@ -2398,8 +2373,6 @@ PROCESS is the shell, HEIGHT and WIDTH the final dimensions."
   (setq-local truncate-lines t)
   (setq-local scroll-conservatively 101)
   (setq-local line-spacing 0)
-  (setq-local window-adjust-process-window-size-function
-              #'ghostel--window-adjust-process-window-size)
   (add-function :after after-focus-change-function #'ghostel--focus-change)
   (ghostel--suppress-interfering-modes))
 
