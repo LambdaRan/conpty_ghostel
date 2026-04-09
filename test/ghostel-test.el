@@ -1740,6 +1740,61 @@ cell, so the visual line width must equal the terminal column count."
               (should-not recenter-called))))
       (kill-buffer buf))))
 
+;; -----------------------------------------------------------------------
+;; Test: ghostel-send-next-key
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-send-next-key-control-x ()
+  "send-next-key sends C-x as raw byte 24 (not intercepted by Emacs)."
+  (let (sent-key)
+    (cl-letf (((symbol-function 'ghostel--send-key)
+               (lambda (str) (setq sent-key str))))
+      (let ((unread-command-events (list ?\C-x)))
+        (ghostel-send-next-key))
+      (should (equal (string 24) sent-key)))))
+
+(ert-deftest ghostel-test-send-next-key-control-h ()
+  "send-next-key sends C-h as raw byte 8."
+  (let (sent-key)
+    (cl-letf (((symbol-function 'ghostel--send-key)
+               (lambda (str) (setq sent-key str))))
+      (let ((unread-command-events (list ?\C-h)))
+        (ghostel-send-next-key))
+      (should (equal (string 8) sent-key)))))
+
+(ert-deftest ghostel-test-send-next-key-regular-char ()
+  "send-next-key sends a regular character as-is."
+  (let (sent-key)
+    (cl-letf (((symbol-function 'ghostel--send-key)
+               (lambda (str) (setq sent-key str))))
+      (let ((unread-command-events (list ?a)))
+        (ghostel-send-next-key))
+      (should (equal "a" sent-key)))))
+
+(ert-deftest ghostel-test-send-next-key-meta-x ()
+  "send-next-key routes M-x through the encoder with meta modifier."
+  (let (captured-key captured-mods
+        (ghostel--term 'fake))
+    (cl-letf (((symbol-function 'ghostel--send-encoded)
+               (lambda (key mods &optional _utf8)
+                 (setq captured-key key captured-mods mods))))
+      (let ((unread-command-events (list ?\M-x)))
+        (ghostel-send-next-key))
+      (should (equal "x" captured-key))
+      (should (equal "meta" captured-mods)))))
+
+(ert-deftest ghostel-test-send-next-key-function-key ()
+  "send-next-key routes function keys through the encoder."
+  (let (captured-key captured-mods
+        (ghostel--term 'fake))
+    (cl-letf (((symbol-function 'ghostel--send-encoded)
+               (lambda (key mods &optional _utf8)
+                 (setq captured-key key captured-mods mods))))
+      (let ((unread-command-events (list 'up)))
+        (ghostel-send-next-key))
+      (should (equal "up" captured-key))
+      (should (equal "" captured-mods)))))
+
 (defconst ghostel-test--elisp-tests
   '(ghostel-test-raw-key-sequences
     ghostel-test-modifier-number
@@ -1778,7 +1833,12 @@ cell, so the visual line width must equal the terminal column count."
     ghostel-test-scroll-on-input-disabled
     ghostel-test-control-key-bindings
     ghostel-test-meta-key-bindings
-    ghostel-test-copy-mode-recenter)
+    ghostel-test-copy-mode-recenter
+    ghostel-test-send-next-key-control-x
+    ghostel-test-send-next-key-control-h
+    ghostel-test-send-next-key-regular-char
+    ghostel-test-send-next-key-meta-x
+    ghostel-test-send-next-key-function-key)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()

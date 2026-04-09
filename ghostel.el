@@ -694,26 +694,50 @@ Used for prompt navigation and optional re-application after full redraws.")
 (defun ghostel-send-next-key ()
   "Read the next key event and send it to the terminal.
 This is an escape hatch for sending keys that are normally
-intercepted by Emacs (e.g., interrupt or prefix keys)."
+intercepted by Emacs (e.g., interrupt or prefix keys).
+Uses `read-event' so that prefix keys return immediately instead
+of waiting for a continuation keystroke."
   (interactive)
-  (let* ((key (read-key-sequence "Send key: "))
-         (char (aref key 0)))
+  (let ((event (read-event "Send key: ")))
     (cond
-     ;; Control character
-     ((and (integerp char) (<= char 31))
-      (ghostel--send-key (string char)))
-     ;; Regular character
-     ((and (integerp char) (< char 128))
-      (ghostel--send-key (string char)))
-     ;; Multi-byte character
-     ((integerp char)
-      (ghostel--send-key (encode-coding-string (string char) 'utf-8)))
-     ;; Function key / special key — look up in keymap
+     ;; Control character (C-@=0, C-a=1 through C-_=31)
+     ((and (integerp event) (<= event 31))
+      (ghostel--send-key (string event)))
+     ;; ASCII (32-127)
+     ((and (integerp event) (<= event 127))
+      (ghostel--send-key (string event)))
+     ;; Non-ASCII character without modifier bits — send as UTF-8
+     ((and (integerp event) (< event #x400000))
+      (ghostel--send-key (encode-coding-string (string event) 'utf-8)))
+     ;; Modified key (M-x, C-M-a, etc.) or function key — use encoder
      (t
-      (let* ((binding (key-binding key)))
-        (if (and binding (commandp binding))
-            (call-interactively binding)
-          (message "ghostel: unrecognized key %S" key)))))))
+      (let* ((base (event-basic-type event))
+             (mods (event-modifiers event))
+             (key-name (cond
+                        ((eq base 'backtab) "tab")
+                        ((integerp base)
+                         (and (< base 128) (string base)))
+                        ((eq base 'deletechar) "delete")
+                        ((and base (symbolp base)) (symbol-name base))
+                        ((and (null base) (symbolp event))
+                         (replace-regexp-in-string
+                          "\\`\\(?:[CMSHs]-\\)*" "" (symbol-name event)))
+                        (t nil)))
+             (mods (if (eq base 'backtab) (cons 'shift mods) mods))
+             (mod-str (mapconcat
+                       #'identity
+                       (delq nil
+                             (mapcar
+                              (lambda (m)
+                                (pcase m
+                                  ('shift "shift") ('control "ctrl")
+                                  ('meta "meta") ('alt "alt")
+                                  ('hyper "hyper") ('super "super")))
+                              mods))
+                       ",")))
+        (if key-name
+            (ghostel--send-encoded key-name mod-str)
+          (message "ghostel: unrecognized key %S" event)))))))
 
 (defun ghostel--send-key (key)
   "Send KEY string to the terminal process.
