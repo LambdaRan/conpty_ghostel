@@ -2181,9 +2181,7 @@ ncurses apps like htop at start-up size and breaks live resize."
                 (< (float-time) deadline))
       (accept-process-output proc 0.05))))
 
-(defconst ghostel-test--bash
-  (cond ((file-executable-p "/bin/bash") "/bin/bash")
-        ((file-executable-p "/usr/bin/bash") "/usr/bin/bash"))
+(defconst ghostel-test--bash (executable-find "bash")
   "Absolute path to bash, or nil if not found.
 The baseline SIGWINCH tests explicitly use bash because trap-on-signal
 behavior for an idle shell reading stdin differs across implementations
