@@ -488,18 +488,18 @@ terminal emulators: [vterm](https://github.com/akermu/emacs-libvterm) (native
 module), [eat](https://codeberg.org/akib/emacs-eat) (pure Elisp), and Emacs
 built-in `term`.
 
-The primary benchmark streams 1 MB of data through a real process pipe,
+The primary benchmark streams 5 MB of data through a real process pipe,
 matching actual terminal usage.  All backends are configured with ~1,000
 lines of scrollback (matching vterm's default).  Results on Apple M4 Max,
 Emacs 31.0.50:
 
 | Backend              | Plain ASCII | URL-heavy |
 |----------------------|------------:|----------:|
-| ghostel              |    64 MB/s  |  22 MB/s  |
-| ghostel (no detect)  |    65 MB/s  |  61 MB/s  |
-| vterm                |    28 MB/s  |  23 MB/s  |
-| eat                  |   4.0 MB/s  | 3.1 MB/s  |
-| term                 |   5.0 MB/s  | 4.2 MB/s  |
+| ghostel              |    65 MB/s  |  42 MB/s  |
+| ghostel (no detect)  |    64 MB/s  |  65 MB/s  |
+| vterm                |    29 MB/s  |  24 MB/s  |
+| eat                  |   3.9 MB/s  | 3.0 MB/s  |
+| term                 |   4.8 MB/s  | 4.1 MB/s  |
 
 Ghostel scans terminal output for URLs and file paths, making them clickable.
 The "no detect" row shows throughput with this detection disabled
@@ -564,7 +564,7 @@ powering Neovim's built-in terminal.
 | Drag-and-drop                 | Yes       | No      |
 | Auto module download          | Yes       | No      |
 | Scrollback default            | ~5,000    | 1,000   |
-| PTY throughput (plain ASCII)  | 64 MB/s   | 28 MB/s |
+| PTY throughput (plain ASCII)  | 65 MB/s   | 29 MB/s |
 | Default redraw rate           | ~30 fps   | ~10 fps |
 
 ### Key differences
@@ -591,13 +591,13 @@ bash, zsh, and fish — no shell RC changes needed.  vterm requires manually
 sourcing scripts in your shell configuration.  Both support Elisp eval from
 the shell and TRAMP-aware remote directory tracking.
 
-**Performance.**  In PTY throughput benchmarks (1 MB streamed through `cat`,
-both backends configured with ~1,000 lines of scrollback), ghostel is roughly
-2x faster than vterm on plain ASCII data (64 vs 28 MB/s).  On URL-heavy
-output the gap narrows as ghostel's link detection adds overhead, but with
-detection disabled ghostel reaches 65 MB/s.  See the
-[Performance](#performance) section above for full numbers and how to run the
-benchmark suite yourself.
+**Performance.**  In PTY throughput benchmarks (5 MB streamed through `cat`,
+both backends configured with ~1,000 lines of scrollback), ghostel is
+roughly 2x faster than vterm on plain ASCII data (65 vs 29 MB/s).  On
+URL-heavy output ghostel still comes out ahead of vterm (42 vs 24 MB/s);
+with link detection disabled ghostel reaches 65 MB/s regardless of input.
+See the [Performance](#performance) section above for full numbers and how
+to run the benchmark suite yourself.
 
 **Installation.**  Ghostel can automatically download a pre-built native
 module or compile from source with [Zig](https://ziglang.org/).  vterm uses
