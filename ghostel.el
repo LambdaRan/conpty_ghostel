@@ -173,6 +173,12 @@ aggressive partial screen updates, but may use more CPU."
   "Default buffer name for ghostel terminals."
   :type 'string)
 
+(defcustom ghostel-enable-title-tracking t
+  "Automatically rename the buffer when the terminal title changes.
+When non-nil, OSC 2 title sequences update the buffer name to
+\"*ghostel: TITLE*\".  Set to nil to keep the buffer name fixed."
+  :type 'boolean)
+
 (defcustom ghostel-kill-buffer-on-exit t
   "Kill the buffer when the shell process exits."
   :type 'boolean)
@@ -1629,10 +1635,12 @@ This ensures terminal text is visible regardless of the Emacs theme."
 
 (defun ghostel--set-title (title)
   "Update the buffer name with TITLE from the terminal.
-Do not overwrite a manual buffer rename."
-  (let ((new-name (format "*ghostel: %s*" title)))
-    (when (or (null ghostel--managed-buffer-name)
-              (equal (buffer-name) ghostel--managed-buffer-name))
+Only acts when `ghostel-enable-title-tracking' is non-nil and the
+buffer has not been manually renamed by the user."
+  (when (and ghostel-enable-title-tracking
+             (or (null ghostel--managed-buffer-name)
+                 (equal (buffer-name) ghostel--managed-buffer-name)))
+    (let ((new-name (format "*ghostel: %s*" title)))
       (rename-buffer new-name t)
       ;; Keep the actual name because `rename-buffer' may uniquify it.
       (setq ghostel--managed-buffer-name (buffer-name)))))
