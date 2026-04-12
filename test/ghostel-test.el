@@ -1448,6 +1448,94 @@ for new size inside BSU/ESU → verify buffer shows new content."
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
+;; Test: resize preserves old frame until redraw replaces it
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-resize-no-blank-flash ()
+  "Buffer keeps old content after resize; redraw replaces it atomically.
+Regression test: fnSetSize used to call erase-buffer synchronously,
+leaving the buffer visibly empty until the next timer-driven redraw.
+Now the erasure is deferred into redraw() under inhibit-redisplay."
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-no-blank*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 100))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t))
+            ;; Fill the viewport with identifiable content.
+            (dotimes (i 10)
+              (ghostel--write-input term (format "LINE-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (let ((pre-content (buffer-substring-no-properties
+                                (point-min) (point-max))))
+              (should (string-match-p "LINE-00" pre-content))
+              (should (string-match-p "LINE-09" pre-content))
+
+              ;; Resize — old content must survive in the buffer.
+              (ghostel--set-size term 6 40)
+              (setq ghostel--term-rows 6)
+              (let ((mid-content (buffer-substring-no-properties
+                                  (point-min) (point-max))))
+                (should (> (length mid-content) 0))
+                (should (string-match-p "LINE-" mid-content)))
+
+              ;; Redraw rebuilds the buffer from the new terminal state.
+              (ghostel--redraw term t)
+              (let ((post-content (buffer-substring-no-properties
+                                   (point-min) (point-max))))
+                (should (> (length post-content) 0))
+                ;; Viewport should have the new row count; extra lines
+                ;; above are scrollback from the old viewport rows.
+                (should (>= (count-lines (point-min) (point-max)) 6))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-resize-redraw-anchors-window-start ()
+  "After resize + redraw, window-start is at the viewport origin.
+Without explicit anchoring, erase+rebuild inside redraw() clamps
+window-start to 1 (top of scrollback), causing a visible jump when
+Emacs auto-scrolls to make point visible."
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-anchor*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (ghostel--force-next-redraw nil)
+                 (inhibit-read-only t))
+            ;; Build up scrollback so the viewport is not at buffer start.
+            (dotimes (i 30)
+              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel--redraw term t)
+            (should (> (line-number-at-pos (point-max)) 10))
+
+            ;; Display in a real window so we can test window-start.
+            (set-window-buffer (selected-window) buf)
+
+            ;; Resize + redraw via delayed-redraw (simulates the real path).
+            (ghostel--set-size term 6 40)
+            (setq ghostel--term-rows 6)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+
+            ;; window-start should be at the viewport, not at buffer start.
+            (let* ((ws (window-start (selected-window)))
+                   (wp (window-point (selected-window)))
+                   (vp-start (save-excursion
+                               (goto-char (point-max))
+                               (forward-line -5)
+                               (line-beginning-position))))
+              (should (= ws vp-start))
+              (should (>= wp vp-start)))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: resize with real process — verify PTY and buffer content
 ;; -----------------------------------------------------------------------
 
@@ -2398,12 +2486,12 @@ ncurses apps like htop at start-up size and breaks live resize."
     (let ((ghostel--term 'fake)
           (ghostel--force-next-redraw nil)
           (set-size-args nil)
-          (invalidate-called nil))
+          (redraw-called nil))
       (let ((cur-buf (current-buffer)))
         (cl-letf (((symbol-function 'ghostel--set-size)
                    (lambda (_term h w) (setq set-size-args (list h w))))
-                  ((symbol-function 'ghostel--invalidate)
-                   (lambda () (setq invalidate-called t)))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (_buf) (setq redraw-called t)))
                   ((symbol-function 'process-buffer)
                    (lambda (_proc) cur-buf))
                   ((default-value 'window-adjust-process-window-size-function)
@@ -2413,7 +2501,7 @@ ncurses apps like htop at start-up size and breaks live resize."
             (should (equal '(120 . 40) result))
             (should (equal '(40 120) set-size-args))
             (should ghostel--force-next-redraw)
-            (should invalidate-called)))))))
+            (should redraw-called)))))))
 
 (ert-deftest ghostel-test-resize-nil-size ()
   "When default function returns nil, no resize happens."
@@ -2564,7 +2652,7 @@ while :; do sleep 0.1; done'\n")
             (let ((ghostel--term 'fake-term))
               (cl-letf (((symbol-function 'ghostel--set-size)
                          (lambda (_t _h _w) nil))
-                        ((symbol-function 'ghostel--invalidate) #'ignore)
+                        ((symbol-function 'ghostel--delayed-redraw) #'ignore)
                         ((default-value 'window-adjust-process-window-size-function)
                          (lambda (_p _w) (cons 120 30))))
                 ;; Invoke the handler as Emacs would.

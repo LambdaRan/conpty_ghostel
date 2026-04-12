@@ -2218,8 +2218,23 @@ interrupted by live output updating the terminal cursor."
           ;; `find-file-other-window'), the ghostel window's
           ;; window-point is stale and the terminal cursor will display
           ;; at the wrong place when the user reselects it.  Sync it.
-          (let ((pt (point)))
+          ;;
+          ;; Also anchor window-start to the viewport origin when point
+          ;; is in the viewport.  Without this, a resize (which erases
+          ;; and rebuilds the buffer inside redraw) leaves window-start
+          ;; clamped to 1 and Emacs's auto-scroll produces a visible
+          ;; jump.  Skip the anchor when point is in scrollback so that
+          ;; users reading history are not yanked back to the bottom.
+          (let* ((pt (point))
+                 (tr (or ghostel--term-rows 0))
+                 (vs (when (> tr 0)
+                       (save-excursion
+                         (goto-char (point-max))
+                         (forward-line (- (1- tr)))
+                         (line-beginning-position)))))
             (dolist (win (get-buffer-window-list buffer nil t))
+              (when (and vs (>= pt vs))
+                (set-window-start win vs t))
               (set-window-point win pt))))))))
 
 (defun ghostel-force-redraw ()
@@ -2254,7 +2269,12 @@ PROCESS is the shell process, WINDOWS is the list of windows."
           (ghostel--set-size ghostel--term (max 1 height) (max 1 width))
           (setq ghostel--term-rows height)
           (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))
+          ;; Redraw synchronously so the buffer is updated before
+          ;; Emacs displays the stale content at the new window size.
+          (when ghostel--redraw-timer
+            (cancel-timer ghostel--redraw-timer)
+            (setq ghostel--redraw-timer nil))
+          (ghostel--delayed-redraw buffer))))
     ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
     ;; after this function returns, matching eat/vterm timing.
     size))
