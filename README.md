@@ -195,34 +195,26 @@ Normal letter keys exit copy mode and send the key to the terminal.
 | `C-c C-n`     | Jump to next prompt              |
 | `C-c C-p`     | Jump to previous prompt          |
 | `C-l`         | Recenter viewport                |
-| `C-c C-a`     | Load full scrollback into buffer |
 | `C-c C-t`     | Exit without copying             |
 | `a`–`z`       | Exit and send key to terminal    |
 
 Soft-wrapped newlines are automatically stripped from copied text.
 
-After `C-c C-a`, the entire scrollback history is loaded into the buffer
-as styled text. Standard Emacs commands work across the full content:
-`C-x h` to select all, `C-s` to search, mark/region spanning any distance.
-
-Set `ghostel-copy-mode-auto-load-scrollback` to `t` to skip the
-viewport-only step and load the full scrollback immediately when
-entering copy mode. Advantages: produces a pure Emacs buffer where
-all standard commands work (incremental search, `occur`, `M-x
-flush-lines`, etc.) without an extra keystroke. Disadvantages: entering
-copy mode takes longer for large scrollback buffers, clickable links
-(URLs, file references, OSC 8 hyperlinks) are not detected in the
-loaded scrollback.
+The full scrollback is always rendered into the buffer as styled text,
+so `isearch`, `consult-line`, `occur`, `M-x flush-lines`, `C-x h` to
+select all, and any other buffer-based command work across the full
+history — even outside copy mode.
 
 ## Features
 
 ### Terminal Emulation
 - Full VT terminal emulation via libghostty-vt
 - 256-color and RGB (24-bit true color) support
+- **OSC 4 / 10 / 11 color queries** — TUI programs can query the current palette, foreground, and background colors, so tools like `duf`, `btop`, `delta`, and anything else using `termenv` auto-detect the right light/dark theme from the Emacs face colors
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
 - Cursor styles: block, bar, underline, hollow block
 - Alternate screen buffer (for TUI apps like htop, vim, etc.)
-- Scrollback buffer (configurable, default 20MB (~10,000 lines))
+- Scrollback buffer (configurable, default 5 MB (~5,000 lines), materialized into the Emacs buffer so `isearch`/`consult-line` work over history)
 
 ### Links and File Detection
 - **OSC 8 hyperlinks** — clickable URLs emitted by terminal programs (click or `RET` to open)
@@ -270,6 +262,9 @@ login shell via `getent passwd`.  `FALLBACK` is used when detection fails.
 OSC 7 directory tracking is TRAMP-aware: when the shell reports a remote
 hostname, `default-directory` is set to the corresponding TRAMP path,
 reusing the existing TRAMP prefix (method, user, multi-hop) when available.
+When no prefix exists, the method defaults to `tramp-default-method`; set
+`ghostel-tramp-default-method` to override it for ghostel specifically
+(e.g. `"scp"`, or `"rpc"` with [emacs-tramp-rpc](https://github.com/ArthurHeymans/emacs-tramp-rpc)).
 
 #### Remote Shell Integration
 
@@ -354,8 +349,8 @@ if [[ "$INSIDE_EMACS" = 'ghostel' ]]; then
     # Open a file in Emacs from the terminal
     e()   { ghostel_cmd find-file-other-window "$@"; }
 
-    # Open dired in another window
-    dow() { ghostel_cmd dired-other-window "$@"; }
+    # Open dired in another window, defaulting to the current directory
+    dow() { ghostel_cmd dired-other-window "${1:-$PWD}"; }
 
     # Open magit for the current directory
     gst() { ghostel_cmd magit-status-setup-buffer "$(pwd)"; }
@@ -388,9 +383,10 @@ individual faces with `M-x customize-face`.
 | `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
 | `ghostel-tramp-shells`           | `(see below)`        | Shell to use per TRAMP method (with login-shell detection) |
 | `ghostel-shell-integration`      | `t`                  | Auto-inject shell integration                            |
+| `ghostel-tramp-default-method`   | `nil`                | TRAMP method for new remote paths from OSC 7 (nil uses `tramp-default-method`) |
 | `ghostel-tramp-shell-integration` | `nil`               | Auto-inject shell integration for remote TRAMP sessions  |
 | `ghostel-buffer-name`            | `"*ghostel*"`        | Default buffer name                                      |
-| `ghostel-max-scrollback`         | `20MB`               | Maximum scrollback size in bytes                         |
+| `ghostel-max-scrollback`         | `5MB`                | Maximum scrollback size in bytes (materialized into the Emacs buffer; ~5,000 rows on 80-col terminals) |
 | `ghostel-timer-delay`            | `0.033`              | Base redraw delay in seconds (~30fps)                    |
 | `ghostel-adaptive-fps`           | `t`                  | Adaptive frame rate (shorter delay after idle, stop timer when idle) |
 | `ghostel-immediate-redraw-threshold` | `256`            | Max output bytes to trigger immediate redraw (0 to disable) |
@@ -403,12 +399,11 @@ individual faces with `M-x customize-face`.
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
 | `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
 | `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)` | Keys passed through to Emacs                             |
-| `ghostel-copy-mode-auto-load-scrollback` | `nil`        | Load full scrollback automatically when entering copy mode |
 | `ghostel-exit-functions`         | `nil`                | Hook run when the shell process exits                    |
 
 ## Evil-mode
 
-Ghostel includes optional `evil-mode` support via `ghostel-evil.el`.
+Ghostel includes optional `evil-mode` support via `evil-ghostel.el`.
 It synchronizes the terminal cursor with Emacs point during evil state
 transitions so that normal-mode navigation (`hjkl` etc.) works
 correctly.
@@ -416,12 +411,12 @@ correctly.
 To enable:
 
 ```elisp
-(use-package ghostel-evil
+(use-package evil-ghostel
   :after (ghostel evil)
-  :hook (ghostel-mode . ghostel-evil-mode))
+  :hook (ghostel-mode . evil-ghostel-mode))
 ```
 
-When `ghostel-evil-mode` is active:
+When `evil-ghostel-mode` is active:
 
 - Ghostel starts in **insert state** (terminal input works normally)
 - Pressing **ESC** enters normal state and snaps point to the terminal cursor
@@ -493,16 +488,18 @@ terminal emulators: [vterm](https://github.com/akermu/emacs-libvterm) (native
 module), [eat](https://codeberg.org/akib/emacs-eat) (pure Elisp), and Emacs
 built-in `term`.
 
-The primary benchmark streams 1 MB of data through a real process pipe,
-matching actual terminal usage.  Results on Apple M4 Max, Emacs 31.0.50:
+The primary benchmark streams 5 MB of data through a real process pipe,
+matching actual terminal usage.  All backends are configured with ~1,000
+lines of scrollback (matching vterm's default).  Results on Apple M4 Max,
+Emacs 31.0.50:
 
 | Backend              | Plain ASCII | URL-heavy |
 |----------------------|------------:|----------:|
-| ghostel              |    72 MB/s  |  26 MB/s  |
-| ghostel (no detect)  |    74 MB/s  |  74 MB/s  |
-| vterm                |    33 MB/s  |  27 MB/s  |
-| eat                  |   4.4 MB/s  | 3.4 MB/s  |
-| term                 |   5.4 MB/s  | 4.6 MB/s  |
+| ghostel              |    65 MB/s  |  42 MB/s  |
+| ghostel (no detect)  |    64 MB/s  |  65 MB/s  |
+| vterm                |    29 MB/s  |  24 MB/s  |
+| eat                  |   3.9 MB/s  | 3.0 MB/s  |
+| term                 |   4.8 MB/s  | 4.1 MB/s  |
 
 Ghostel scans terminal output for URLs and file paths, making them clickable.
 The "no detect" row shows throughput with this detection disabled
@@ -546,6 +543,7 @@ powering Neovim's built-in terminal.
 | Feature                       | ghostel   | vterm   |
 |-------------------------------|-----------|---------|
 | True color (24-bit)           | Yes       | Yes     |
+| OSC 4/10/11 color queries     | Yes       | No      |
 | Bold / italic / faint         | Yes       | Yes     |
 | Underline styles (5 types)    | Yes       | No      |
 | Underline color               | Yes       | No      |
@@ -565,8 +563,8 @@ powering Neovim's built-in terminal.
 | Copy mode                     | Yes       | Yes     |
 | Drag-and-drop                 | Yes       | No      |
 | Auto module download          | Yes       | No      |
-| Scrollback default            | ~10,000   | 1,000   |
-| PTY throughput (plain ASCII)  | 72 MB/s   | 33 MB/s |
+| Scrollback default            | ~5,000    | 1,000   |
+| PTY throughput (plain ASCII)  | 65 MB/s   | 29 MB/s |
 | Default redraw rate           | ~30 fps   | ~10 fps |
 
 ### Key differences
@@ -593,12 +591,13 @@ bash, zsh, and fish — no shell RC changes needed.  vterm requires manually
 sourcing scripts in your shell configuration.  Both support Elisp eval from
 the shell and TRAMP-aware remote directory tracking.
 
-**Performance.**  In PTY throughput benchmarks (1 MB streamed through `cat`),
-ghostel is roughly 2x faster than vterm on plain ASCII data (72 vs 33 MB/s).
-On URL-heavy output the gap narrows as ghostel's link detection adds overhead,
-but with detection disabled ghostel reaches 74 MB/s.  See the
-[Performance](#performance) section above for full numbers and how to run the
-benchmark suite yourself.
+**Performance.**  In PTY throughput benchmarks (5 MB streamed through `cat`,
+both backends configured with ~1,000 lines of scrollback), ghostel is
+roughly 2x faster than vterm on plain ASCII data (65 vs 29 MB/s).  On
+URL-heavy output ghostel still comes out ahead of vterm (42 vs 24 MB/s);
+with link detection disabled ghostel reaches 65 MB/s regardless of input.
+See the [Performance](#performance) section above for full numbers and how
+to run the benchmark suite yourself.
 
 **Installation.**  Ghostel can automatically download a pre-built native
 module or compile from source with [Zig](https://ziglang.org/).  vterm uses

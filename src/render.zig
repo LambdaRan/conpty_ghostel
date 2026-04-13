@@ -341,11 +341,14 @@ fn scanHyperlinksFromGrid(
 }
 
 /// Apply hyperlink text properties to the Emacs buffer.
+/// Row indices are relative to the viewport — caller passes the char
+/// position of the first viewport line so we can resolve absolute rows.
 fn applyHyperlinks(
     env: emacs.Env,
     spans: []const HyperlinkSpan,
     span_count: usize,
     uri_buf: []const u8,
+    viewport_start: i64,
 ) void {
     if (span_count == 0) return;
 
@@ -357,8 +360,8 @@ fn applyHyperlinks(
         const uri = uri_buf[span.uri_start..span.uri_start + span.uri_len];
         if (uri.len == 0) continue;
 
-        // Navigate to span start
-        env.gotoCharN(1);
+        // Navigate to span start (viewport-relative row -> absolute line)
+        env.gotoCharN(viewport_start);
         _ = env.forwardLine(@as(i64, span.row));
         env.moveToColumn(@as(i64, span.col_start));
         const start = env.point();
@@ -393,6 +396,56 @@ fn isRowPrompt(term: *Terminal) bool {
     return semantic != 0;
 }
 
+/// Hash the first ~16 cells of libghostty's first scrollback row using
+/// FNV-1a. Returns 0 if there is no scrollback or if anything fails.
+///
+/// Used to detect rotation: when libghostty's scrollback is plateaued at
+/// its byte cap, sustained writes evict the oldest row in lockstep with
+/// new rows being pushed, so `total_rows` doesn't change and the normal
+/// delta-detection sees no work to do. Sampling the first scrollback
+/// row's content lets us detect that the row at index 0 has changed
+/// underneath us.
+///
+/// Scrolls libghostty's viewport to the top to read the row, then
+/// restores the previous viewport offset. Cheap (~6 libghostty calls);
+/// gated by the caller to only run when rotation is suspected.
+fn computeFirstScrollbackRowHash(term: *Terminal) u64 {
+    const sb = term.getScrollbar() orelse return 0;
+    const saved_offset = sb.offset;
+
+    term.scrollViewport(gt.SCROLL_TOP, 0);
+    defer {
+        term.scrollViewport(gt.SCROLL_TOP, 0);
+        if (saved_offset > 0) {
+            term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+        }
+    }
+
+    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) return 0;
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) return 0;
+    if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) return 0;
+    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) return 0;
+
+    // FNV-1a 64-bit hash. We mix in the first ~16 cells' first
+    // codepoints (or a space for empty cells) — enough entropy to
+    // distinguish rotation states without scanning the whole row.
+    const fnv_prime: u64 = 0x100000001b3;
+    var hash: u64 = 0xcbf29ce484222325;
+    var i: usize = 0;
+    while (i < 16 and gt.c.ghostty_render_state_row_cells_next(term.row_cells)) : (i += 1) {
+        var graphemes_len: u32 = 0;
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) != gt.SUCCESS) continue;
+        if (graphemes_len == 0) {
+            hash = (hash ^ ' ') *% fnv_prime;
+            continue;
+        }
+        var codepoints: [4]u32 = undefined;
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&codepoints)) != gt.SUCCESS) continue;
+        hash = (hash ^ codepoints[0]) *% fnv_prime;
+    }
+    return hash;
+}
+
 /// Result from buildRowContent: byte length for make_string, char count for properties.
 const RowContent = struct {
     byte_len: usize,
@@ -406,6 +459,14 @@ const RowContent = struct {
 
 /// Build text content and style runs for the current row in the iterator.
 /// Style runs use character (codepoint) offsets for Emacs put-text-property.
+///
+/// Trailing blank cells — spaces with the default cell style — are
+/// trimmed off the end of the row so the Emacs buffer does not carry
+/// libghostty's full-width viewport padding. A cell is NOT blank if
+/// its character is non-space, or if its style has any non-default
+/// attribute (e.g. a colored background, underline, etc.), so visibly-
+/// styled blanks are preserved. Style runs extending past the trim
+/// point are clipped to the new length by `insertAndStyle'.
 fn buildRowContent(
     term: *Terminal,
     text_buf: []u8,
@@ -414,6 +475,11 @@ fn buildRowContent(
 ) RowContent {
     var text_len: usize = 0; // byte offset
     var char_len: usize = 0; // character (codepoint) offset
+    // Position at the end of the last non-blank cell; final row length
+    // is trimmed back to this. Any run of blank cells past the end is
+    // discarded along with their default-style trailing padding.
+    var trim_text_len: usize = 0;
+    var trim_char_len: usize = 0;
     var prompt_char_len: usize = 0; // chars that are semantic prompt
     var in_prompt: bool = true; // track contiguous leading prompt cells
     var has_wide: bool = false;
@@ -478,6 +544,12 @@ fn buildRowContent(
                 char_len += 1;
             }
             if (in_prompt) prompt_char_len = char_len;
+            // Empty cells are blank for trim purposes unless their
+            // style has a visible attribute (e.g. colored background).
+            if (!cell_style.isDefault()) {
+                trim_text_len = text_len;
+                trim_char_len = char_len;
+            }
             continue;
         }
 
@@ -496,7 +568,23 @@ fn buildRowContent(
             char_len += 1; // one codepoint = one Emacs character
         }
         if (in_prompt) prompt_char_len = char_len;
+        // Any cell that libghostty stored a grapheme for was written
+        // explicitly by the terminal, so it anchors the trim point —
+        // even if the grapheme happens to be a space (e.g. the space
+        // in a \"$ \" prompt, or a space the shell intentionally
+        // emitted as part of a layout). Only unwritten padding cells
+        // (the `graphemes_len == 0' branch above) are considered blank.
+        trim_text_len = text_len;
+        trim_char_len = char_len;
     }
+
+    // Trim trailing blank cells. Cap `prompt_char_len' at the new
+    // `char_len' so the "leading prompt" region never extends past the
+    // trimmed text. Style runs extending past the trim point are
+    // clipped by `insertAndStyle' via its `content.char_len' cap.
+    text_len = trim_text_len;
+    char_len = trim_char_len;
+    if (prompt_char_len > char_len) prompt_char_len = char_len;
 
     // Close final run
     if (char_len > run_start_char and run_count.* < runs.len) {
@@ -537,109 +625,90 @@ fn insertAndStyle(
     }
 }
 
-/// Render the entire scrollback + active screen into the Emacs buffer.
-/// Returns the 1-based buffer line number corresponding to the original viewport top.
-pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) i64 {
-    const total_rows = term.getTotalRows();
-    if (total_rows == 0) return 1;
+/// Insert `count` libghostty rows starting at `first_row` (0 = top of
+/// scrollback) into the Emacs buffer at `point`. Each row is followed by
+/// a newline; soft-wrapped rows get the `ghostel-wrap` property on their
+/// trailing newline so copy-mode can filter them out.
+///
+/// Drives libghostty by scrolling its viewport through the requested range
+/// and re-querying the render state for each page. The caller is expected
+/// to save and restore the libghostty viewport position around this call.
+///
+/// Returns the number of rows actually inserted.
+fn insertScrollbackRange(
+    env: emacs.Env,
+    term: *Terminal,
+    first_row: usize,
+    count: usize,
+    default_fg: gt.ColorRgb,
+    default_bg: gt.ColorRgb,
+) usize {
+    if (count == 0) return 0;
 
-    // Save current viewport position
-    const sb = term.getScrollbar() orelse return 1;
-    const saved_offset = sb.offset;
-
-    // Get default colors
-    // (need a render_state_update to read them, use current viewport for that)
-    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
-        return 1;
-    }
-    var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
-    var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
-    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
-    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
-
-    // Set buffer default face
-    var fg_hex: [7]u8 = undefined;
-    var bg_hex: [7]u8 = undefined;
-    _ = env.call2(
-        emacs.sym.@"ghostel--set-buffer-face",
-        env.makeString(formatColor(default_fg, &fg_hex)),
-        env.makeString(formatColor(default_bg, &bg_hex)),
-    );
-
-    // Erase buffer
-    env.eraseBuffer();
-
-    // Scroll to top of scrollback
+    // Position libghostty viewport at first_row.
     term.scrollViewport(gt.SCROLL_TOP, 0);
+    if (first_row > 0) {
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(first_row));
+    }
 
-    // Shared buffers for row content
     var runs: [512]RunInfo = undefined;
     var text_buf: [16384]u8 = undefined;
 
-    var rendered: usize = 0;
-    var prev_wrapped: bool = false;
+    var inserted: usize = 0;
 
-    while (rendered < total_rows) {
-        // Query actual viewport position
+    while (inserted < count) {
         const cur_sb = term.getScrollbar() orelse break;
         const viewport_start = cur_sb.offset;
 
-        // Update render state for current viewport
-        if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
-            break;
-        }
+        if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) break;
+        if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) break;
 
-        // Get row iterator
-        if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
-            break;
-        }
-
-        // How many rows to skip (already rendered from previous page overlap)
-        const viewport_rows: usize = term.rows;
-        const skip: usize = if (rendered > viewport_start) rendered - viewport_start else 0;
-        if (skip >= viewport_rows) break; // no new rows in this viewport
-        // How many rows to take from this viewport
-        const take: usize = @min(viewport_rows - skip, total_rows - rendered);
-        if (take == 0) break; // no progress possible
+        const absolute_target = first_row + inserted;
+        const skip: usize = if (absolute_target > viewport_start) absolute_target - viewport_start else 0;
+        if (skip >= term.rows) break;
+        const take: usize = @min(term.rows - skip, count - inserted);
+        if (take == 0) break;
 
         var row_in_page: usize = 0;
+        var took: usize = 0;
         while (gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
             defer row_in_page += 1;
+            if (row_in_page < skip) continue;
+            if (took >= take) break;
 
-            if (row_in_page < skip) {
-                // Still need to track wrap state through skipped rows
-                prev_wrapped = isRowWrapped(term);
-                continue;
-            }
-            if (row_in_page >= skip + take) {
-                break;
-            }
-
-            // Get cells for this row
             if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
-                prev_wrapped = false;
-                rendered += 1;
+                took += 1;
+                inserted += 1;
                 continue;
             }
 
-            // Insert newline between rows
-            if (rendered > 0) {
-                const nl_start = env.point();
-                env.insert("\n");
-                if (prev_wrapped) {
-                    env.putTextProperty(nl_start, env.point(), emacs.sym.@"ghostel-wrap", env.t());
-                }
+            var run_count: usize = 0;
+            var content = buildRowContent(term, &text_buf, &runs, &run_count);
+
+            // Append the trailing newline to the row buffer so the row
+            // text + newline insert through a single env.insert call
+            // instead of two. This saves one Elisp FFI round-trip per
+            // inserted row, which is the dominant per-row cost in this
+            // hot loop. Style runs only cover the row's cells, so the
+            // unstyled trailing \n is harmless to insertAndStyle. If the
+            // row exactly filled text_buf, fall back to a separate
+            // env.insert("\n") so the "one row per line" invariant
+            // (relied on by the `after_insert - 1` property math below)
+            // always holds.
+            const newline_in_buf = content.byte_len < text_buf.len;
+            if (newline_in_buf) {
+                text_buf[content.byte_len] = '\n';
+                content.byte_len += 1;
+                content.char_len += 1;
             }
 
-            // Build row content
-            var run_count: usize = 0;
-            const content = buildRowContent(term, &text_buf, &runs, &run_count);
-
-            // Insert text and apply styles
             const row_start = env.extractInteger(env.point());
             insertAndStyle(env, &text_buf, content, &runs, run_count, default_fg, default_bg);
+            if (!newline_in_buf) {
+                env.insert("\n");
+            }
+            const after_insert = env.extractInteger(env.point());
 
-            // Mark prompt portion
             if (content.prompt_char_len > 0) {
                 env.putTextProperty(
                     env.makeInteger(row_start),
@@ -650,42 +719,297 @@ pub fn redrawFullScrollback(env: emacs.Env, term: *Terminal) i64 {
             } else if (isRowPrompt(term)) {
                 env.putTextProperty(
                     env.makeInteger(row_start),
-                    env.point(),
+                    env.makeInteger(after_insert - 1), // exclude trailing newline
                     emacs.sym.@"ghostel-prompt",
                     env.t(),
                 );
             }
 
-            prev_wrapped = isRowWrapped(term);
-            rendered += 1;
+            // Mark the trailing newline with ghostel-wrap if the row is
+            // soft-wrapped, so copy-mode can filter wrap newlines from
+            // copied text.
+            if (isRowWrapped(term)) {
+                env.putTextProperty(
+                    env.makeInteger(after_insert - 1),
+                    env.makeInteger(after_insert),
+                    emacs.sym.@"ghostel-wrap",
+                    env.t(),
+                );
+            }
+
+            took += 1;
+            inserted += 1;
         }
 
-        if (rendered >= total_rows) break;
-
-        // Scroll down by viewport size for next page
+        if (inserted >= count) break;
+        // Advance viewport by a full page for the next iteration.
         term.scrollViewport(gt.SCROLL_DELTA, @intCast(term.rows));
     }
 
-    // Restore viewport to saved position
-    term.scrollViewport(gt.SCROLL_TOP, 0);
-    if (saved_offset > 0) {
-        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    return inserted;
+}
+
+
+/// Convert a terminal column to an Emacs character offset by iterating
+/// the row's cells.  Returns `true` and positions point on success;
+/// `false` if the cell data is unavailable (caller should fall back to
+/// `move-to-column`).
+///
+/// This avoids relying on Emacs' `char-width`, which can disagree with
+/// the terminal's column width for certain characters (e.g. box-drawing
+/// glyphs on CJK/pgtk systems where `char-width` returns 2 but the
+/// terminal treats them as single-width).
+fn positionCursorByCell(env: emacs.Env, term: *Terminal, cx: u16, cy: u16) bool {
+    if (cx == 0) return true; // already at column 0
+
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) {
+        return false;
     }
 
-    // Return 1-based line number of the original viewport top
-    return @as(i64, @intCast(saved_offset)) + 1;
+    // Advance iterator to cursor row cy.
+    {
+        var ri: u16 = 0;
+        while (ri <= cy) : (ri += 1) {
+            if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) {
+                return false;
+            }
+        }
+    }
+
+    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+        return false;
+    }
+
+    // Walk cells 0..cx-1, counting Emacs characters.
+    var col: u16 = 0;
+    var char_count: i64 = 0;
+    while (col < cx) : (col += 1) {
+        if (!gt.c.ghostty_render_state_row_cells_next(term.row_cells)) break;
+
+        var graphemes_len: u32 = 0;
+        _ = gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len));
+
+        if (graphemes_len == 0) {
+            // Spacer tails produce no Emacs character.
+            var raw_cell: gt.c.GhosttyCell = undefined;
+            var wide: c_int = gt.c.GHOSTTY_CELL_WIDE_NARROW;
+            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell)) == gt.SUCCESS) {
+                _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
+            }
+            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) {
+                continue;
+            }
+            char_count += 1; // empty cell → space
+        } else {
+            char_count += @intCast(@min(graphemes_len, 16));
+        }
+    }
+
+    // Cap at end of line so we never jump past it into the next row
+    // (can happen when cursor is on a trimmed trailing blank).
+    const pt = env.extractInteger(env.point());
+    const eol = env.extractInteger(env.lineEndPosition());
+    const max_chars = eol - pt;
+    env.gotoCharN(pt + @min(char_count, max_chars));
+    return true;
 }
 
 /// Redraw the terminal into the current Emacs buffer.
-/// When force_full is true, always erase and rebuild (matches Ghostty GPU behaviour).
-pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
+///
+/// Maintains a "growing buffer" model where the Emacs buffer contains
+/// all materialized scrollback (above) and the current viewport (below).
+/// On each call we:
+///   1. Force libghostty's viewport to the bottom (active screen).
+///   2. Poll `getTotalRows()` against `term.scrollback_in_buffer` to
+///      detect rows that scrolled off the top (append to buffer) or
+///      rows evicted by libghostty's scrollback cap (trim from buffer).
+///   3. Render the viewport into the tail of the buffer, anchored at
+///      the line that follows the last scrollback row.
+///
+/// When `force_full` is true, the viewport region is fully re-rendered
+/// instead of using the incremental dirty-row path.
+pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
+    var force_full = force_full_arg;
+
+    // Lock the libghostty viewport to the bottom. Users navigate history
+    // through Emacs now, so any lingering scroll offset (e.g. from an
+    // explicit ghostel--scroll) would desync our scrollback tracker.
+    if (term.getScrollbar()) |sb| {
+        if (sb.len + sb.offset < sb.total) {
+            term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+        }
+    }
+
     // Update render state from terminal
     if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) {
         return;
     }
 
+    // ---- Deferred resize buffer reset ----------------------------------------
+    // terminal.resize() sets resize_pending instead of immediately erasing the
+    // buffer, so the old frame stays visible until this redraw replaces it
+    // (the caller binds inhibit-redisplay around us).  Erase now and force a
+    // full rebuild of scrollback + viewport.
+    if (term.resize_pending) {
+        env.eraseBuffer();
+        term.resize_pending = false;
+        force_full = true;
+    }
+
+    // Resolve default colors once — used for both the scrollback append
+    // path and the viewport render path.
+    var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
+    var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
+
+    // ---- Scrollback rotation detection ------------------------------------
+    // When libghostty's scrollback is at its byte cap, sustained writes
+    // evict the oldest rows and push new ones, so the row at scrollback
+    // index 0 changes underneath us. The normal delta-sync below tracks
+    // `total_rows` deltas, but those don't capture content rotation —
+    // if the count is unchanged (or even shrinking) the trim path would
+    // remove our top rows under the *assumption* they match the rows
+    // libghostty just evicted, which isn't true after rotation.
+    //
+    // Detect rotation by hashing the first scrollback row whenever
+    // writes have happened since the last redraw and we have scrollback.
+    // A change means the top row is no longer the row we materialized
+    // → wipe the buffer and let the delta-sync below re-fetch everything
+    // fresh from libghostty.
+    if (term.wrote_since_redraw and term.scrollback_in_buffer > 0 and term.first_scrollback_row_hash != 0) {
+        const new_hash = computeFirstScrollbackRowHash(term);
+        // computeFirstScrollbackRowHash scrolled libghostty's viewport to
+        // sample row 0 and the defer restored the offset, but the render
+        // state may now be stale — refresh it before continuing.
+        if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) return;
+        if (new_hash != term.first_scrollback_row_hash) {
+            // Rotation detected — erase the buffer entirely and force a
+            // full viewport render. The delta-sync below will then see
+            // libghostty_sb - 0 = libghostty_sb and refetch everything.
+            env.eraseBuffer();
+            term.scrollback_in_buffer = 0;
+            term.first_scrollback_row_hash = 0;
+            force_full = true;
+        }
+    }
+
+    // ---- Scrollback sync ---------------------------------------------------
+    // libghostty stores scrollback + active screen in a single row space.
+    // The rows "above" the viewport are scrollback; our invariant is that
+    // those rows are all materialized in the Emacs buffer, one per line.
+    //
+    // We compute the viewport-start char position at most once per redraw
+    // by walking from point-min and reusing point() after any insert/trim
+    // touches it. forwardLine is O(scrollback) so doing it twice would
+    // double the per-redraw cost in long-running sessions.
+    const total_rows = term.getTotalRows();
+    const libghostty_sb: usize = if (total_rows > term.rows) total_rows - term.rows else 0;
+
+    // Walk to the current viewport start (line scrollback_in_buffer + 1).
+    env.gotoCharN(1);
+    if (term.scrollback_in_buffer > 0) {
+        _ = env.forwardLine(@as(i64, @intCast(term.scrollback_in_buffer)));
+    }
+    var viewport_start_int = env.extractInteger(env.point());
+
+    if (libghostty_sb > term.scrollback_in_buffer) {
+        // New rows scrolled off in libghostty. Strategy:
+        //
+        // 1. Promote as many existing buffer rows as possible. The rows
+        //    that were at the top of the viewport in the previous redraw
+        //    are exactly the rows libghostty just pushed into scrollback,
+        //    so just bumping `scrollback_in_buffer` makes them scrollback
+        //    in our model too — no fetch, no re-render. Critically, any
+        //    text properties applied to those rows while they were in the
+        //    viewport (URL detection, ghostel-prompt, etc.) survive
+        //    automatically because we never touch the text.
+        //
+        // 2. If the buffer didn't have enough viewport rows to absorb the
+        //    full delta (bootstrap, post-resize, or a burst that scrolled
+        //    more rows than the viewport between redraws), fall back to
+        //    `insertScrollbackRange` for the remainder.
+        var delta = libghostty_sb - term.scrollback_in_buffer;
+
+        env.gotoCharN(viewport_start_int);
+        const remaining_lines = env.forwardLine(@as(i64, @intCast(delta)));
+        var promoted: usize = delta - @as(usize, @intCast(remaining_lines));
+
+        // forward-line counts the position right after the last buffer
+        // char as a moveable "line N+1" even when the buffer doesn't
+        // end in \n. That position corresponds to our terminal cursor
+        // row — a stale snapshot, NOT a real libghostty scrollback row.
+        // If we landed at pointMax with no trailing newline, peel one
+        // off the promoted count so we don't promote the cursor row.
+        if (promoted > 0 and env.extractInteger(env.point()) == env.extractInteger(env.pointMax())) {
+            const cb = env.call0(emacs.sym.@"char-before");
+            if (env.isNotNil(cb) and env.extractInteger(cb) != '\n') {
+                promoted -= 1;
+            }
+        }
+
+        if (promoted > 0) {
+            term.scrollback_in_buffer += promoted;
+            // forward-line may have left point at pointMax even when it
+            // partially walked past complete lines, so always re-walk
+            // exactly `promoted` newline-bounded lines to anchor the new
+            // viewport_start at the start of the first un-promoted row.
+            env.gotoCharN(viewport_start_int);
+            _ = env.forwardLine(@as(i64, @intCast(promoted)));
+            viewport_start_int = env.extractInteger(env.point());
+            delta -= promoted;
+        }
+
+        if (delta > 0) {
+            // Bootstrap fallback: fetch the rest from libghostty.
+            env.gotoCharN(viewport_start_int);
+            const inserted = insertScrollbackRange(
+                env,
+                term,
+                term.scrollback_in_buffer,
+                delta,
+                default_fg,
+                default_bg,
+            );
+            term.scrollback_in_buffer += inserted;
+            viewport_start_int = env.extractInteger(env.point());
+
+            // insertScrollbackRange scrolled libghostty's viewport through
+            // the scrollback range — restore it to the active screen and
+            // refresh the render state for the viewport render below.
+            term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+            if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) return;
+        }
+    } else if (libghostty_sb < term.scrollback_in_buffer) {
+        // libghostty's scrollback cap evicted the oldest rows — trim the
+        // same number of lines from the top of the buffer.
+        const delta = term.scrollback_in_buffer - libghostty_sb;
+        env.gotoCharN(1);
+        if (env.forwardLine(@as(i64, @intCast(delta))) == 0) {
+            env.deleteRegion(env.makeInteger(1), env.point());
+            term.scrollback_in_buffer -= delta;
+            // After the delete, the new viewport start has shifted down.
+            // forwardLine is already at the right line (point-min + delta
+            // lines was the next surviving row, now line 1+scrollback_in_buffer).
+            // Recompute by walking the remaining scrollback rows.
+        } else {
+            // Ran off the end — buffer is out of sync; rebuild from scratch.
+            env.eraseBuffer();
+            term.scrollback_in_buffer = 0;
+            force_full = true;
+        }
+        env.gotoCharN(1);
+        if (term.scrollback_in_buffer > 0) {
+            _ = env.forwardLine(@as(i64, @intCast(term.scrollback_in_buffer)));
+        }
+        viewport_start_int = env.extractInteger(env.point());
+    }
+
     // Check dirty state — cells are only redrawn when dirty, but cursor
     // positioning always runs so that cursor-only movements are visible.
+    // force_full overrides: the buffer may have been erased by scrollback
+    // sync / resize / rotation above, so we must rebuild even if
+    // libghostty considers the cells clean.
     var dirty: c_int = gt.DIRTY_FALSE;
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_DIRTY, @ptrCast(&dirty));
     var has_hyperlinks: bool = false;
@@ -693,13 +1017,7 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
     var hyperlink_row_count: usize = 0;
     var has_wide_chars: bool = false;
 
-    if (dirty != gt.DIRTY_FALSE) {
-        // Get default colors
-        var default_fg = gt.ColorRgb{ .r = 204, .g = 204, .b = 204 };
-        var default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
-        _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_FOREGROUND, @ptrCast(&default_fg));
-        _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_COLOR_BACKGROUND, @ptrCast(&default_bg));
-
+    if (dirty != gt.DIRTY_FALSE or force_full) {
         // Set buffer default face
         var fg_hex: [7]u8 = undefined;
         var bg_hex: [7]u8 = undefined;
@@ -718,7 +1036,8 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
         // force_full bypasses partial mode to avoid stale rows after scrolls.
         const partial = (!force_full and dirty == gt.DIRTY_PARTIAL);
         if (!partial) {
-            env.eraseBuffer();
+            // Wipe only the viewport region; scrollback stays intact.
+            env.deleteRegion(env.makeInteger(viewport_start_int), env.pointMax());
         }
 
         // Shared buffers for row content
@@ -762,8 +1081,8 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
             }
 
             if (partial) {
-                // Navigate to this row and clear its content
-                env.gotoCharN(1);
+                // Navigate to this row (viewport-relative) and clear its content.
+                env.gotoCharN(viewport_start_int);
                 const moved = env.forwardLine(@as(i64, @intCast(row_count)));
                 if (moved != 0) {
                     // Row doesn't exist yet — fall through to append
@@ -820,10 +1139,10 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
         }
 
         // Trim excess buffer lines beyond the terminal's row count.
-        // Partial redraws don't erase the buffer, so stale trailing
-        // lines can accumulate after a resize or mode switch.
+        // Partial redraws don't erase the viewport region, so stale
+        // trailing lines can accumulate after a resize or mode switch.
         if (partial and row_count > 0) {
-            env.gotoCharN(1);
+            env.gotoCharN(viewport_start_int);
             if (env.forwardLine(@as(i64, @intCast(row_count))) == 0) {
                 env.deleteRegion(env.point(), env.pointMax());
             }
@@ -848,19 +1167,26 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
             &hl_uri_buf,
         );
         if (hl.count > 0) {
-            applyHyperlinks(env, &hl_spans, hl.count, &hl_uri_buf);
+            applyHyperlinks(env, &hl_spans, hl.count, &hl_uri_buf, viewport_start_int);
         }
     }
 
-    // Auto-detect plain-text URLs
+    // Auto-detect plain-text URLs — only on the viewport region. Scrollback
+    // rows are skipped to keep streaming O(viewport) per redraw instead of
+    // O(buffer); rows that have already scrolled past stay as plain text
+    // and remain searchable, just not clickable.
     if (dirty != gt.DIRTY_FALSE) {
-        _ = env.call0(emacs.sym.@"ghostel--detect-urls");
+        _ = env.call2(
+            emacs.sym.@"ghostel--detect-urls",
+            env.makeInteger(viewport_start_int),
+            env.pointMax(),
+        );
         if (has_wide_chars) {
             _ = env.call2(env.intern("set"), emacs.sym.@"ghostel--has-wide-chars", env.t());
         }
     }
 
-    // Position cursor
+    // Position cursor (viewport-relative row -> absolute line)
     var cursor_has_value: bool = false;
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_HAS_VALUE, @ptrCast(&cursor_has_value));
     if (cursor_has_value) {
@@ -869,9 +1195,11 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
         _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_X, @ptrCast(&cx));
         _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y, @ptrCast(&cy));
 
-        env.gotoCharN(1);
+        env.gotoCharN(viewport_start_int);
         _ = env.forwardLine(@as(i64, cy));
-        env.moveToColumn(@as(i64, cx));
+        if (!positionCursorByCell(env, term, cx, cy)) {
+            env.moveToColumn(@as(i64, cx));
+        }
     }
 
     // Update cursor style
@@ -891,4 +1219,17 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full: bool) void {
     if (term.getPwd()) |pwd| {
         _ = env.call1(emacs.sym.@"ghostel--update-directory", env.makeString(pwd));
     }
+
+    // Update the cached first-scrollback-row hash for the next redraw's
+    // rotation check. Always re-sample (cheap) because previous-redraw
+    // promotion/insert/trim could have shifted the row at index 0.
+    if (term.scrollback_in_buffer > 0) {
+        term.first_scrollback_row_hash = computeFirstScrollbackRowHash(term);
+    } else {
+        term.first_scrollback_row_hash = 0;
+    }
+
+    // Clear the write flag so the next redraw can detect "writes happened
+    // since last redraw" for the rotation check.
+    term.wrote_since_redraw = false;
 }

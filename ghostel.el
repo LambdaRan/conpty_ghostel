@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.9.0
+;; Version: 0.12.2
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -117,11 +117,18 @@ detection fails."
                 (list (choice string (const login-shell))
                       (choice (const :tag "No fallback" nil) string))))
 
-(defcustom ghostel-max-scrollback (* 20 1024 1024)  ; 20MB
+(defcustom ghostel-max-scrollback (* 5 1024 1024)  ; 5MB
   "Maximum scrollback size in bytes.
-Memory is allocated lazily, so a large value does not consume
-memory at startup.  The default of 20 MB holds roughly 10,000
-lines at typical terminal widths."
+5 MB holds roughly 5,000 rows on a typical 80-column terminal
+\(fewer on wider terminals — the cost scales with column count).
+
+The full scrollback is materialized into the Emacs buffer so that
+`isearch', `consult-line', and other buffer-based commands work
+across history.  Each materialized row also lives in the Emacs
+buffer with text properties for color/style/links, so the
+practical Emacs heap cost is roughly equal to the libghostty
+allocation, and large values noticeably slow down sustained
+high-throughput output (e.g. `cat huge.log')."
   :type 'integer)
 
 (defcustom ghostel-timer-delay 0.033
@@ -169,6 +176,12 @@ aggressive partial screen updates, but may use more CPU."
 (defcustom ghostel-buffer-name "*ghostel*"
   "Default buffer name for ghostel terminals."
   :type 'string)
+
+(defcustom ghostel-enable-title-tracking t
+  "Automatically rename the buffer when the terminal title changes.
+When non-nil, OSC 2 title sequences update the buffer name to
+\"*ghostel: TITLE*\".  Set to nil to keep the buffer name fixed."
+  :type 'boolean)
 
 (defcustom ghostel-kill-buffer-on-exit t
   "Kill the buffer when the shell process exits."
@@ -243,6 +256,15 @@ Set to t for all supported shells, or a list of symbols
                  (repeat :tag "Specific shells"
                          (choice (const bash) (const zsh) (const fish)))))
 
+(defcustom ghostel-tramp-default-method nil
+  "TRAMP method for constructing remote paths from OSC 7 directory reports.
+When directory tracking (OSC 7) reports a hostname that does not match
+the local machine and `default-directory' has no existing remote prefix,
+this method is used to build the TRAMP path (e.g. \"/ssh:host:/path\").
+When nil, falls back to `tramp-default-method'."
+  :type '(choice (const :tag "Use tramp-default-method" nil)
+                 string))
+
 (defcustom ghostel-keymap-exceptions
   '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
@@ -261,15 +283,6 @@ If nil, search in PATH then in the ghostel package directory."
 When non-nil, any character typed while the viewport is scrolled
 into the scrollback will first jump to the bottom of the terminal
 before sending the input."
-  :type 'boolean)
-
-(defcustom ghostel-copy-mode-auto-load-scrollback nil
-  "Automatically load the full scrollback when entering copy mode.
-When non-nil, entering copy mode immediately loads the entire
-scrollback history into the buffer, producing a plain Emacs buffer
-that supports all standard commands (search, select-all, etc.).
-When nil (the default), copy mode shows only the current viewport
-and scrollback can be loaded on demand with \\[ghostel-copy-mode-load-all]."
   :type 'boolean)
 
 ;;; ANSI color faces
@@ -377,7 +390,7 @@ and scrollback can be loaded on demand with \\[ghostel-copy-mode-load-all]."
   "https://github.com/dakra/ghostel/releases"
   "Base URL for ghostel GitHub releases.")
 
-(defconst ghostel--minimum-module-version "0.9.0"
+(defconst ghostel--minimum-module-version "0.12.2"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -393,7 +406,6 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function ghostel--module-version "ghostel-module")
 (declare-function ghostel--mouse-event "ghostel-module")
 (declare-function ghostel--new "ghostel-module")
-(declare-function ghostel--redraw-full-scrollback "ghostel-module")
 (declare-function ghostel--redraw "ghostel-module" (term &optional full))
 (declare-function ghostel--scroll "ghostel-module")
 (declare-function ghostel--scroll-bottom "ghostel-module")
@@ -605,11 +617,12 @@ DIR is the module directory."
 (defvar-local ghostel--term nil
   "Handle to the native terminal instance.")
 
+(defvar-local ghostel--term-rows nil
+  "Row count of the native terminal, for viewport/scrollback arithmetic.
+Updated whenever the terminal is created or resized.")
+
 (defvar-local ghostel--copy-mode-active nil
   "Non-nil when copy mode is active.")
-
-(defvar-local ghostel--copy-mode-full-buffer nil
-  "Non-nil when full scrollback has been loaded into the buffer in copy mode.")
 
 (defvar-local ghostel--process nil
   "The shell process.")
@@ -1114,119 +1127,55 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             (ghostel--mouse-mods event)))))
 
 (defun ghostel--scroll-up (&optional event)
-  "Scroll the terminal viewport up (into scrollback).
+  "Scroll the Emacs window up (toward older scrollback).
 When the terminal has mouse tracking enabled, forward EVENT as a
 scroll event to the running application instead."
   (interactive "e")
-  (if ghostel--copy-mode-full-buffer
-      (scroll-down 3)
-    (when ghostel--term
-      (unless (ghostel--forward-scroll-event event 4) ; button 4 = scroll up
-        (ghostel--scroll ghostel--term -3)
-        (if ghostel--copy-mode-active
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-          (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))))
+  (unless (ghostel--forward-scroll-event event 4) ; button 4 = scroll up
+    (scroll-down 3)))
 
 (defun ghostel--scroll-down (&optional event)
-  "Scroll the terminal viewport down.
+  "Scroll the Emacs window down (toward newer content).
 When the terminal has mouse tracking enabled, forward EVENT as a
 scroll event to the running application instead."
   (interactive "e")
-  (if ghostel--copy-mode-full-buffer
-      (scroll-up 3)
-    (when ghostel--term
-      (unless (ghostel--forward-scroll-event event 5) ; button 5 = scroll down
-        (ghostel--scroll ghostel--term 3)
-        (if ghostel--copy-mode-active
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-          (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))))
+  (unless (ghostel--forward-scroll-event event 5) ; button 5 = scroll down
+    (scroll-up 3)))
 
 (defun ghostel-copy-mode-scroll-up ()
-  "Scroll the terminal viewport up by a page in copy mode."
+  "Scroll the Emacs window up by a page in copy mode."
   (interactive)
-  (let ((col (current-column)))
-    (if ghostel--copy-mode-full-buffer
-        (scroll-down-command)
-      (when ghostel--term
-        (let ((height (count-lines (point-min) (point-max))))
-          (ghostel--scroll ghostel--term (- 2 height))
-          (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw)))))
-    (move-to-column col)))
+  (scroll-down-command))
 
 (defun ghostel-copy-mode-scroll-down ()
-  "Scroll the terminal viewport down by a page in copy mode."
+  "Scroll the Emacs window down by a page in copy mode."
   (interactive)
-  (let ((col (current-column)))
-    (if ghostel--copy-mode-full-buffer
-        (scroll-up-command)
-      (when ghostel--term
-        (let ((height (count-lines (point-min) (point-max))))
-          (ghostel--scroll ghostel--term (- height 2))
-          (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw)))))
-    (move-to-column col)))
+  (scroll-up-command))
 
 (defun ghostel-copy-mode-previous-line ()
-  "Move to the previous line, scrolling the viewport if at the top."
+  "Move to the previous line in copy mode."
   (interactive)
   (let ((col (current-column)))
-    (if ghostel--copy-mode-full-buffer
-        (forward-line -1)
-      (if (= (line-number-at-pos) 1)
-          (when ghostel--term
-            (ghostel--scroll ghostel--term -1)
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-            (goto-char (point-min)))
-        (forward-line -1)))
+    (forward-line -1)
     (move-to-column col)))
 
 (defun ghostel-copy-mode-next-line ()
-  "Move to the next line, scrolling the viewport if at the bottom."
+  "Move to the next line in copy mode."
   (interactive)
   (let ((col (current-column)))
-    (if ghostel--copy-mode-full-buffer
-        (forward-line 1)
-      (if (>= (line-number-at-pos) (line-number-at-pos (point-max)))
-          (when ghostel--term
-            (ghostel--scroll ghostel--term 1)
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-            (goto-char (point-max))
-            (beginning-of-line))
-        (forward-line 1)))
+    (forward-line 1)
     (move-to-column col)))
 
 (defun ghostel-copy-mode-beginning-of-buffer ()
-  "Scroll to the top of scrollback in copy mode."
+  "Move to the top of the buffer (oldest scrollback) in copy mode."
   (interactive)
-  (if ghostel--copy-mode-full-buffer
-      (goto-char (point-min))
-    (when ghostel--term
-      (ghostel--scroll-top ghostel--term)
-      (let ((inhibit-read-only t))
-        (ghostel--redraw ghostel--term ghostel-full-redraw))
-      (goto-char (point-min)))))
+  (goto-char (point-min)))
 
 (defun ghostel-copy-mode-end-of-buffer ()
-  "Scroll to the bottom of scrollback in copy mode."
+  "Move to the bottom of the buffer (current viewport) in copy mode."
   (interactive)
-  (if ghostel--copy-mode-full-buffer
-      (progn
-        (goto-char (point-max))
-        (skip-chars-backward " \t\n"))
-    (when ghostel--term
-      (ghostel--scroll-bottom ghostel--term)
-      (let ((inhibit-read-only t))
-        (ghostel--redraw ghostel--term ghostel-full-redraw))
-      ;; The native redraw already positions point at the terminal cursor,
-      ;; so no explicit goto-char needed here.
-      )))
+  (goto-char (point-max))
+  (skip-chars-backward " \t\n"))
 
 (defun ghostel-copy-mode-end-of-line ()
   "Move to the last non-whitespace character on the line."
@@ -1235,37 +1184,9 @@ scroll event to the running application instead."
   (skip-chars-backward " \t"))
 
 (defun ghostel-copy-mode-recenter ()
-  "Recenter the terminal viewport around the current line in copy mode.
-Scrolls the terminal viewport so the current line is vertically
-centered, then redraws.  When the scroll is clamped at a scrollback
-boundary (nothing to scroll into), does nothing."
+  "Recenter the current line in the window."
   (interactive)
-  (if ghostel--copy-mode-full-buffer
-      (recenter)
-    (when ghostel--term
-      (let* ((current-line (line-number-at-pos))
-             (win-height (window-body-height))
-             (center (/ win-height 2))
-             (col (current-column)))
-        (unless (= current-line center)
-          ;; Hash the buffer to detect whether the scroll was clamped.
-          (let ((old-hash (buffer-hash)))
-            (ghostel--scroll ghostel--term (- current-line center))
-            (let ((inhibit-read-only t))
-              (ghostel--redraw ghostel--term ghostel-full-redraw))
-            ;; If the buffer changed the viewport actually moved —
-            ;; reposition point at center.  Otherwise the scroll was
-            ;; clamped; restore point since redraw moved it to the
-            ;; terminal cursor.
-            (if (equal old-hash (buffer-hash))
-                (progn
-                  (goto-char (point-min))
-                  (forward-line (1- current-line))
-                  (move-to-column col))
-              (goto-char (point-min))
-              (forward-line (1- (min center (line-number-at-pos (point-max)))))
-              (move-to-column col)
-              (recenter))))))))
+  (recenter))
 
 
 ;;; Mouse input
@@ -1356,7 +1277,6 @@ boundary (nothing to scroll into), does nothing."
     (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
     (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
     (define-key map (kbd "C-l")             #'ghostel-copy-mode-recenter)
-    (define-key map (kbd "C-c C-a")         #'ghostel-copy-mode-load-all)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
@@ -1374,13 +1294,12 @@ Covers both `global-hl-line-mode' and buffer-local `hl-line-mode'.")
 
 (defun ghostel-copy-mode ()
   "Enter copy mode for selecting and copying terminal text.
-The display is frozen and standard Emacs navigation keys work.
-Set mark, navigate to select, then \\[ghostel-copy-mode-copy] to copy.
-Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
+Live terminal output is paused; standard Emacs navigation, search,
+and marking work across the full scrollback that is already rendered
+in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
   (interactive)
   (if ghostel--copy-mode-active
       (ghostel-copy-mode-exit)
-    ;; Freeze display
     (setq ghostel--copy-mode-active t)
     (when ghostel--redraw-timer
       (cancel-timer ghostel--redraw-timer)
@@ -1388,42 +1307,34 @@ Press \\`q' or \\[ghostel-copy-mode-exit] to exit without copying."
     ;; Ensure cursor is visible for navigation
     (setq ghostel--saved-cursor-type cursor-type)
     (setq cursor-type (default-value 'cursor-type))
-    ;; Switch to copy mode keymap (standard Emacs keys work by default)
     (setq ghostel--saved-local-map (current-local-map))
     (use-local-map ghostel-copy-mode-map)
     (when ghostel--saved-hl-line-mode
       (hl-line-mode 1))
     (setq buffer-read-only t)
-    (if ghostel-copy-mode-auto-load-scrollback
-        (ghostel-copy-mode-load-all)
-      (setq mode-line-process ":Copy")
-      (force-mode-line-update)
-      (message "Copy mode: C-SPC to mark, navigate to select, M-w to copy, q to exit"))))
+    (setq mode-line-process ":Copy")
+    (force-mode-line-update)
+    (message "Copy mode: C-SPC to mark, navigate to select, M-w to copy, q to exit")))
 
 (defun ghostel-copy-mode-exit ()
   "Exit copy mode and return to terminal mode."
   (interactive)
   (when ghostel--copy-mode-active
-    (let ((was-full ghostel--copy-mode-full-buffer))
-      (setq ghostel--copy-mode-active nil)
-      (setq ghostel--copy-mode-full-buffer nil)
-      (setq cursor-type ghostel--saved-cursor-type)
-      (deactivate-mark)
-      (use-local-map ghostel--saved-local-map)
-      (when ghostel--saved-hl-line-mode
-        (hl-line-mode -1))
-      (setq buffer-read-only nil)
-      (setq mode-line-process nil)
-      (force-mode-line-update)
-      (when ghostel--term
-        (ghostel--scroll-bottom ghostel--term)
-        (when was-full
-          ;; Erase stale full-scrollback content so normal redraw rebuilds
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (ghostel--redraw ghostel--term t))))
-      (ghostel--invalidate)
-      (message "Copy mode exited"))))
+    (setq ghostel--copy-mode-active nil)
+    (setq cursor-type ghostel--saved-cursor-type)
+    (deactivate-mark)
+    (use-local-map ghostel--saved-local-map)
+    (when ghostel--saved-hl-line-mode
+      (hl-line-mode -1))
+    (setq buffer-read-only nil)
+    (setq mode-line-process nil)
+    (force-mode-line-update)
+    ;; Jump out of any scrollback position so the redraw is allowed to
+    ;; position point at the terminal cursor (otherwise
+    ;; `ghostel--delayed-redraw' would preserve our scrollback marker).
+    (goto-char (point-max))
+    (ghostel--invalidate)
+    (message "Copy mode exited")))
 
 (defun ghostel-copy-mode-exit-and-send ()
   "Exit copy mode and send the key that triggered exit to the terminal."
@@ -1464,27 +1375,6 @@ stripped so the copied text matches the original terminal content."
       (kill-new text)
       (message "Copied to kill ring")))
   (ghostel-copy-mode-exit))
-
-(defun ghostel-copy-mode-load-all ()
-  "Load the entire scrollback into the buffer for cross-viewport selection.
-After loading, standard Emacs navigation and selection work across
-the full scrollback history."
-  (interactive)
-  (when (and ghostel--copy-mode-active ghostel--term
-             (not ghostel--copy-mode-full-buffer))
-    (message "Loading scrollback...")
-    (let* ((saved-line (1- (line-number-at-pos))) ; 0-based line within viewport
-           (saved-col (current-column))
-           (inhibit-read-only t)
-           (viewport-line (ghostel--redraw-full-scrollback ghostel--term)))
-      (goto-char (point-min))
-      (forward-line (+ (1- viewport-line) saved-line))
-      (move-to-column saved-col)
-      (recenter saved-line))
-    (setq ghostel--copy-mode-full-buffer t)
-    (setq mode-line-process ":Emacs")
-    (force-mode-line-update)
-    (message "Scrollback loaded")))
 
 (defun ghostel-copy-all ()
   "Copy the entire scrollback buffer to the kill ring."
@@ -1536,42 +1426,47 @@ at the given line in another window."
   (interactive)
   (ghostel--open-link (get-text-property (point) 'help-echo)))
 
-(defun ghostel--detect-urls ()
-  "Scan the buffer for plain-text URLs and file:line references.
-Skips regions that already have a `help-echo' property (e.g. from OSC 8)."
-  (save-excursion
-    ;; Pass 1: http(s) URLs
-    (when ghostel-enable-url-detection
-      (goto-char (point-min))
-      (while (re-search-forward
-              "https?://[^ \t\n\r\"<>]*[^ \t\n\r\"<>.,;:!?)>]"
-              nil t)
-        (let ((beg (match-beginning 0))
-              (end (match-end 0)))
-          (unless (get-text-property beg 'help-echo)
-            (let ((url (match-string-no-properties 0)))
-              (put-text-property beg end 'help-echo url)
-              (put-text-property beg end 'mouse-face 'highlight)
-              (put-text-property beg end 'keymap ghostel-link-map))))))
-    ;; Pass 2: file:line references (e.g. "./foo.el:42" or "/tmp/bar.rs:10")
-    (when ghostel-enable-file-detection
-      (goto-char (point-min))
-      (while (re-search-forward
-              "\\(?:\\./\\|/\\)[^ \t\n\r:\"<>]+:[0-9]+"
-              nil t)
-        (let ((beg (match-beginning 0))
-              (end (match-end 0)))
-          (unless (get-text-property beg 'help-echo)
-            (let* ((text (match-string-no-properties 0))
-                   (sep (string-match ":[0-9]+\\'" text))
-                   (path (substring text 0 sep))
-                   (line (substring text (1+ sep)))
-                   (abs-path (expand-file-name path)))
-              (when (file-exists-p abs-path)
-                (put-text-property beg end 'help-echo
-                                   (concat "fileref:" abs-path ":" line))
-                (put-text-property beg end 'mouse-face 'highlight)
-                (put-text-property beg end 'keymap ghostel-link-map)))))))))
+(defun ghostel--detect-urls (&optional begin end)
+  "Scan a buffer region for plain-text URLs and file:line references.
+BEGIN and END default to `point-min' and `point-max' respectively.
+Skips regions that already have a `help-echo' property (e.g. from OSC 8).
+Bounding the scan keeps streaming output from re-scanning the entire
+materialized scrollback on every redraw."
+  (let ((begin (or begin (point-min)))
+        (end (or end (point-max))))
+    (save-excursion
+      ;; Pass 1: http(s) URLs
+      (when ghostel-enable-url-detection
+        (goto-char begin)
+        (while (re-search-forward
+                "https?://[^ \t\n\r\"<>]*[^ \t\n\r\"<>.,;:!?)>]"
+                end t)
+          (let ((beg (match-beginning 0))
+                (mend (match-end 0)))
+            (unless (get-text-property beg 'help-echo)
+              (let ((url (match-string-no-properties 0)))
+                (put-text-property beg mend 'help-echo url)
+                (put-text-property beg mend 'mouse-face 'highlight)
+                (put-text-property beg mend 'keymap ghostel-link-map))))))
+      ;; Pass 2: file:line references (e.g. "./foo.el:42" or "/tmp/bar.rs:10")
+      (when ghostel-enable-file-detection
+        (goto-char begin)
+        (while (re-search-forward
+                "\\(?:\\./\\|/\\)[^ \t\n\r:\"<>]+:[0-9]+"
+                end t)
+          (let ((beg (match-beginning 0))
+                (mend (match-end 0)))
+            (unless (get-text-property beg 'help-echo)
+              (let* ((text (match-string-no-properties 0))
+                     (sep (string-match ":[0-9]+\\'" text))
+                     (path (substring text 0 sep))
+                     (line (substring text (1+ sep)))
+                     (abs-path (expand-file-name path)))
+                (when (file-exists-p abs-path)
+                  (put-text-property beg mend 'help-echo
+                                     (concat "fileref:" abs-path ":" line))
+                  (put-text-property beg mend 'mouse-face 'highlight)
+                  (put-text-property beg mend 'keymap ghostel-link-map))))))))))
 
 
 (defun ghostel--compensate-wide-chars ()
@@ -1720,7 +1615,15 @@ Parses the command and arguments, looks up the command in
          (args (cdr parts))
          (entry (assoc command ghostel-eval-cmds)))
     (if entry
-        (apply (cadr entry) args)
+        ;; Catch errors from the dispatched function: this callback runs
+        ;; synchronously inside the native VT parser, so any unhandled
+        ;; error propagates back up through `ghostel--write-input' and
+        ;; crashes the process filter / redraw timer.
+        (condition-case err
+            (apply (cadr entry) args)
+          (error
+           (message "ghostel: error calling %s: %s"
+                    command (error-message-string err))))
       (message "ghostel: unknown eval command %S (add to `ghostel-eval-cmds' to allow)"
                command))))
 
@@ -1756,10 +1659,12 @@ This ensures terminal text is visible regardless of the Emacs theme."
 
 (defun ghostel--set-title (title)
   "Update the buffer name with TITLE from the terminal.
-Do not overwrite a manual buffer rename."
-  (let ((new-name (format "*ghostel: %s*" title)))
-    (when (or (null ghostel--managed-buffer-name)
-              (equal (buffer-name) ghostel--managed-buffer-name))
+Only acts when `ghostel-enable-title-tracking' is non-nil and the
+buffer has not been manually renamed by the user."
+  (when (and ghostel-enable-title-tracking
+             (or (null ghostel--managed-buffer-name)
+                 (equal (buffer-name) ghostel--managed-buffer-name)))
+    (let ((new-name (format "*ghostel: %s*" title)))
       (rename-buffer new-name t)
       ;; Keep the actual name because `rename-buffer' may uniquify it.
       (setq ghostel--managed-buffer-name (buffer-name)))))
@@ -1799,7 +1704,10 @@ file:// URL does not match the local machine, construct a TRAMP path."
               (let ((prefix (file-remote-p default-directory)))
                 (setq path (if prefix
                                (concat prefix filename)
-                             (format "/ssh:%s:%s" host filename))))))
+                             (format "/%s:%s:%s"
+                                     (or ghostel-tramp-default-method
+                                         tramp-default-method)
+                                     host filename))))))
         (setq path dir))
       (when (and path (not (string= path "")))
         (if (file-remote-p path)
@@ -1906,6 +1814,14 @@ the redraw is performed immediately to minimize typing latency."
       (when ghostel--term
         ;; Accumulate output for batched write-input at redraw time.
         (push output ghostel--pending-output)
+        ;; Respond to OSC 4/10/11 color queries immediately: programs like
+        ;; `duf' read stdin with a tight timeout and give up if the reply
+        ;; waits for the redraw timer.  Flushing runs the extractor in the
+        ;; native module, which writes the reply back through the PTY
+        ;; before this filter returns.
+        (when (string-match-p
+               "\e\\]\\(?:4;[0-9]+;\\?\\|10;\\?\\|11;\\?\\)" output)
+          (ghostel--flush-pending-output))
         ;; Immediate redraw for interactive echo: small output arriving
         ;; within `ghostel-immediate-redraw-interval' of last keystroke.
         (if (and (> ghostel-immediate-redraw-threshold 0)
@@ -2322,10 +2238,19 @@ frame after idle to improve interactive responsiveness."
   (when ghostel--pending-output
     (let ((combined (apply #'concat (nreverse ghostel--pending-output))))
       (setq ghostel--pending-output nil)
-      (ghostel--write-input ghostel--term combined))))
+      ;; An OSC 51;E callback dispatched synchronously from the native
+      ;; parser (e.g. `find-file-other-window') can change the current
+      ;; buffer via `select-window'.  Isolate that so callers keep
+      ;; reading buffer-locals — notably `ghostel--term' — from the
+      ;; ghostel buffer after this returns.
+      (save-current-buffer
+        (ghostel--write-input ghostel--term combined)))))
 
 (defun ghostel--delayed-redraw (buffer)
-  "Perform the actual redraw in BUFFER."
+  "Perform the actual redraw in BUFFER.
+If point is currently inside the materialized scrollback (above the
+viewport), save and restore it so scrolling up to read history is not
+interrupted by live output updating the terminal cursor."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq ghostel--redraw-timer nil)
@@ -2337,12 +2262,53 @@ frame after idle to improve interactive responsiveness."
                      (ghostel--mode-enabled ghostel--term 2026))
           (setq ghostel--force-next-redraw nil)
           (setq ghostel--has-wide-chars nil)
-          (let ((inhibit-read-only t)
-                (inhibit-redisplay t)
-                (inhibit-modification-hooks t))
-            (ghostel--redraw ghostel--term ghostel-full-redraw))
+          (let* ((rows (or ghostel--term-rows 0))
+                 ;; Compute the viewport start — first char of the last
+                 ;; `rows` lines — to decide whether point is currently
+                 ;; in the scrollback region above it. Bounded O(rows).
+                 (viewport-start
+                  (when (> rows 0)
+                    (save-excursion
+                      (goto-char (point-max))
+                      (forward-line (- (1- rows)))
+                      (line-beginning-position))))
+                 ;; Preserve point only when reading scrollback.
+                 (saved-marker
+                  (when (and viewport-start (< (point) viewport-start))
+                    (copy-marker (point) t)))
+                 (inhibit-read-only t)
+                 (inhibit-redisplay t)
+                 (inhibit-modification-hooks t))
+            (ghostel--redraw ghostel--term ghostel-full-redraw)
+            (when saved-marker
+              (goto-char saved-marker)
+              (set-marker saved-marker nil)))
           (when ghostel--has-wide-chars
-            (ghostel--compensate-wide-chars)))))))
+            (ghostel--compensate-wide-chars))
+          ;; Native redraw updates buffer-point via `goto-char', which
+          ;; only propagates to `window-point' for the selected window.
+          ;; If an OSC 51;E callback moved selection elsewhere (e.g.
+          ;; `find-file-other-window'), the ghostel window's
+          ;; window-point is stale and the terminal cursor will display
+          ;; at the wrong place when the user reselects it.  Sync it.
+          ;;
+          ;; Also anchor window-start to the viewport origin when point
+          ;; is in the viewport.  Without this, a resize (which erases
+          ;; and rebuilds the buffer inside redraw) leaves window-start
+          ;; clamped to 1 and Emacs's auto-scroll produces a visible
+          ;; jump.  Skip the anchor when point is in scrollback so that
+          ;; users reading history are not yanked back to the bottom.
+          (let* ((pt (point))
+                 (tr (or ghostel--term-rows 0))
+                 (vs (when (> tr 0)
+                       (save-excursion
+                         (goto-char (point-max))
+                         (forward-line (- (1- tr)))
+                         (line-beginning-position)))))
+            (dolist (win (get-buffer-window-list buffer nil t))
+              (when (and vs (>= pt vs))
+                (set-window-start win vs t))
+              (set-window-point win pt))))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
@@ -2373,11 +2339,17 @@ PROCESS is the shell process, WINDOWS is the list of windows."
     (when (and size (buffer-live-p buffer))
       (with-current-buffer buffer
         (when ghostel--term
-          (ghostel--set-size ghostel--term height width)
+          (ghostel--set-size ghostel--term (max 1 height) (max 1 width))
           (when (and (eq system-type 'windows-nt) (process-live-p process))
             (ghostel--conpty-proxy-resize process width height))
+          (setq ghostel--term-rows height)
           (setq ghostel--force-next-redraw t)
-          (ghostel--invalidate))))
+          ;; Redraw synchronously so the buffer is updated before
+          ;; Emacs displays the stale content at the new window size.
+          (when ghostel--redraw-timer
+            (cancel-timer ghostel--redraw-timer)
+            (setq ghostel--redraw-timer nil))
+          (ghostel--delayed-redraw buffer))))
     ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
     ;; after this function returns, matching eat/vterm timing.
     ;; On Windows, ConPTY resize is handled above instead.
@@ -2392,6 +2364,7 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   (font-lock-mode -1)
   (setq buffer-read-only nil)
   (setq-local scroll-margin 0)
+  (setq-local auto-hscroll-mode nil)
   (setq-local hscroll-margin 0)
   (setq-local truncate-lines t)
   (setq-local scroll-conservatively 101)
@@ -2457,6 +2430,7 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
              (width (window-max-chars-per-line)))
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
+        (setq ghostel--term-rows height)
         (ghostel--apply-palette ghostel--term))
       (ghostel--start-process))))
 

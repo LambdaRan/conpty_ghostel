@@ -30,6 +30,32 @@ mouse_encoder: gt.c.GhosttyMouseEncoder,
 cols: u16,
 rows: u16,
 
+/// Number of libghostty scrollback rows already materialized into the
+/// Emacs buffer above the viewport. Polled on each redraw; kept in sync
+/// by appending newly-scrolled-off rows and trimming rows evicted by
+/// libghostty's scrollback cap.
+scrollback_in_buffer: usize = 0,
+
+/// Set by `vtWrite`, cleared at the end of `redraw`. Used to detect that
+/// libghostty has been written to since the last redraw — required by
+/// the cap-bound stale-scrollback rebuild trigger to distinguish "no
+/// activity" from "writes happened but total_rows plateaued".
+wrote_since_redraw: bool = false,
+
+/// Set by `resize`, cleared at the start of `redraw`. When true, the
+/// next redraw will erase the buffer and force a full rebuild.  This
+/// defers the buffer erasure from the synchronous resize call (which
+/// would leave the buffer visibly empty until the timer-driven redraw)
+/// into the redraw pass where `inhibit-redisplay` prevents flicker.
+resize_pending: bool = false,
+
+/// Hash of the first scrollback row's content, sampled at the end of
+/// each redraw that touched scrollback. Used to detect rotation
+/// (libghostty evicting the oldest row in lockstep with new ones being
+/// pushed) when `total_rows` is plateaued at the cap. Zero means "no
+/// scrollback" or "not yet sampled".
+first_scrollback_row_hash: u64 = 0,
+
 /// Cached Emacs env pointer — only valid during a callback from Emacs.
 env: ?emacs.Env = null,
 
@@ -160,18 +186,46 @@ pub fn getColorPalette(self: *Self, palette: *[256]gt.ColorRgb) bool {
     ) == gt.SUCCESS;
 }
 
+/// Get the effective foreground color (honouring any OSC 10 override).
+pub fn getColorForeground(self: *Self, out: *gt.ColorRgb) bool {
+    return gt.c.ghostty_terminal_get(
+        self.terminal,
+        gt.DATA_COLOR_FOREGROUND,
+        @ptrCast(out),
+    ) == gt.SUCCESS;
+}
+
+/// Get the effective background color (honouring any OSC 11 override).
+pub fn getColorBackground(self: *Self, out: *gt.ColorRgb) bool {
+    return gt.c.ghostty_terminal_get(
+        self.terminal,
+        gt.DATA_COLOR_BACKGROUND,
+        @ptrCast(out),
+    ) == gt.SUCCESS;
+}
+
 /// Feed VT data from the PTY into the terminal.
 pub fn vtWrite(self: *Self, data: []const u8) void {
     gt.c.ghostty_terminal_vt_write(self.terminal, data.ptr, data.len);
+    self.wrote_since_redraw = true;
 }
 
 /// Resize the terminal.
+///
+/// Resets `scrollback_in_buffer` because libghostty reflows wrapped rows
+/// on resize and the row count above the viewport no longer matches what
+/// we have in the Emacs buffer.  Sets `resize_pending` so the next
+/// `redraw()` erases the buffer under `inhibit-redisplay` and rebuilds
+/// scrollback from scratch — avoiding a visible blank frame.
 pub fn resize(self: *Self, cols: u16, rows: u16) !void {
     if (gt.c.ghostty_terminal_resize(self.terminal, cols, rows, 1, 1) != gt.SUCCESS) {
         return error.ResizeFailed;
     }
     self.cols = cols;
     self.rows = rows;
+    self.scrollback_in_buffer = 0;
+    self.first_scrollback_row_hash = 0;
+    self.resize_pending = true;
 }
 
 /// Scroll the viewport.

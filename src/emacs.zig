@@ -290,6 +290,7 @@ pub const Sym = struct {
     @"line-end-position": Value,
     @"point-max": Value,
     @"delete-region": Value,
+    @"char-before": Value,
 
     // Text property names
     face: Value,

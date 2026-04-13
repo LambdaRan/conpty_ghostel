@@ -14,7 +14,7 @@ const input = @import("input.zig");
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.9.0";
+const version = "0.12.2";
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -48,7 +48,6 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--cursor-position", 1, 1, &fnCursorPosition, "Return terminal cursor position as (COL . ROW), 0-indexed.\n\n(ghostel--cursor-position TERM)");
     env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
     env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
-    env.bindFunction("ghostel--redraw-full-scrollback", 1, 1, &fnRedrawFullScrollback, "Render entire scrollback into buffer, return original viewport line.\n\n(ghostel--redraw-full-scrollback TERM)");
     env.bindFunction("ghostel--copy-all-text", 1, 1, &fnCopyAllText, "Return entire scrollback as plain text string.\n\n(ghostel--copy-all-text TERM)");
     env.bindFunction("ghostel--module-version", 0, 0, &fnModuleVersion, "Return the native module version string.\n\n(ghostel--module-version)");
 
@@ -75,7 +74,7 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
     const max_scrollback: usize = if (nargs > 2 and env.isNotNil(args[2]))
         @intCast(env.extractInteger(args[2]))
     else
-        25_000_000; // ~25 MB, roughly 10k lines at standard page density
+        5 * 1024 * 1024; // ~5 MB, roughly 5k rows on an 80-column terminal
 
     const term = std.heap.c_allocator.create(Terminal) catch {
         env.signalError("ghostel: out of memory");
@@ -140,6 +139,14 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     defer term.env = null;
 
     const raw = data.?;
+
+    // Respond to OSC 4/10/11 color queries BEFORE feeding libghostty.
+    // libghostty will synchronously emit responses for other queries in
+    // the same write (e.g. CSI 6n cursor-position report) via the
+    // write_pty callback, and termenv-based programs read only the first
+    // response chunk — so the color reply must be on the wire first or
+    // the program discards our reply as noise.
+    extractOscColorQueries(env, term, raw);
 
     if (comptime builtin.os.tag == .windows) {
         // Windows ConPTY handles line discipline (CRLF conversion),
@@ -335,6 +342,150 @@ fn extractOsc133(env: emacs.Env, data: []const u8) void {
     }
 }
 
+/// Send `OSC N;rgb:RRRR/GGGG/BBBB <term>` for a dynamic color (OSC 10/11).
+fn sendDynamicColorReply(
+    env: emacs.Env,
+    osc_num: u8,
+    color: gt.ColorRgb,
+    term_bytes: []const u8,
+) void {
+    var buf: [64]u8 = undefined;
+    const written = std.fmt.bufPrint(
+        &buf,
+        "\x1b]{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}{s}",
+        .{
+            osc_num,
+            color.r, color.r,
+            color.g, color.g,
+            color.b, color.b,
+            term_bytes,
+        },
+    ) catch return;
+    _ = env.call1(emacs.sym.@"ghostel--flush-output", env.makeString(written));
+}
+
+/// Send `OSC 4;INDEX;rgb:RRRR/GGGG/BBBB <term>` for a palette entry.
+fn sendPaletteColorReply(
+    env: emacs.Env,
+    index: u16,
+    color: gt.ColorRgb,
+    term_bytes: []const u8,
+) void {
+    var buf: [64]u8 = undefined;
+    const written = std.fmt.bufPrint(
+        &buf,
+        "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}{s}",
+        .{
+            index,
+            color.r, color.r,
+            color.g, color.g,
+            color.b, color.b,
+            term_bytes,
+        },
+    ) catch return;
+    _ = env.call1(emacs.sym.@"ghostel--flush-output", env.makeString(written));
+}
+
+/// Parse a non-negative decimal integer.  Returns null on empty input,
+/// any non-digit byte, or numeric overflow of `u32`.
+fn parseDecimal(s: []const u8) ?u32 {
+    if (s.len == 0) return null;
+    return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
+/// Scan data for OSC 4/10/11 color queries and emit responses in source
+/// order.  libghostty applies OSC 4/10/11 **sets** internally but silently
+/// drops the query form (`?` value), so ghostel scans the raw input and
+/// replies itself.
+///
+/// Colors come from the terminal's currently effective state, which reflects
+/// sets applied by earlier write-input calls — but NOT sets that appear
+/// earlier in *this* input buffer, because this extractor runs before
+/// `vtWrite` so the color reply is on the wire before any reply libghostty
+/// generates itself (e.g. the CSI 6n cursor-position reply some programs
+/// send in the same write).  Termenv-based readers consume the first chunk
+/// off stdin, so ordering matters more than same-chunk freshness.
+///
+/// Only fully-terminated OSC sequences produce a reply: a query split
+/// across two process-output chunks is ignored until a later call carries
+/// the terminator.
+fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) void {
+    var palette: [256]gt.ColorRgb = undefined;
+    var palette_loaded = false;
+
+    var pos: usize = 0;
+    while (pos + 1 < data.len) {
+        // Find next OSC introducer "ESC ]".
+        const osc_rel = std.mem.indexOfPos(u8, data, pos, "\x1b]") orelse break;
+        const code_start = osc_rel + 2;
+
+        // Read the decimal OSC code up to the first ';'.
+        var code_end = code_start;
+        while (code_end < data.len and data[code_end] >= '0' and data[code_end] <= '9') {
+            code_end += 1;
+        }
+        if (code_end == code_start or code_end >= data.len or data[code_end] != ';') {
+            pos = code_start;
+            continue;
+        }
+        const payload_start = code_end + 1;
+
+        // Find the terminator (BEL or ST).  Require a real one — partial OSCs
+        // split across chunks are left for the next call so we don't reply
+        // before the client has finished writing its query.
+        var end = payload_start;
+        var term_len: usize = 0;
+        while (end < data.len) : (end += 1) {
+            if (data[end] == 0x07) {
+                term_len = 1;
+                break;
+            }
+            if (data[end] == 0x1b and end + 1 < data.len and data[end + 1] == '\\') {
+                term_len = 2;
+                break;
+            }
+        }
+        if (term_len == 0) break;
+
+        const payload = data[payload_start..end];
+        const term_bytes = data[end .. end + term_len];
+        pos = end + term_len;
+
+        const code = parseDecimal(data[code_start..code_end]) orelse continue;
+        switch (code) {
+            10 => {
+                if (!std.mem.eql(u8, payload, "?")) continue;
+                var fg: gt.ColorRgb = undefined;
+                if (!term.getColorForeground(&fg)) continue;
+                sendDynamicColorReply(env, 10, fg, term_bytes);
+            },
+            11 => {
+                if (!std.mem.eql(u8, payload, "?")) continue;
+                var bg: gt.ColorRgb = undefined;
+                if (!term.getColorBackground(&bg)) continue;
+                sendDynamicColorReply(env, 11, bg, term_bytes);
+            },
+            4 => {
+                // Payload is a ';'-separated list of `index;value` pairs.
+                // Reply only to pairs whose value is literally "?".
+                var it = std.mem.splitScalar(u8, payload, ';');
+                while (it.next()) |index_tok| {
+                    const value_tok = it.next() orelse break;
+                    if (!std.mem.eql(u8, value_tok, "?")) continue;
+                    const idx = parseDecimal(index_tok) orelse continue;
+                    if (idx >= 256) continue;
+                    if (!palette_loaded) {
+                        if (!term.getColorPalette(&palette)) break;
+                        palette_loaded = true;
+                    }
+                    sendPaletteColorReply(env, @intCast(idx), palette[idx], term_bytes);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 /// (ghostel--set-size TERM ROWS COLS)
 fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
@@ -350,6 +501,9 @@ fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*any
         env.signalError("ghostel: resize failed");
         return env.nil();
     };
+    // Reflow invalidates the materialized scrollback — terminal.resize()
+    // sets resize_pending so the next redraw() erases and rebuilds under
+    // inhibit-redisplay, avoiding a visible blank frame.
 
     return env.nil();
 }
@@ -769,16 +923,6 @@ fn fnCursorPosition(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y, @ptrCast(&cy));
 
     return env.call2(emacs.sym.cons, env.makeInteger(@as(i64, cx)), env.makeInteger(@as(i64, cy)));
-}
-
-/// (ghostel--redraw-full-scrollback TERM)
-/// Render the entire scrollback into the current buffer.
-/// Returns the 1-based line number of the original viewport position.
-fn fnRedrawFullScrollback(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
-    const env = emacs.Env.init(raw_env.?);
-    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-    const line = render.redrawFullScrollback(env, term);
-    return env.makeInteger(line);
 }
 
 /// (ghostel--copy-all-text TERM)

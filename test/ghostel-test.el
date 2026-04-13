@@ -173,11 +173,186 @@
       (should (string-match-p "line [0-4]" state)))))     ; scrollback shows earlier lines
 
 ;; -----------------------------------------------------------------------
+;; Test: scrollback is materialized into the Emacs buffer (vterm parity)
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-scrollback-in-buffer ()
+  "After overflowing the viewport, scrolled-off rows live in the Emacs buffer.
+This is the vterm-style growing-buffer model that lets `isearch' and
+`consult-line' search history without entering copy mode."
+  (let ((buf (generate-new-buffer " *ghostel-test-sb-buffer*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 1000))
+                 (inhibit-read-only t))
+            ;; Write 12 lines into a 5-row terminal — 7 should scroll off.
+            (dotimes (i 12)
+              (ghostel--write-input term (format "row-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Earliest row that scrolled off must now live in the buffer.
+              (should (string-match-p "row-00" content))
+              ;; A middle row that scrolled off must also be present.
+              (should (string-match-p "row-05" content))
+              ;; The most recent row is on the active screen.
+              (should (string-match-p "row-11" content)))
+            ;; 12 distinct rows made it into the buffer.  The trailing
+            ;; empty cursor row is trimmed to nothing by the renderer
+            ;; and therefore contributes no additional line.
+            (should (= 12 (count-lines (point-min) (point-max))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-render-trims-trailing-whitespace ()
+  "Rendered rows do not carry libghostty's full-width padding.
+The renderer should only keep cells the terminal actually wrote to,
+so a short line in a 40-column terminal shows up as the written
+content plus no trailing space padding.  Shell-written spaces
+\(e.g. the trailing space in a \\='$ \\=' prompt or `%-80s' layout)
+are retained — only unwritten padding cells are trimmed."
+  (let ((buf (generate-new-buffer " *ghostel-test-trim-ws*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 3 40 100))
+                 (inhibit-read-only t))
+            ;; Write `hi` at the top-left and redraw.
+            (ghostel--write-input term "\e[H\e[2Jhi")
+            (ghostel--redraw term t)
+            (let ((lines (split-string (buffer-substring-no-properties
+                                        (point-min) (point-max))
+                                       "\n")))
+              ;; First row is trimmed to "hi" (no trailing spaces).
+              (should (equal "hi" (car lines)))
+              ;; Remaining rows are empty (not rows of 40 spaces).
+              (dolist (row (cdr lines))
+                (should (string-empty-p row))))
+            ;; Shell-written trailing space is preserved.
+            (ghostel--write-input term "\e[H\e[2J$ ")
+            (ghostel--redraw term t)
+            (let ((lines (split-string (buffer-substring-no-properties
+                                        (point-min) (point-max))
+                                       "\n")))
+              (should (equal "$ " (car lines))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-scrollback-preserves-url-properties ()
+  "Verify URL text properties survive scrollback promotion.
+When libghostty pushes a row into scrollback, the redraw promotes the
+existing buffer text instead of fetching a fresh copy from libghostty,
+so any text properties the row earned while it was the viewport (URL
+detection, ghostel-prompt) stay attached."
+  (let ((buf (generate-new-buffer " *ghostel-test-sb-url*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 1000))
+                 (inhibit-read-only t)
+                 (ghostel-enable-url-detection t)
+                 (ghostel-enable-file-detection nil))
+            ;; Write a row with a URL while it's in the viewport.
+            (ghostel--write-input term "see https://example.com here\r\n")
+            (ghostel--redraw term t)
+            ;; Sanity: detect-urls applied a help-echo while the row is visible.
+            (goto-char (point-min))
+            (let ((url-pos (search-forward "https://example.com" nil t)))
+              (should url-pos)
+              (should (equal "https://example.com"
+                             (get-text-property (- url-pos 19) 'help-echo))))
+            ;; Now scroll the URL row off the active screen.
+            (dotimes (_ 6) (ghostel--write-input term "filler\r\n"))
+            (ghostel--redraw term t)
+            ;; The URL row now lives in the scrollback region of the buffer.
+            (goto-char (point-min))
+            (let ((url-pos (search-forward "https://example.com" nil t)))
+              (should url-pos)
+              ;; The clickable text properties survived the scroll because
+              ;; promotion preserved the buffer text instead of re-fetching
+              ;; from libghostty.
+              (should (equal "https://example.com"
+                             (get-text-property (- url-pos 19) 'help-echo))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-scrollback-grows-incrementally ()
+  "Successive redraws append newly-scrolled-off rows without losing history."
+  (let ((buf (generate-new-buffer " *ghostel-test-sb-incr*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 1000))
+                 (inhibit-read-only t))
+            ;; First batch: write 8 lines, redraw.
+            (dotimes (i 8)
+              (ghostel--write-input term (format "first-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "first-00" content))
+              (should (string-match-p "first-07" content)))
+            ;; Second batch: write more lines, redraw again.
+            (dotimes (i 6)
+              (ghostel--write-input term (format "second-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; All earlier scrollback rows survive the second redraw.
+              (should (string-match-p "first-00" content))
+              (should (string-match-p "first-07" content))
+              (should (string-match-p "second-00" content))
+              (should (string-match-p "second-05" content)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-scrollback-rotation-rebuild ()
+  "Verify cap rotation triggers a rebuild so the buffer reflects libghostty.
+The test fills libghostty past its scrollback cap with EARLY markers,
+redraws once so the buffer matches the current libghostty state, then
+writes a much bigger batch of LATE markers (without an intervening
+redraw).  When the next redraw runs, libghostty's `total_rows' is
+plateaued at the cap so the normal delta-detection sees nothing to do
+— the rotation-detect path must kick in, notice the first scrollback
+row's hash has changed, erase the buffer, and let the bootstrap fetch
+re-sync from libghostty so the buffer reflects the LATE rows."
+  (let ((buf (generate-new-buffer " *ghostel-test-sb-rotate*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* (;; 4 KB cap empirically holds ~920 rows of short content
+                 ;; in libghostty's compact storage.
+                 (term (ghostel--new 5 80 (* 4 1024)))
+                 (inhibit-read-only t))
+            ;; Phase 1: write 5000 EARLY rows. libghostty's scrollback
+            ;; saturates at ~920 rows so the surviving rows are
+            ;; early-04080..early-04999 (the most recent 920 of 5000).
+            (dotimes (i 5000)
+              (ghostel--write-input term (format "early-%05d\r\n" i)))
+            (ghostel--redraw term t)
+            ;; After this redraw, buffer's scrollback_in_buffer matches
+            ;; libghostty's count (~920) and contains those high-numbered
+            ;; early rows.
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "early-04999" content)))
+            ;; Phase 2: write 5000 LATE rows WITHOUT redrawing in
+            ;; between. libghostty rotates: every new write evicts an
+            ;; early row and pushes a late row. After 5000 writes, all
+            ;; survivors are late-* (since 5000 > 920 cap).
+            (dotimes (i 5000)
+              (ghostel--write-input term (format "late-%05d\r\n" i)))
+            ;; Final redraw: total_rows hasn't changed (libghostty is
+            ;; still at the cap) but the content has fully rotated.
+            ;; Without rotation-detect this would be a no-op and the
+            ;; buffer would still show early-* rows.
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Late rows must be present (libghostty kept the most
+              ;; recent ones, the rebuild fetched them into the buffer).
+              (should (string-match-p "late-04999" content))
+              ;; Early rows must NOT be present anywhere — libghostty
+              ;; evicted them AND the rebuild flushed our stale copy.
+              (should-not (string-match-p "early-" content)))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: clear screen (ghostel-clear)
 ;; -----------------------------------------------------------------------
 
 (ert-deftest ghostel-test-clear-screen ()
-  "Test that ghostel-clear clears the visible screen but preserves scrollback."
+  "Test that ghostel-clear clears the visible screen but preserves scrollback.
+With the growing-buffer model the scrollback is always materialized into
+the Emacs buffer, so we just check the buffer text directly instead of
+scrolling libghostty's viewport."
   (let ((buf (generate-new-buffer " *ghostel-test-clear*")))
     (unwind-protect
         (with-current-buffer buf
@@ -211,11 +386,10 @@
             ;; Simulate what delayed-redraw does
             (ghostel--flush-pending-output)
             (let ((inhibit-read-only t)) (ghostel--redraw ghostel--term t))
-            ;; Scrollback should still exist after screen clear
-            (ghostel--scroll ghostel--term -30)
-            (let ((inhibit-read-only t)) (ghostel--redraw ghostel--term t))
+            ;; Scrollback rows live in the buffer above the cleared
+            ;; viewport — search for any clear-test echo to confirm.
             (let ((content (buffer-substring-no-properties (point-min) (point-max))))
-              (should (string-match-p "clear-test-0" content))) ; scrollback preserved
+              (should (string-match-p "clear-test-[0-9]+" content)))
             (delete-process proc)))
       (kill-buffer buf))))
 
@@ -317,7 +491,9 @@
 (ert-deftest ghostel-test-wide-char-no-overflow ()
   "Test that wide characters (emoji) don't make rendered lines overflow.
 A 2-cell-wide emoji should not produce an extra space for the spacer
-cell, so the visual line width must equal the terminal column count."
+cell, so the visual line width must equal the emoji width (2).  The
+renderer trims trailing blank cells, so we compare against 2 rather
+than the full terminal `cols'."
   (let ((buf (generate-new-buffer " *ghostel-test-wide*"))
         (cols 40))
     (unwind-protect
@@ -327,12 +503,15 @@ cell, so the visual line width must equal the terminal column count."
             ;; Feed a wide emoji — occupies 2 terminal cells
             (ghostel--write-input term "🟢")
             (ghostel--redraw term t)
-            ;; First rendered line should have visual width == cols
+            ;; First rendered line should have visual width 2 (the
+            ;; emoji) and no trailing padding from the spacer cell.
             (goto-char (point-min))
             (let* ((line (buffer-substring (line-beginning-position)
                                            (line-end-position)))
                    (width (string-width line)))
-              (should (equal cols width)))))
+              (should (equal 2 width))
+              ;; And the line must NOT exceed the terminal width.
+              (should (<= width cols)))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
@@ -371,6 +550,28 @@ cell, so the visual line width must equal the terminal column count."
             (ghostel--set-title "Title B")
             (should (equal "ghostel manual title test" (buffer-name)))
             (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest ghostel-test-title-tracking-disabled ()
+  "Test that title updates are ignored when `ghostel-enable-title-tracking' is nil."
+  (let (buf)
+    (unwind-protect
+        (cl-letf (((symbol-function 'ghostel--new)
+                   (lambda (&rest _args) 'fake-term))
+                  ((symbol-function 'ghostel--apply-palette)
+                   (lambda (&rest _args) nil))
+                  ((symbol-function 'ghostel--start-process)
+                   (lambda () nil)))
+          (let ((ghostel--buffer-counter 0)
+                (ghostel-enable-title-tracking nil))
+            (ghostel)
+            (setq buf (current-buffer))
+            (with-current-buffer buf
+              (should (equal "*ghostel*" (buffer-name)))
+              (ghostel--set-title "Ignored Title")
+              (should (equal "*ghostel*" (buffer-name)))
+              (should (equal "*ghostel*" ghostel--managed-buffer-name)))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
@@ -718,6 +919,115 @@ Mirrors the real zsh case where the directory still contains a
       (should (equal nil kill-ring)))))                     ; osc52 query ignored
 
 ;; -----------------------------------------------------------------------
+;; Test: OSC 4/10/11 color query responses
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-osc-color-query ()
+  "Test that OSC 4/10/11 color queries get responses."
+  (let* ((term (ghostel--new 25 80 1000))
+         (sent-bytes nil))
+    (cl-letf (((symbol-function 'ghostel--flush-output)
+               (lambda (data)
+                 (setq sent-bytes (concat sent-bytes data)))))
+
+      ;; OSC 11 background query with ST terminator.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]11;?\e\\")
+      (should sent-bytes)
+      (should (string-match-p "\\`\e\\]11;rgb:[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}\e\\\\\\'"
+                              sent-bytes))
+
+      ;; OSC 10 foreground query with BEL terminator.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]10;?\a")
+      (should sent-bytes)
+      (should (string-match-p "\\`\e\\]10;rgb:[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}/[0-9a-f]\\{4\\}\a\\'"
+                              sent-bytes))
+
+      ;; OSC 4 palette query for index 1, after a prior set.  The extractor
+      ;; runs before vtWrite inside a single write-input, so the set must
+      ;; land in a previous call for the new value to be visible.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;1;rgb:11/22/33\e\\")
+      (should (equal nil sent-bytes))                   ; set: no reply
+      (ghostel--write-input term "\e]4;1;?\e\\")
+      (should (equal "\e]4;1;rgb:1111/2222/3333\e\\" sent-bytes))
+
+      ;; OSC 10 with a set value (not a query) — no response.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]10;rgb:aa/bb/cc\e\\")
+      (should (equal nil sent-bytes))
+
+      ;; OSC 4 set (not a query) — no response.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;2;rgb:44/55/66\e\\")
+      (should (equal nil sent-bytes))
+
+      ;; Malformed OSC 4 payloads — don't crash, don't reply.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;\e\\")           ; empty
+      (ghostel--write-input term "\e]4;xyz;?\e\\")     ; non-numeric index
+      (ghostel--write-input term "\e]4;999;?\e\\")     ; index out of range
+      (ghostel--write-input term "\e]4;0\e\\")         ; index without value
+      (ghostel--write-input term "\e]4;99999999999999999999;?\e\\") ; overflow
+      (should (equal nil sent-bytes))
+
+      ;; Multiple different-type queries in one write must reply in source
+      ;; order so termenv-style readers can match by position.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]11;?\e\\\e]10;?\e\\")
+      (should (string-match-p "\\`\e\\]11;rgb:.*?\e\\\\\e\\]10;rgb:.*?\e\\\\\\'"
+                              sent-bytes))
+
+      ;; Multi-pair OSC 4 with mixed set+query: the extractor runs before
+      ;; vtWrite, so the set is not yet visible to the query in the same
+      ;; payload — but the index=1 value seeded in the earlier write
+      ;; above is still there, and both indices get replied to in order.
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]4;1;?;3;?\e\\")
+      (should (string-match-p
+               "\\`\e\\]4;1;rgb:1111/2222/3333\e\\\\\e\\]4;3;rgb:.*?\e\\\\\\'"
+               sent-bytes))
+
+      ;; Unterminated OSC query — reply is withheld until the terminator
+      ;; arrives.  (We don't buffer across write-input calls, so the
+      ;; terminator must be in the same call to get a reply.)
+      (setq sent-bytes nil)
+      (ghostel--write-input term "\e]11;?")
+      (should (equal nil sent-bytes)))))
+
+(ert-deftest ghostel-test-osc-color-query-filter-flush ()
+  "The process filter must flush synchronously on a color query.
+Programs like `duf' read stdin with a short timeout and give up if
+the reply waits for the redraw timer."
+  (let ((buf (generate-new-buffer " *ghostel-osc-flush*"))
+        (fake-proc (make-symbol "fake-proc"))
+        (sent nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq ghostel--term (ghostel--new 25 80 1000))
+          (setq ghostel--process fake-proc)
+          (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                    ((symbol-function 'process-live-p) (lambda (_) t))
+                    ((symbol-function 'ghostel--flush-output)
+                     (lambda (data) (setq sent (concat sent data))))
+                    ((symbol-function 'ghostel--invalidate) #'ignore))
+            ;; OSC 11 query arrives — reply must be produced before
+            ;; `ghostel--filter' returns, not on a later timer tick.
+            (ghostel--filter fake-proc "\e]11;?\e\\")
+            (should sent)
+            (should (string-match-p "\\`\e\\]11;rgb:" sent))
+            (should (equal nil ghostel--pending-output))
+
+            ;; A non-query OSC 11 set must NOT trigger the sync flush,
+            ;; so the data stays pending for the redraw timer.
+            (setq sent nil)
+            (ghostel--filter fake-proc "\e]11;rgb:11/22/33\e\\")
+            (should (equal nil sent))
+            (should ghostel--pending-output)))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: focus events gated by mode 1004
 ;; -----------------------------------------------------------------------
 
@@ -759,7 +1069,9 @@ Mirrors the real zsh case where the directory still contains a
               (should (string-match-p "line-B" content))       ; row1 preserved
               (should (string-match-p "line-C updated" content))) ; row2 updated
 
-            (should (equal 5 (count-lines (point-min) (point-max)))))) ; line count
+            ;; 3 content rows + 2 trailing blank rows trimmed to
+            ;; empty strings = 4 newlines = 4 lines counted.
+            (should (equal 4 (count-lines (point-min) (point-max))))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
@@ -1136,6 +1448,94 @@ for new size inside BSU/ESU → verify buffer shows new content."
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
+;; Test: resize preserves old frame until redraw replaces it
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-resize-no-blank-flash ()
+  "Buffer keeps old content after resize; redraw replaces it atomically.
+Regression test: fnSetSize used to call erase-buffer synchronously,
+leaving the buffer visibly empty until the next timer-driven redraw.
+Now the erasure is deferred into redraw() under inhibit-redisplay."
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-no-blank*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 100))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t))
+            ;; Fill the viewport with identifiable content.
+            (dotimes (i 10)
+              (ghostel--write-input term (format "LINE-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (let ((pre-content (buffer-substring-no-properties
+                                (point-min) (point-max))))
+              (should (string-match-p "LINE-00" pre-content))
+              (should (string-match-p "LINE-09" pre-content))
+
+              ;; Resize — old content must survive in the buffer.
+              (ghostel--set-size term 6 40)
+              (setq ghostel--term-rows 6)
+              (let ((mid-content (buffer-substring-no-properties
+                                  (point-min) (point-max))))
+                (should (> (length mid-content) 0))
+                (should (string-match-p "LINE-" mid-content)))
+
+              ;; Redraw rebuilds the buffer from the new terminal state.
+              (ghostel--redraw term t)
+              (let ((post-content (buffer-substring-no-properties
+                                   (point-min) (point-max))))
+                (should (> (length post-content) 0))
+                ;; Viewport should have the new row count; extra lines
+                ;; above are scrollback from the old viewport rows.
+                (should (>= (count-lines (point-min) (point-max)) 6))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-resize-redraw-anchors-window-start ()
+  "After resize + redraw, window-start is at the viewport origin.
+Without explicit anchoring, erase+rebuild inside redraw() clamps
+window-start to 1 (top of scrollback), causing a visible jump when
+Emacs auto-scrolls to make point visible."
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-anchor*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (ghostel--force-next-redraw nil)
+                 (inhibit-read-only t))
+            ;; Build up scrollback so the viewport is not at buffer start.
+            (dotimes (i 30)
+              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel--redraw term t)
+            (should (> (line-number-at-pos (point-max)) 10))
+
+            ;; Display in a real window so we can test window-start.
+            (set-window-buffer (selected-window) buf)
+
+            ;; Resize + redraw via delayed-redraw (simulates the real path).
+            (ghostel--set-size term 6 40)
+            (setq ghostel--term-rows 6)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+
+            ;; window-start should be at the viewport, not at buffer start.
+            (let* ((ws (window-start (selected-window)))
+                   (wp (window-point (selected-window)))
+                   (vp-start (save-excursion
+                               (goto-char (point-max))
+                               (forward-line -5)
+                               (line-beginning-position))))
+              (should (= ws vp-start))
+              (should (>= wp vp-start)))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: resize with real process — verify PTY and buffer content
 ;; -----------------------------------------------------------------------
 
@@ -1164,7 +1564,11 @@ app redraws all rows at new width via the filter pipeline."
                   (ghostel--redraw ghostel--term t)
                   (let ((c (buffer-substring-no-properties (point-min) (point-max))))
                     (should (string-match-p "WIDE-R00" c))
-                    ;; Verify rows are 80 chars wide.
+                    ;; Row 1 is at most `cols' chars wide after the
+                    ;; renderer trims unwritten padding.  The shell
+                    ;; here left-pads with spaces up to 80 cols via
+                    ;; `%-80s', which libghostty records as written
+                    ;; space cells, so row 1 stays exactly 80 chars.
                     (should (= 80 (length (car (split-string c "\n"))))))
 
                   ;; Simulate what the resize function does.
@@ -1187,8 +1591,11 @@ app redraws all rows at new width via the filter pipeline."
                     (should (string-match-p "NARROW-R05" content))
                     ;; No old wide content.
                     (should-not (string-match-p "WIDE-R" content))
-                    ;; Rows should be 40 chars wide (new terminal width).
-                    (should (= 40 (length (car (split-string content "\n")))))))
+                    ;; Each row is at most 40 chars (the new terminal
+                    ;; width) — the app wrote 10 chars then stopped,
+                    ;; so the renderer trims at the content end.
+                    (dolist (row (split-string content "\n"))
+                      (should (<= (length row) 40)))))
               (when (process-live-p proc)
                 (delete-process proc)))))
       (kill-buffer buf))))
@@ -1345,6 +1752,48 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
       (should (car messages))
       (should (string-match-p "unknown eval command" (car messages))))))
 
+(ert-deftest ghostel-test-osc51-eval-catches-errors ()
+  "Errors signaled by a dispatched OSC 51;E function must not
+propagate out of `ghostel--osc51-eval' — otherwise they crash the
+process filter / redraw timer that invoked the native parser.
+Regression for a follow-up to #82 where `dow' with no args called
+`dired-other-window' with 0 arguments and signaled up through the
+filter."
+  (let* ((ghostel-eval-cmds
+          `(("boom" ,(lambda (&rest _) (error "kaboom")))))
+         (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      ;; Must not raise.
+      (ghostel--osc51-eval "\"boom\"")
+      (should (car messages))
+      (should (string-match-p "error calling boom" (car messages)))
+      (should (string-match-p "kaboom" (car messages))))))
+
+(ert-deftest ghostel-test-flush-pending-output-preserves-buffer ()
+  "Regression for #82: a buffer switch performed by a synchronous
+native callback (as OSC 51;E dispatch does when it calls
+`find-file-other-window') must not leak out of
+`ghostel--flush-pending-output'.  Otherwise callers such as
+`ghostel--delayed-redraw' read `ghostel--term' from the wrong
+buffer and hand nil to the native module."
+  (let ((ghostel-buf (generate-new-buffer " *ghostel-test-flush-buf*"))
+        (other-buf (generate-new-buffer " *ghostel-test-flush-other*")))
+    (unwind-protect
+        (with-current-buffer ghostel-buf
+          (setq-local ghostel--term 'fake-handle)
+          (setq-local ghostel--pending-output (list "payload"))
+          (cl-letf (((symbol-function 'ghostel--write-input)
+                     (lambda (_term _data)
+                       ;; Simulate `find-file-other-window' flipping
+                       ;; the current buffer via `select-window'.
+                       (set-buffer other-buf))))
+            (ghostel--flush-pending-output))
+          (should (eq (current-buffer) ghostel-buf))
+          (should (null ghostel--pending-output)))
+      (kill-buffer ghostel-buf)
+      (kill-buffer other-buf))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: copy-mode cursor visibility
 ;; -----------------------------------------------------------------------
@@ -1462,52 +1911,6 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
       (should (equal '(4) result)))))
 
 ;; -----------------------------------------------------------------------
-;; Test: copy-mode-load-all state management
-;; -----------------------------------------------------------------------
-
-(ert-deftest ghostel-test-copy-mode-load-all ()
-  "Test that `ghostel-copy-mode-load-all' sets full-buffer state."
-  (let ((buf (generate-new-buffer " *ghostel-test-load-all*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let ((ghostel--copy-mode-active nil)
-                (ghostel--redraw-timer nil)
-                (ghostel--term 'fake-term))
-            ;; Enter copy mode
-            (ghostel-copy-mode)
-            (should ghostel--copy-mode-active)              ; in copy mode
-            (should-not ghostel--copy-mode-full-buffer)     ; not full yet
-            ;; Simulate a 3-line viewport with point on line 2, column 3
-            (let ((inhibit-read-only t))
-              (erase-buffer)
-              (insert "aaa\nbbbXbb\nccc"))
-            (goto-char (point-min))
-            (forward-line 1)
-            (move-to-column 3)                              ; on 'X' in line 2
-            ;; Stub the native function and recenter (no window in batch).
-            ;; The stub must NOT bind inhibit-read-only itself — the real
-            ;; native function doesn't, so the caller must have it set.
-            ;; Returns viewport-line=3 (viewport starts at line 3 in full buffer)
-            (cl-letf (((symbol-function 'ghostel--redraw-full-scrollback)
-                       (lambda (_term)
-                         (erase-buffer)
-                         (insert "sb1\nsb2\naaa\nbbbXbb\nccc")
-                         3))
-                      ((symbol-function 'recenter) #'ignore))
-              (ghostel-copy-mode-load-all)
-              (should ghostel--copy-mode-full-buffer)       ; now full
-              ;; Point should be on line 4 (viewport-line 3 + saved offset 1)
-              (should (= 4 (line-number-at-pos)))           ; preserved line
-              (should (= 3 (current-column))))
-            ;; Exit resets full-buffer state
-            (cl-letf (((symbol-function 'ghostel--scroll-bottom) #'ignore)
-                      ((symbol-function 'ghostel--redraw) #'ignore))
-              (ghostel-copy-mode-exit))
-            (should-not ghostel--copy-mode-full-buffer)))   ; reset on exit
-      (kill-buffer buf))))
-
-;; -----------------------------------------------------------------------
 ;; Test: ghostel-copy-all copies to kill ring
 ;; -----------------------------------------------------------------------
 
@@ -1527,32 +1930,28 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
-;; Test: copy-mode scroll commands in full-buffer mode
+;; Test: copy-mode scroll commands use Emacs navigation
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-copy-mode-full-buffer-scroll ()
-  "Test that scroll commands use Emacs navigation in full-buffer mode."
-  (let ((buf (generate-new-buffer " *ghostel-test-full-scroll*")))
+(ert-deftest ghostel-test-copy-mode-buffer-navigation ()
+  "Copy-mode navigation commands operate on the Emacs buffer directly."
+  (let ((buf (generate-new-buffer " *ghostel-test-copy-nav*")))
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
           (let ((ghostel--copy-mode-active t)
-                (ghostel--copy-mode-full-buffer t)
                 (ghostel--term 'fake-term)
                 (inhibit-read-only t))
-            ;; Insert content
             (insert (mapconcat #'number-to-string (number-sequence 1 20) "\n"))
             (goto-char (point-min))
-            ;; Test beginning/end of buffer
             (ghostel-copy-mode-end-of-buffer)
-            (should (= (point) (point-max)))                ; jumped to end
+            (should (= (point) (point-max)))
             (ghostel-copy-mode-beginning-of-buffer)
-            (should (= (point) (point-min)))                ; jumped to beginning
-            ;; Test line navigation
+            (should (= (point) (point-min)))
             (ghostel-copy-mode-next-line)
-            (should (= 2 (line-number-at-pos)))             ; moved to line 2
+            (should (= 2 (line-number-at-pos)))
             (ghostel-copy-mode-previous-line)
-            (should (= 1 (line-number-at-pos)))))           ; moved back to line 1
+            (should (= 1 (line-number-at-pos)))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
@@ -1848,8 +2247,6 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
   (let ((ghostel--term 'fake)
         (ghostel--process 'fake)
         (ghostel--copy-mode-active nil)
-        (ghostel--copy-mode-full-buffer nil)
-        (ghostel--force-next-redraw nil)
         (mouse-event-args nil)
         (scroll-called nil)
         ;; Fake wheel-up event at row 5, col 10
@@ -1859,8 +2256,8 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
                (lambda (_term action button row col mods)
                  (setq mouse-event-args (list action button row col mods))
                  t))
-              ((symbol-function 'ghostel--scroll)
-               (lambda (_term _delta) (setq scroll-called t)))
+              ((symbol-function 'scroll-down)
+               (lambda (&optional _) (setq scroll-called t)))
               ((symbol-function 'process-live-p) (lambda (_p) t)))
       (ghostel--scroll-up fake-event)
       (should mouse-event-args)
@@ -1876,8 +2273,8 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
                  (lambda (_term action button row col mods)
                    (setq mouse-event-args (list action button row col mods))
                    t))
-                ((symbol-function 'ghostel--scroll)
-                 (lambda (_term _delta) (setq scroll-called t)))
+                ((symbol-function 'scroll-up)
+                 (lambda (&optional _) (setq scroll-called t)))
                 ((symbol-function 'process-live-p) (lambda (_p) t)))
         (ghostel--scroll-down fake-down-event)
         (should mouse-event-args)
@@ -1885,29 +2282,25 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
         (should-not scroll-called)))))
 
 (ert-deftest ghostel-test-scroll-fallback-no-mouse-tracking ()
-  "Scroll-up/down fall back to viewport scroll when mouse tracking is off."
+  "Scroll-up/down fall back to Emacs window scroll when mouse tracking is off."
   (let ((ghostel--term 'fake)
         (ghostel--process 'fake)
         (ghostel--copy-mode-active nil)
-        (ghostel--copy-mode-full-buffer nil)
-        (ghostel--force-next-redraw nil)
-        (scroll-delta nil)
+        (scroll-down-arg nil)
+        (scroll-up-arg nil)
         (fake-up-event `(wheel-up (,(selected-window) 1 (10 . 5) 0)))
         (fake-down-event `(wheel-down (,(selected-window) 1 (10 . 5) 0))))
     (cl-letf (((symbol-function 'ghostel--mouse-event)
                (lambda (_term _action _button _row _col _mods) nil))
-              ((symbol-function 'ghostel--scroll)
-               (lambda (_term delta) (setq scroll-delta delta)))
-              ((symbol-function 'ghostel--invalidate) #'ignore)
+              ((symbol-function 'scroll-down)
+               (lambda (&optional n) (setq scroll-down-arg n)))
+              ((symbol-function 'scroll-up)
+               (lambda (&optional n) (setq scroll-up-arg n)))
               ((symbol-function 'process-live-p) (lambda (_p) t)))
       (ghostel--scroll-up fake-up-event)
-      (should (equal -3 scroll-delta))
-      (should ghostel--force-next-redraw)
-      ;; Reset and test scroll-down fallback
-      (setq scroll-delta nil ghostel--force-next-redraw nil)
+      (should (equal 3 scroll-down-arg))
       (ghostel--scroll-down fake-down-event)
-      (should (equal 3 scroll-delta))
-      (should ghostel--force-next-redraw))))
+      (should (equal 3 scroll-up-arg)))))
 
 (ert-deftest ghostel-test-control-key-bindings ()
   "All non-exception C-<letter> keys should be bound in ghostel-mode-map."
@@ -1939,67 +2332,12 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
 ;; -----------------------------------------------------------------------
 
 (ert-deftest ghostel-test-copy-mode-recenter ()
-  "Recenter scrolls terminal viewport to center the current line."
-  (let ((buf (generate-new-buffer " *ghostel-test-copy-mode-recenter*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (dotimes (i 20) (insert (format "line-%02d" i) (make-string 33 ?x) "\n"))
-          (setq ghostel--term 'fake-term)
-          (setq ghostel--copy-mode-active t)
-          (setq buffer-read-only t)
-          (let ((scroll-delta nil)
-                (redraw-called nil)
-                (recenter-called nil))
-            ;; Mock redraw that changes the first line (simulates viewport shift).
-            (cl-letf (((symbol-function 'ghostel--scroll)
-                       (lambda (_term delta) (setq scroll-delta delta)))
-                      ((symbol-function 'ghostel--redraw)
-                       (lambda (_term _full)
-                         (setq redraw-called t)
-                         (save-excursion
-                           (goto-char (point-min))
-                           (delete-char 1)
-                           (insert "!"))))
-                      ((symbol-function 'window-body-height)
-                       (lambda (&rest _) 20))
-                      ((symbol-function 'recenter)
-                       (lambda (&rest _) (setq recenter-called t))))
-              ;; Point on line 5 (above center 10) → scroll viewport up
-              (goto-char (point-min))
-              (forward-line 4)
-              (ghostel-copy-mode-recenter)
-              (should (equal -5 scroll-delta))
-              (should redraw-called)
-              (should recenter-called))
-
-            ;; Mock redraw that does NOT change buffer (simulates clamped scroll).
-            (cl-letf (((symbol-function 'ghostel--scroll)
-                       (lambda (_term delta) (setq scroll-delta delta)))
-                      ((symbol-function 'ghostel--redraw)
-                       (lambda (_term _full) (setq redraw-called t)))
-                      ((symbol-function 'window-body-height)
-                       (lambda (&rest _) 20))
-                      ((symbol-function 'recenter)
-                       (lambda (&rest _) (setq recenter-called t))))
-              ;; Point on line 15 (below center), scroll clamped → no-op
-              (setq scroll-delta nil redraw-called nil recenter-called nil)
-              (goto-char (point-min))
-              (forward-line 14)
-              (ghostel-copy-mode-recenter)
-              (should (equal 5 scroll-delta))
-              (should redraw-called)
-              (should-not recenter-called)
-              (should (= 15 (line-number-at-pos)))
-
-              ;; Point on line 10 (at center) → no scroll at all
-              (setq scroll-delta nil redraw-called nil recenter-called nil)
-              (goto-char (point-min))
-              (forward-line 9)
-              (ghostel-copy-mode-recenter)
-              (should-not scroll-delta)
-              (should-not redraw-called)
-              (should-not recenter-called))))
-      (kill-buffer buf))))
+  "Copy-mode recenter delegates to the standard `recenter' command."
+  (let ((called nil))
+    (cl-letf (((symbol-function 'recenter)
+               (lambda (&rest _) (setq called t))))
+      (ghostel-copy-mode-recenter)
+      (should called))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-send-next-key
@@ -2071,11 +2409,20 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
 
 (ert-deftest ghostel-test-update-directory-remote ()
   "Test TRAMP path construction from remote OSC 7."
-  ;; Remote hostname -> TRAMP ssh path
+  ;; Remote hostname -> TRAMP path using tramp-default-method fallback
   (let ((ghostel--last-directory nil)
-        (default-directory "/tmp/"))
+        (default-directory "/tmp/")
+        (ghostel-tramp-default-method nil)
+        (tramp-default-method "ssh"))
     (ghostel--update-directory "file://remote-host/home/user")
     (should (equal "/ssh:remote-host:/home/user/" default-directory)))
+  ;; ghostel-tramp-default-method takes precedence over tramp-default-method
+  (let ((ghostel--last-directory nil)
+        (default-directory "/tmp/")
+        (ghostel-tramp-default-method "rsync")
+        (tramp-default-method "ssh"))
+    (ghostel--update-directory "file://remote-host/home/user")
+    (should (equal "/rsync:remote-host:/home/user/" default-directory)))
   ;; Preserves method from existing TRAMP default-directory
   (let ((ghostel--last-directory nil)
         (default-directory "/scp:server:/"))
@@ -2139,12 +2486,12 @@ ncurses apps like htop at start-up size and breaks live resize."
     (let ((ghostel--term 'fake)
           (ghostel--force-next-redraw nil)
           (set-size-args nil)
-          (invalidate-called nil))
+          (redraw-called nil))
       (let ((cur-buf (current-buffer)))
         (cl-letf (((symbol-function 'ghostel--set-size)
                    (lambda (_term h w) (setq set-size-args (list h w))))
-                  ((symbol-function 'ghostel--invalidate)
-                   (lambda () (setq invalidate-called t)))
+                  ((symbol-function 'ghostel--delayed-redraw)
+                   (lambda (_buf) (setq redraw-called t)))
                   ((symbol-function 'process-buffer)
                    (lambda (_proc) cur-buf))
                   ((default-value 'window-adjust-process-window-size-function)
@@ -2154,7 +2501,7 @@ ncurses apps like htop at start-up size and breaks live resize."
             (should (equal '(120 . 40) result))
             (should (equal '(40 120) set-size-args))
             (should ghostel--force-next-redraw)
-            (should invalidate-called)))))))
+            (should redraw-called)))))))
 
 (ert-deftest ghostel-test-resize-nil-size ()
   "When default function returns nil, no resize happens."
@@ -2305,7 +2652,7 @@ while :; do sleep 0.1; done'\n")
             (let ((ghostel--term 'fake-term))
               (cl-letf (((symbol-function 'ghostel--set-size)
                          (lambda (_t _h _w) nil))
-                        ((symbol-function 'ghostel--invalidate) #'ignore)
+                        ((symbol-function 'ghostel--delayed-redraw) #'ignore)
                         ((default-value 'window-adjust-process-window-size-function)
                          (lambda (_p _w) (cons 120 30))))
                 ;; Invoke the handler as Emacs would.
@@ -2378,18 +2725,20 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-apply-palette-default-colors
     ghostel-test-osc51-eval
     ghostel-test-osc51-eval-unknown
+    ghostel-test-osc51-eval-catches-errors
+    ghostel-test-flush-pending-output-preserves-buffer
     ghostel-test-copy-mode-cursor
     ghostel-test-copy-mode-hl-line
     ghostel-test-project-buffer-name
     ghostel-test-project-universal-arg
-    ghostel-test-copy-mode-load-all
     ghostel-test-copy-all
-    ghostel-test-copy-mode-full-buffer-scroll
+    ghostel-test-copy-mode-buffer-navigation
     ghostel-test-package-version
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum
     ghostel-test-title-does-not-overwrite-manual-rename
+    ghostel-test-title-tracking-disabled
     ghostel-test-immediate-redraw-triggers-on-small-echo
     ghostel-test-immediate-redraw-skips-large-output
     ghostel-test-immediate-redraw-skips-stale-send
