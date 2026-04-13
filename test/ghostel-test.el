@@ -2693,6 +2693,37 @@ ncurses apps like htop at start-up size and breaks live resize."
             (when (process-live-p proc)
               (delete-process proc))))))))
 
+(ert-deftest ghostel-test-start-process-local-bash-integration-keeps-early-echo ()
+  "Local bash integration must keep `stty echo' in the wrapper.
+Old bash versions can initialize readline before the ENV-injected
+integration script runs, so input echo must be enabled before exec."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/bash")
+               (ghostel-shell-integration t)
+               (default-directory "/tmp/")
+               (proc (ghostel--start-process)))
+          (unwind-protect
+              (let ((cmd (process-command proc)))
+                (should (equal '("/bin/sh" "-c") (seq-take cmd 2)))
+                (should (string-match-p "stty .* -ixon echo\\b" (nth 2 cmd)))
+                (should (string-match-p "exec /bin/bash --posix" (nth 2 cmd)))
+                (should (member "GHOSTEL_BASH_INJECT=1" captured-env))
+                (should (seq-some (lambda (s) (string-prefix-p "ENV=" s))
+                                  captured-env)))
+            (when (process-live-p proc)
+              (delete-process proc))))))))
+
 ;; -----------------------------------------------------------------------
 ;; Tests: window resize
 ;; -----------------------------------------------------------------------

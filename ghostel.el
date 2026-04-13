@@ -2080,8 +2080,9 @@ on the remote host."
          ;;    pass through to the application instead of being
          ;;    swallowed by the PTY line discipline.
          ;;  - echo: bash-only — readline buffers its own echo, so
-         ;;    we need PTY-level echo.  When bash integration is
-         ;;    active, the integration script handles echo.
+         ;;    we need PTY-level echo early in startup.  Old bash
+         ;;    versions (notably macOS /bin/bash 3.2) may initialize
+         ;;    readline before ENV-sourced integration runs.
          ;; The clear-screen hides the stty output.  exec replaces
          ;; the wrapper so only the shell process remains.
          (shell-args (cond
@@ -2093,8 +2094,7 @@ on the remote host."
          (stty-flags (cond
                       (remote-integration
                        (plist-get remote-integration :stty))
-                      ((and (eq (ghostel--detect-shell shell) 'bash)
-                            (not integration-env))
+                      ((eq shell-type 'bash)
                        "erase '^?' iutf8 -ixon echo")
                       (t "erase '^?' iutf8 -ixon")))
          (shell-command
