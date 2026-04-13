@@ -1961,7 +1961,7 @@ Returns nil on failure."
                                           "fi\n"
                                           integration))
              (list :env nil :args (list "--rcfile" path)
-                   :stty "erase '^?' iutf8 echo" :temp-files (list temp))))
+                   :stty "erase '^?' iutf8 -ixon echo" :temp-files (list temp))))
           ;; Zsh: ZDOTDIR replaces .zshenv search, so we restore it,
           ;; source the user's .zshenv, then load integration.
           ('zsh
@@ -1990,7 +1990,7 @@ Returns nil on failure."
                                           "    'builtin' 'unset' '_ghostel_file'\n"
                                           "}\n"))
              (list :env (list (format "ZDOTDIR=%s" remote-dir))
-                   :args nil :stty "erase '^?' iutf8"
+                   :args nil :stty "erase '^?' iutf8 -ixon"
                    :temp-dirs (list temp-dir))))
           ;; Fish: -C runs after config, so just source the script.
           ('fish
@@ -2001,7 +2001,7 @@ Returns nil on failure."
              (list :env nil
                    :args (list "-C" (format "source %s"
                                             (shell-quote-argument path)))
-                   :stty "erase '^?' iutf8" :temp-files (list temp))))))
+                   :stty "erase '^?' iutf8 -ixon" :temp-files (list temp))))))
     (error
      (message "ghostel: remote shell integration failed: %s"
               (error-message-string err))
@@ -2082,6 +2082,9 @@ on the remote host."
          ;;    whether \x7f means backspace.
          ;;  - iutf8: kernel-level UTF-8 awareness so backspace
          ;;    correctly erases multi-byte characters.
+         ;;  - -ixon: disable XON/XOFF flow control so C-q and C-s
+         ;;    pass through to the application instead of being
+         ;;    swallowed by the PTY line discipline.
          ;;  - echo: bash-only — readline buffers its own echo, so
          ;;    we need PTY-level echo.  When bash integration is
          ;;    active, the integration script handles echo.
@@ -2098,8 +2101,8 @@ on the remote host."
                        (plist-get remote-integration :stty))
                       ((and (eq (ghostel--detect-shell shell) 'bash)
                             (not integration-env))
-                       "erase '^?' iutf8 echo")
-                      (t "erase '^?' iutf8")))
+                       "erase '^?' iutf8 -ixon echo")
+                      (t "erase '^?' iutf8 -ixon")))
          (shell-command
           (list "/bin/sh" "-c"
                 (concat "stty " stty-flags

@@ -2630,6 +2630,7 @@ ncurses apps like htop at start-up size and breaks live resize."
                 (should (equal '("/bin/sh" "-c") (seq-take cmd 2)))
                 (should (string-match-p "stty .* rows 43 columns 137"
                                         (nth 2 cmd)))
+                (should (string-match-p "-ixon" (nth 2 cmd)))
                 (should-not (seq-some (lambda (s) (string-prefix-p "LINES=" s))
                                       captured-env))
                 (should-not (seq-some (lambda (s) (string-prefix-p "COLUMNS=" s))
@@ -2721,8 +2722,9 @@ is broken on this system."
           ;; Install a SIGWINCH trap that prints a marker to stdout.
           (process-send-string
            proc "trap 'printf \"__WINCH__\\n\"' WINCH\n")
-          ;; Wait a bit for shell to consume the trap command.
-          (sleep-for 0.3)
+          ;; Wait for shell to start and consume the trap command.
+          ;; Bash with readline needs more startup time than /bin/sh.
+          (sleep-for 0.5)
           ;; Clear output so we only see post-resize output.
           (setq output "")
           ;; Now trigger a resize — this is what Emacs does after
