@@ -51,21 +51,7 @@ pub fn build(b: *std.Build) void {
     );
     b.getInstallStep().dependOn(&copy_step.step);
 
-    const check_mod = b.createModule(.{
-        .root_source_file = b.path("src/module.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addModuleIncludes(check_mod, emacs_module_dir, ghostty_lib);
 
-    const check_obj = b.addObject(.{
-        .name = "ghostel-module-check",
-        .root_module = check_mod,
-    });
-
-    const check = b.step("check", "Check that the module compiles (no linking)");
-    check.dependOn(&check_obj.step);
 }
 
 fn addModuleIncludes(

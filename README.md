@@ -38,9 +38,8 @@ binaries are available for:
 - `x86_64-linux`
 - `aarch64-linux`
 
-If you prefer to build from source or need a different platform, you'll also
-need [Zig](https://ziglang.org/) 0.14+ and the ghostty submodule (see
-[Building from source](#building-from-source)).
+If you prefer to build from source or need a different platform, you'll also need
+[Zig](https://ziglang.org/) 0.15.2+ (see [Building from source](#building-from-source)).
 
 ## Installation
 
@@ -105,10 +104,12 @@ To override the vendored Emacs header, set `EMACS_INCLUDE_DIR` to a
 directory containing `emacs-module.h`, or set `EMACS_BIN_DIR` to an
 Emacs `bin/` directory.
 
-To build against a local ghostty checkout:
+To build against a local ghostty checkout, temporarily point the
+dependency at your local path:
 
 ```sh
-zig build -Doptimize=ReleaseFast --override-dep ghostty=/path/to/ghostty
+zig fetch --save=ghostty /path/to/ghostty
+zig build -Doptimize=ReleaseFast
 ```
 
 ### Building from source (MELPA install)

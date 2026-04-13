@@ -6,15 +6,12 @@ EVIL_DIR       ?= $(XDG_CACHE_HOME)/evil
 
 ELC := ghostel.elc ghostel-debug.elc
 
-.PHONY: all build check test test-all test-evil lint melpazoid byte-compile bench bench-quick clean
+.PHONY: all build test test-all test-evil lint melpazoid byte-compile bench bench-quick clean
 
 all: build test-all test-evil lint
 
 build:
 	zig build
-
-check:
-	zig build check
 
 # Pattern rule: rebuild .elc whenever its .el source is newer.
 # Make's timestamp tracking keeps the byte-compiled files in sync, so
