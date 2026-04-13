@@ -261,7 +261,7 @@ When nil, falls back to `tramp-default-method'."
                  string))
 
 (defcustom ghostel-keymap-exceptions
-  '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
+  '("C-c" "C-x" "C-u" "C-h" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
 These keys pass through to Emacs instead."
   :type '(repeat string))
@@ -783,6 +783,7 @@ is non-nil.")
     (define-key map (kbd "C-c C-z")   #'ghostel-send-C-z)
     (define-key map (kbd "C-c C-\\")  #'ghostel-send-C-backslash)
     (define-key map (kbd "C-c C-d")   #'ghostel-send-C-d)
+    (define-key map (kbd "C-g")       #'ghostel-send-C-g)
     (define-key map (kbd "C-c C-t")   #'ghostel-copy-mode)
     (define-key map (kbd "C-c M-w")   #'ghostel-copy-all)
     (define-key map (kbd "C-c C-y")   #'ghostel-paste)
@@ -1052,6 +1053,14 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
   (interactive)
   (ghostel--send-encoded "d" "ctrl"))
 
+(defun ghostel-send-C-g ()
+  "Send \\`C-g' to the terminal.
+Clears `quit-flag' which Emacs sets when \\`C-g' is pressed with
+`inhibit-quit' non-nil."
+  (interactive)
+  (setq quit-flag nil)
+  (ghostel--send-key (string 7)))
+
 
 ;;; Paste / yank
 
@@ -1282,6 +1291,7 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
     ;; Normal letter keys exit copy mode and send the key to the terminal
     (define-key map [remap self-insert-command] #'ghostel-copy-mode-exit-and-send)
     (define-key map (kbd "C-c C-t") #'ghostel-copy-mode-exit)
+    (define-key map (kbd "C-g") #'ghostel-copy-mode-exit)
     (define-key map (kbd "M-w") #'ghostel-copy-mode-copy)
     (define-key map (kbd "C-w") #'ghostel-copy-mode-copy)
     ;; Prompt navigation works in copy mode too
@@ -1336,6 +1346,7 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
 (defun ghostel-copy-mode-exit ()
   "Exit copy mode and return to terminal mode."
   (interactive)
+  (setq quit-flag nil)
   (when ghostel--copy-mode-active
     (setq ghostel--copy-mode-active nil)
     (setq cursor-type ghostel--saved-cursor-type)
@@ -2346,7 +2357,11 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   (setq-local line-spacing 0)
   (add-function :after after-focus-change-function #'ghostel--focus-change)
   (ghostel--suppress-interfering-modes)
-  (setq ghostel--scroll-intercept-active t))
+  (setq ghostel--scroll-intercept-active t)
+  ;; Let C-g reach the keymap instead of triggering keyboard-quit.
+  ;; When inhibit-quit is non-nil, C-g sets quit-flag and delivers
+  ;; the character through normal input dispatch.
+  (setq-local inhibit-quit t))
 
 (defun ghostel--suppress-interfering-modes ()
   "Disable global minor modes that interfere with ghostel.

@@ -2536,6 +2536,26 @@ buffer and hand nil to the native module."
   ;; C-@ should also be bound (sends NUL)
   (should (lookup-key ghostel-mode-map (kbd "C-@"))))
 
+(ert-deftest ghostel-test-c-g-binding ()
+  "C-g should be bound to `ghostel-send-C-g' in ghostel-mode-map."
+  (should (eq (lookup-key ghostel-mode-map (kbd "C-g"))
+              #'ghostel-send-C-g)))
+
+(ert-deftest ghostel-test-c-g-exits-copy-mode ()
+  "C-g should be bound in copy-mode-map to exit copy mode."
+  (should (eq (lookup-key ghostel-copy-mode-map (kbd "C-g"))
+              #'ghostel-copy-mode-exit)))
+
+(ert-deftest ghostel-test-inhibit-quit ()
+  "ghostel-mode should set inhibit-quit buffer-locally."
+  (let ((buf (generate-new-buffer " *ghostel-test-inhibit-quit*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (should (eq inhibit-quit t))
+          (should (local-variable-p 'inhibit-quit)))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-meta-key-bindings ()
   "All non-exception M-<letter> keys should be bound in ghostel-mode-map."
   (dolist (c (number-sequence ?a ?z))
@@ -3011,6 +3031,9 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-scroll-intercept-forwards-mouse-tracking
     ghostel-test-scroll-intercept-fallthrough
     ghostel-test-control-key-bindings
+    ghostel-test-c-g-binding
+    ghostel-test-c-g-exits-copy-mode
+    ghostel-test-inhibit-quit
     ghostel-test-meta-key-bindings
     ghostel-test-copy-mode-recenter
     ghostel-test-send-next-key-control-x
