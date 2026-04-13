@@ -38,9 +38,8 @@ binaries are available for:
 - `x86_64-linux`
 - `aarch64-linux`
 
-If you prefer to build from source or need a different platform, you'll also
-need [Zig](https://ziglang.org/) 0.14+ and the ghostty submodule (see
-[Building from source](#building-from-source)).
+If you prefer to build from source or need a different platform, you'll also need
+[Zig](https://ziglang.org/) 0.15.2+ (see [Building from source](#building-from-source)).
 
 ## Installation
 
@@ -81,51 +80,47 @@ pre-built binary** or **compile from source** (controlled by
 `ghostel-module-auto-install`, default `ask`).  You can also trigger these
 manually:
 
-- `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
-- `M-x ghostel-module-compile` — build from source via `build.sh`
+- `M-x ghostel-download-module` — download the minimum supported pre-built binary
+- `C-u M-x ghostel-download-module` — choose a specific release tag (leave blank for latest)
+- `M-x ghostel-module-compile` — build from source via `zig build`
 
 ## Building from source
 
 Building is only needed if you don't want to use the pre-built binaries.
+Ghostel vendors a generated `include/emacs-module.h`, so normal builds do not
+require local Emacs headers.  If you want to override the vendored header, set
+`EMACS_INCLUDE_DIR` to a directory containing `emacs-module.h`, or set
+`EMACS_BIN_DIR` to an Emacs `bin/` directory and Ghostel will look for
+`../include` and `../share/emacs/include`.
 
 ```sh
-# Clone with submodule
-git clone --recurse-submodules https://github.com/dakra/ghostel.git
+git clone https://github.com/dakra/ghostel.git
 cd ghostel
 
-# Build everything (libghostty-vt + ghostel module)
-./build.sh
+# Build everything (fetches ghostty automatically via Zig package manager)
+zig build -Doptimize=ReleaseFast
 ```
 
-If you already have the repo, initialize the submodule and build:
+To override the vendored Emacs header, set `EMACS_INCLUDE_DIR` to a
+directory containing `emacs-module.h`, or set `EMACS_BIN_DIR` to an
+Emacs `bin/` directory.
+
+To build against a local ghostty checkout, temporarily point the
+dependency at your local path:
 
 ```sh
-git submodule update --init vendor/ghostty
-./build.sh
+zig fetch --save=ghostty /path/to/ghostty
+zig build -Doptimize=ReleaseFast
 ```
 
 ### Building from source (MELPA install)
 
-MELPA packages only include `.el` files — the build script, Zig sources, and
-ghostty submodule are not included.  This means `M-x ghostel-module-compile`
-is not available when installed from MELPA.
+When installed from MELPA, `M-x ghostel-module-compile` builds the native
+module from source using `zig build`.  Zig's package manager fetches the
+ghostty dependency automatically.
 
-The recommended approach is to download a **pre-built binary** via
-`M-x ghostel-download-module` (this works regardless of install method).
-
-If you prefer to compile from source, clone the repository, build, and copy
-the resulting module into your MELPA package directory:
-
-```sh
-git clone --recurse-submodules https://github.com/dakra/ghostel.git
-cd ghostel
-./build.sh
-
-# Copy the module into your MELPA package directory
-# (adjust the path to match your Emacs package directory and ghostel version)
-cp ghostel-module.dylib ~/.emacs.d/elpa/ghostel-*/    # macOS
-cp ghostel-module.so    ~/.emacs.d/elpa/ghostel-*/    # Linux
-```
+Alternatively, download a **pre-built binary** via `M-x ghostel-download-module`
+(or `C-u M-x ghostel-download-module` to pick a specific release).
 
 ## Shell Integration
 

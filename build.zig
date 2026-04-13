@@ -1,10 +1,21 @@
 const std = @import("std");
 
+const vendored_emacs_module_dir = "include";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
     const is_release = optimize != .Debug;
+    const target_os = target.result.os.tag;
+    const emacs_module_dir = resolveEmacsModuleDir(b);
+    const ghostty_dep = b.dependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"emit-lib-vt" = true,
+    });
+
+    const ghostty_lib = ghostty_dep.artifact("ghostty-vt-static");
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/module.zig"),
         .target = target,
@@ -13,117 +24,107 @@ pub fn build(b: *std.Build) void {
         .strip = if (is_release) true else null,
         .omit_frame_pointer = if (is_release) true else null,
     });
+    addModuleIncludes(mod, emacs_module_dir, ghostty_lib);
+    mod.linkLibrary(ghostty_lib);
 
-    // Emacs module header — check EMACS_INCLUDE_DIR env, then platform defaults
-    if (b.graph.env_map.get("EMACS_INCLUDE_DIR")) |inc_dir| {
-        mod.addSystemIncludePath(.{ .cwd_relative = inc_dir });
-    } else {
-        const resolved = target.result;
-        if (resolved.os.tag == .macos) {
-            mod.addSystemIncludePath(.{
-                .cwd_relative = "/Applications/Emacs.app/Contents/Resources/include",
-            });
-        } else if (resolved.os.tag == .windows) {
-            // Windows: user should set EMACS_INCLUDE_DIR; this is a fallback
-            mod.addSystemIncludePath(.{
-                .cwd_relative = "C:/Program Files/Emacs/emacs-30.2/include",
-            });
-        } else {
-            mod.addSystemIncludePath(.{
-                .cwd_relative = "/usr/include",
-            });
-        }
-    }
-
-    // Project headers (emacs-module-wrapper.h for musl compatibility)
-    mod.addIncludePath(b.path("src"));
-
-    // libghostty-vt headers — try both source tree and build output
-    mod.addIncludePath(b.path("vendor/ghostty/include"));
-    mod.addIncludePath(b.path("vendor/ghostty/zig-out/include"));
-
-    // Full build: link against pre-built static libraries
     const lib = b.addLibrary(.{
         .name = "ghostel-module",
         .linkage = .dynamic,
         .root_module = mod,
     });
-
-    const target_os = target.result.os.tag;
-    if (target_os == .windows) {
-        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/ghostty-vt-static.lib"));
-        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/simdutf.lib"));
-        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/highway.lib"));
-    } else {
-        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libghostty-vt.a"));
-        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libsimdutf.a"));
-        lib.addObjectFile(b.path("vendor/ghostty/zig-out/lib/libhighway.a"));
-    }
-    lib.linkSystemLibrary("c++");
-
-    // Release optimizations: dead-code elimination and symbol visibility
     if (is_release) {
         lib.link_gc_sections = true;
         lib.link_function_sections = true;
         lib.link_data_sections = true;
         lib.dead_strip_dylibs = true;
 
-        if (target.result.os.tag == .linux) {
+        if (target_os == .linux) {
             lib.setVersionScript(b.path("symbols.map"));
         }
     }
 
     b.installArtifact(lib);
 
-    // Copy the shared library to project root for easy Emacs loading.
-    const lib_name = switch (target_os) {
+    const copy_step = b.addInstallFile(
+        lib.getEmittedBin(),
+        moduleOutputName(target_os),
+    );
+    b.getInstallStep().dependOn(&copy_step.step);
+}
+
+fn addModuleIncludes(
+    mod: *std.Build.Module,
+    emacs_module_dir: std.Build.LazyPath,
+    ghostty_lib: *std.Build.Step.Compile,
+) void {
+    mod.addSystemIncludePath(emacs_module_dir);
+    mod.addIncludePath(ghostty_lib.getEmittedIncludeTree());
+}
+
+fn resolveEmacsModuleDir(b: *std.Build) std.Build.LazyPath {
+    if (b.graph.env_map.get("EMACS_INCLUDE_DIR")) |dir| {
+        ensureEmacsModuleHeaderExists(b.allocator, "EMACS_INCLUDE_DIR", dir);
+        return .{ .cwd_relative = dir };
+    }
+
+    if (b.graph.env_map.get("EMACS_BIN_DIR")) |bin_dir| {
+        const include_dir = resolveEmacsIncludeDirFromBin(b.allocator, bin_dir) orelse
+            std.debug.panic(
+                "EMACS_BIN_DIR={s} does not resolve to a directory containing emacs-module.h",
+                .{bin_dir},
+            );
+        return .{ .cwd_relative = include_dir };
+    }
+
+    return .{ .cwd_relative = vendored_emacs_module_dir };
+}
+
+fn resolveEmacsIncludeDirFromBin(
+    allocator: std.mem.Allocator,
+    bin_dir: []const u8,
+) ?[]const u8 {
+    const include_dir = std.fs.path.join(allocator, &.{ bin_dir, "..", "include" }) catch
+        @panic("out of memory while resolving EMACS_BIN_DIR");
+    if (dirHasEmacsModuleHeader(allocator, include_dir)) {
+        return include_dir;
+    }
+    allocator.free(include_dir);
+
+    const share_include_dir = std.fs.path.join(
+        allocator,
+        &.{ bin_dir, "..", "share", "emacs", "include" },
+    ) catch @panic("out of memory while resolving EMACS_BIN_DIR");
+    if (dirHasEmacsModuleHeader(allocator, share_include_dir)) {
+        return share_include_dir;
+    }
+    allocator.free(share_include_dir);
+
+    return null;
+}
+
+fn ensureEmacsModuleHeaderExists(
+    allocator: std.mem.Allocator,
+    env_name: []const u8,
+    dir: []const u8,
+) void {
+    if (!dirHasEmacsModuleHeader(allocator, dir)) {
+        std.debug.panic("{s}={s} does not contain emacs-module.h", .{ env_name, dir });
+    }
+}
+
+fn dirHasEmacsModuleHeader(allocator: std.mem.Allocator, dir: []const u8) bool {
+    const header_path = std.fs.path.join(allocator, &.{ dir, "emacs-module.h" }) catch
+        @panic("out of memory while resolving emacs-module.h");
+    defer allocator.free(header_path);
+
+    std.fs.cwd().access(header_path, .{}) catch return false;
+    return true;
+}
+
+fn moduleOutputName(target_os: std.Target.Os.Tag) []const u8 {
+    return switch (target_os) {
         .macos => "../ghostel-module.dylib",
         .windows => "../ghostel-module.dll",
         else => "../ghostel-module.so",
     };
-    const copy_step = b.addInstallFile(
-        lib.getEmittedBin(),
-        lib_name,
-    );
-    b.getInstallStep().dependOn(&copy_step.step);
-
-    // "zig build check" — compile-only step for CI.
-    // Verifies all Zig source compiles against headers without needing
-    // the pre-built static libraries (no linking).
-    const check_mod = b.createModule(.{
-        .root_source_file = b.path("src/module.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
-    if (b.graph.env_map.get("EMACS_INCLUDE_DIR")) |inc_dir| {
-        check_mod.addSystemIncludePath(.{ .cwd_relative = inc_dir });
-    } else {
-        const check_resolved = target.result;
-        if (check_resolved.os.tag == .macos) {
-            check_mod.addSystemIncludePath(.{
-                .cwd_relative = "/Applications/Emacs.app/Contents/Resources/include",
-            });
-        } else if (check_resolved.os.tag == .windows) {
-            check_mod.addSystemIncludePath(.{
-                .cwd_relative = "C:/Program Files/Emacs/include",
-            });
-        } else {
-            check_mod.addSystemIncludePath(.{
-                .cwd_relative = "/usr/include",
-            });
-        }
-    }
-    check_mod.addIncludePath(b.path("src"));
-    check_mod.addIncludePath(b.path("vendor/ghostty/include"));
-    check_mod.addIncludePath(b.path("vendor/ghostty/zig-out/include"));
-
-    const check_obj = b.addObject(.{
-        .name = "ghostel-module-check",
-        .root_module = check_mod,
-    });
-
-    const check = b.step("check", "Check that the module compiles (no linking)");
-    check.dependOn(&check_obj.step);
 }

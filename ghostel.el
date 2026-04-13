@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.12.2
+;; Version: 0.13.0
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -69,11 +69,10 @@
 ;;     [[ "$INSIDE_EMACS" = 'ghostel' ]] && \
 ;;       source "$EMACS_GHOSTEL_PATH/etc/ghostel.zsh"
 ;;
-;; Building the native module:
+;; Building the native module (requires Zig 0.15.2+):
 ;;
-;;   Run ./build.sh from the project root, or M-x ghostel-module-compile
-;;   from within Emacs.  Requires Zig 0.14+ and the vendored ghostty
-;;   submodule.
+;;   Run zig build from the project root,
+;;   or M-x ghostel-module-compile from within Emacs.
 
 ;;; Code:
 
@@ -386,11 +385,13 @@ before sending the input."
    ghostel-color-bright-white]
   "Color palette for the terminal (vector of 16 face names).")
 
-(defvar ghostel-github-release-url
+(defcustom ghostel-github-release-url
   "https://github.com/dakra/ghostel/releases"
-  "Base URL for ghostel GitHub releases.")
+  "Base URL for Ghostel GitHub releases.
+Customize this when downloading pre-built modules from a fork or mirror."
+  :type 'string)
 
-(defconst ghostel--minimum-module-version "0.12.2"
+(defconst ghostel--minimum-module-version "0.13.0"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -436,22 +437,26 @@ Returns nil if the platform is not recognized."
     (when tag
       (format "ghostel-module-%s%s" tag module-file-suffix))))
 
-(defun ghostel--module-download-url ()
-  "Return the download URL for the current platform's pre-built module."
+(defun ghostel--module-download-url (&optional version)
+  "Return the download URL for the current platform's pre-built module.
+When VERSION is nil, use the latest release download URL."
   (let ((asset-name (ghostel--module-asset-name)))
     (when asset-name
-      (let ((version (ghostel--package-version)))
-        (if version
-            (format "%s/download/v%s/%s"
-                    ghostel-github-release-url version asset-name)
-          (format "%s/latest/download/%s"
-                  ghostel-github-release-url asset-name))))))
+      (if version
+          (format "%s/download/v%s/%s"
+                  ghostel-github-release-url version asset-name)
+        (format "%s/latest/download/%s"
+                ghostel-github-release-url asset-name)))))
 
-(defun ghostel--download-module (dir)
+(defun ghostel--download-module (dir &optional version latest-release)
   "Download a pre-built module into DIR.
+When VERSION is non-nil, download that release tag.
+When LATEST-RELEASE is non-nil, use the latest release asset URL.
 Returns non-nil on success."
   (condition-case err
-      (let ((url (ghostel--module-download-url)))
+      (let* ((requested-version (unless latest-release
+                                  (or version ghostel--minimum-module-version)))
+             (url (ghostel--module-download-url requested-version)))
         (when url
           (unless (string-prefix-p "https://" url)
             (error "Refusing non-HTTPS download URL: %s" url))
@@ -468,20 +473,23 @@ Returns non-nil on success."
 (defun ghostel--compile-module (dir)
   "Compile the native module from source in DIR.
 Runs synchronously and returns non-nil on success."
-  (let ((default-directory dir)
-        (script (expand-file-name "build.sh" dir)))
-    (if (file-executable-p script)
-        (progn
-          (message "ghostel: compiling native module (this may take a moment)...")
-          (let ((ret (call-process script nil "*ghostel-build*" nil)))
-            (if (eq ret 0)
-                (progn (message "ghostel: native module compiled successfully") t)
-              (display-warning 'ghostel
-                               "Module compilation failed.  See *ghostel-build* buffer for details.")
-              nil)))
-      (display-warning 'ghostel
-                       (format "build.sh not found in %s.\nClone with submodules and run ./build.sh manually." dir))
-      nil)))
+  (let ((default-directory dir))
+    (message "ghostel: compiling native module with zig build (this may take a moment)...")
+    (condition-case err
+        (let ((ret (process-file "zig" nil "*ghostel-build*" nil
+                                 "build" "-Doptimize=ReleaseFast" "-Dcpu=baseline")))
+          (if (eq ret 0)
+              (progn (message "ghostel: native module compiled successfully") t)
+            (display-warning 'ghostel
+                             "Module compilation failed.  See *ghostel-build* buffer for details.")
+            nil))
+      (file-missing
+       (display-warning 'ghostel
+                        (format "zig executable not found while compiling in %s" dir))
+       nil)
+      (error
+       (display-warning 'ghostel (error-message-string err))
+       nil))))
 
 (defun ghostel--ensure-module (dir)
   "Ensure the native module exists in DIR.
@@ -494,16 +502,28 @@ Behavior is controlled by `ghostel-module-auto-install'."
       ('compile  (ghostel--compile-module dir))
       (_         nil))))
 
+(defun ghostel--read-module-download-version ()
+  "Prompt for a release tag to download, or nil for the latest release."
+  (let ((version (read-string
+                  (format "Ghostel module version (>= %s, empty for latest): "
+                          ghostel--minimum-module-version))))
+    (unless (string= version "")
+      (when (version< version ghostel--minimum-module-version)
+        (user-error "Version %s is older than minimum supported version %s"
+                    version ghostel--minimum-module-version))
+      version)))
+
 (defun ghostel--ask-install-action (_dir)
   "Prompt the user to choose how to install the missing native module.
 Returns \\='download, \\='compile, or nil."
-  (let* ((url (or (ghostel--module-download-url) "GitHub releases"))
+  (let* ((url (or (ghostel--module-download-url ghostel--minimum-module-version)
+                  "GitHub releases"))
          (choice (read-char-choice
                   (format "Ghostel native module not found.
 
   [d] Download pre-built binary from:
       %s
-  [c] Compile from source (requires Zig)
+  [c] Compile from source via build.sh
   [s] Skip — install manually later
 
 Choice: " url)
@@ -512,19 +532,6 @@ Choice: " url)
       (?d 'download)
       (?c 'compile)
       (?s nil))))
-
-(defun ghostel--package-version ()
-  "Return ghostel release version string, or nil.
-Reads the Version header from ghostel.el so the download URL
-matches the GitHub release tag even when MELPA rewrites the
-version to a date-based string."
-  (require 'lisp-mnt nil t)
-  (when (fboundp 'lm-header)
-    (let ((lib (or load-file-name (locate-library "ghostel.el" t))))
-      (when lib
-        (with-temp-buffer
-          (insert-file-contents lib nil 0 1024)
-          (lm-header "Version"))))))
 
 (defun ghostel--download-file (url dest)
   "Download URL to DEST.  Return non-nil on success."
@@ -549,30 +556,35 @@ version to a date-based string."
                 (kill-buffer buf))))))
     (error nil)))
 
-(defun ghostel-download-module ()
-  "Interactively download the pre-built native module for this platform."
-  (interactive)
+(defun ghostel-download-module (&optional prompt-for-version)
+  "Interactively download the pre-built native module for this platform.
+With PROMPT-FOR-VERSION, prompt for a release tag to download.
+Leaving the prompt empty downloads the latest release."
+  (interactive "P")
   (let* ((dir (file-name-directory (or load-file-name
                                        (locate-library "ghostel")
                                        buffer-file-name)))
          (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir)))
+               (concat "ghostel-module" module-file-suffix) dir))
+         (version (when prompt-for-version
+                    (ghostel--read-module-download-version)))
+         (latest-release (and prompt-for-version (null version))))
     (when (and (file-exists-p mod)
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
-    (if (ghostel--download-module dir)
+    (if (ghostel--download-module dir version latest-release)
         (progn
           (module-load mod)
           (message "ghostel: module loaded successfully"))
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
 
 (defun ghostel-module-compile ()
-  "Compile the ghostel native module by running build.sh.
+  "Compile the ghostel native module by running zig build.
 The output is shown in a *ghostel-build* compilation buffer."
   (interactive)
   (let ((default-directory (file-name-directory (or (locate-library "ghostel")
                                                     default-directory))))
-    (compile (expand-file-name "build.sh") t)))
+    (compile "zig build -Doptimize=ReleaseFast -Dcpu=baseline" t)))
 
 
 (defun ghostel--check-module-version (dir)
@@ -611,7 +623,6 @@ DIR is the module directory."
                        (concat "Native module not found: " mod
                                "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))
 
-
 ;;; Internal variables
 
 (defvar-local ghostel--term nil
