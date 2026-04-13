@@ -31,6 +31,24 @@
       (cons (string-to-number (match-string 1 info))
             (string-to-number (match-string 2 info))))))
 
+(defun ghostel-test--wait-for (proc pred &optional timeout)
+  "Poll PROC until PRED returns non-nil, or TIMEOUT seconds (default 5).
+Signal an ERT failure if TIMEOUT is reached or PROC exits before PRED
+succeeds."
+  (let* ((timeout (or timeout 5))
+         (deadline (+ (float-time) timeout))
+         result)
+    (while (and (not (setq result (funcall pred)))
+                (< (float-time) deadline)
+                (process-live-p proc))
+      (accept-process-output proc 0.05))
+    (unless result
+      (ert-fail
+       (if (process-live-p proc)
+           (format "Timed out after %.1fs waiting for predicate" timeout)
+         (format "Process %s exited before predicate succeeded" (process-name proc)))))
+    result))
+
 ;; -----------------------------------------------------------------------
 ;; Test: terminal creation
 ;; -----------------------------------------------------------------------
@@ -372,13 +390,18 @@ scrolling libghostty's viewport."
             (set-process-window-size proc 5 80)
             (set-process-query-on-exit-flag proc nil)
             ;; Wait for shell init
-            (dotimes (_ 30) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () ghostel--pending-output) 10)
             (ghostel--flush-pending-output)
             (let ((inhibit-read-only t)) (ghostel--redraw ghostel--term t))
             ;; Generate scrollback
             (dotimes (i 15)
               (process-send-string proc (format "echo clear-test-%d\n" i)))
-            (dotimes (_ 20) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda ()
+                                      (cl-some (lambda (s) (string-match-p "clear-test-14" s))
+                                               ghostel--pending-output))
+                                    10)
             ;; Do NOT manually flush — let ghostel-clear handle it
             (should (> (length ghostel--pending-output) 0))    ; pending output exists
             ;; Clear screen
@@ -715,23 +738,30 @@ than the full terminal `cols'."
             (set-process-window-size proc 25 80)
             (set-process-query-on-exit-flag proc nil)
             ;; Wait for shell init
-            (dotimes (_ 30) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (equal "" (ghostel--debug-state ghostel--term)))) 10)
             (should (process-live-p proc))                ; shell process alive
 
             ;; Run a command
             (process-send-string proc "echo GHOSTEL_TEST_OK\n")
-            (dotimes (_ 10) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (string-match-p "GHOSTEL_TEST_OK"
+                                                               (ghostel--debug-state ghostel--term))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "GHOSTEL_TEST_OK" state))) ; command output visible
 
             ;; Test typing + backspace via PTY echo
             (process-send-string proc "abc")
-            (dotimes (_ 5) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (string-match-p "abc"
+                                                               (ghostel--debug-state ghostel--term))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "abc" state)))      ; typed text visible
 
             (process-send-string proc "\x7f")
-            (dotimes (_ 5) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (string-match-p "abc"
+                                                                    (ghostel--debug-state ghostel--term)))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "ab" state))        ; backspace removed char
               (should-not (string-match-p "abc" state)))  ; no abc after BS
@@ -830,18 +860,23 @@ Mirrors the real zsh case where the directory still contains a
             (set-process-window-size proc 25 80)
             (set-process-query-on-exit-flag proc nil)
             ;; Wait for fish init (may need longer for DA query handshake)
-            (dotimes (_ 50) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (equal "" (ghostel--debug-state ghostel--term)))) 10)
             (should (process-live-p proc))
 
             ;; Type "abc" then backspace
             (process-send-string proc "abc")
-            (dotimes (_ 10) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (string-match-p "abc"
+                                                               (ghostel--debug-state ghostel--term))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "abc" state)))
 
             ;; Send backspace (\x7f) and verify it works
             (process-send-string proc "\x7f")
-            (dotimes (_ 10) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (string-match-p "abc"
+                                                                    (ghostel--debug-state ghostel--term)))))
             (ghostel--flush-pending-output)
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "ab" state))
@@ -2685,12 +2720,7 @@ ncurses apps like htop at start-up size and breaks live resize."
 
 ;;; SIGWINCH delivery tests — verify the PTY actually sends the signal
 
-(defun ghostel-test--sigwinch-wait-for (proc pred timeout)
-  "Wait up to TIMEOUT seconds for PRED to become non-nil on PROC output."
-  (let ((deadline (+ (float-time) timeout)))
-    (while (and (not (funcall pred))
-                (< (float-time) deadline))
-      (accept-process-output proc 0.05))))
+;; Uses ghostel-test--wait-for defined at the top of this file.
 
 (defconst ghostel-test--bash (executable-find "bash")
   "Absolute path to bash, or nil if not found.
@@ -2731,7 +2761,7 @@ is broken on this system."
           ;; adjust-window-size-function returns a (width . height).
           (set-process-window-size proc 30 120)
           ;; Wait up to 2 seconds for trap to fire.
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__WINCH__" output)) 2.0)
           (should (string-match-p "__WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2770,7 +2800,7 @@ printf '\\033[H\\033[2J'; exec %s"
           (sleep-for 0.3)
           (setq output "")
           (set-process-window-size proc 30 120)
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__WINCH__" output)) 2.0)
           (should (string-match-p "__WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2826,7 +2856,7 @@ while :; do sleep 0.1; done'\n")
                   ;; Emacs calls set-process-window-size with the returned size.
                   (should (equal size (cons 120 30)))
                   (set-process-window-size proc (cdr size) (car size))))))
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__CHILD_WINCH__" output)) 2.0)
           (should (string-match-p "__CHILD_WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2869,7 +2899,7 @@ foreground process group."
 while :; do sleep 0.1; done'\n")
           (sleep-for 0.5)
           (set-process-window-size proc 30 120)
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__CHILD_WINCH__" output)) 2.0)
           (should (string-match-p "__CHILD_WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2948,6 +2978,12 @@ while :; do sleep 0.1; done'\n")
   "Run only pure Elisp tests (no native module required)."
   (ert-run-tests-batch-and-exit
    `(member ,@ghostel-test--elisp-tests)))
+
+(defun ghostel-test-run-native ()
+  "Run only tests that require the native module."
+  (ert-run-tests-batch-and-exit
+   `(and "^ghostel-test-"
+         (not (member ,@ghostel-test--elisp-tests)))))
 
 (defun ghostel-test-run ()
   "Run all ghostel tests."
