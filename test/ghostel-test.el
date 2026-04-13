@@ -1970,14 +1970,123 @@ buffer and hand nil to the native module."
 ;; -----------------------------------------------------------------------
 
 ;; -----------------------------------------------------------------------
-;; Test: module version check
+;; Test: module download version selection
 ;; -----------------------------------------------------------------------
 
-(ert-deftest ghostel-test-package-version ()
-  "Test that `ghostel--package-version' returns a version string."
-  (let ((ver (ghostel--package-version)))
-    (should (stringp ver))
-    (should (string-match-p "^[0-9]+\\.[0-9]+\\.[0-9]+" ver))))
+(ert-deftest ghostel-test-module-download-url-uses-requested-version ()
+  "Requested download versions are decoupled from the package version."
+  (let ((ghostel-github-release-url "https://example.invalid/releases"))
+    (cl-letf (((symbol-function 'ghostel--module-asset-name)
+               (lambda () "ghostel-module-x86_64-linux.so")))
+      (should (equal "https://example.invalid/releases/download/v0.7.1/ghostel-module-x86_64-linux.so"
+                     (ghostel--module-download-url "0.7.1"))))))
+
+(ert-deftest ghostel-test-module-download-url-uses-latest-release ()
+  "A nil download version uses the latest release asset."
+  (let ((ghostel-github-release-url "https://example.invalid/releases"))
+    (cl-letf (((symbol-function 'ghostel--module-asset-name)
+               (lambda () "ghostel-module-x86_64-linux.so")))
+      (should (equal "https://example.invalid/releases/latest/download/ghostel-module-x86_64-linux.so"
+                     (ghostel--module-download-url nil))))))
+
+(ert-deftest ghostel-test-download-module-defaults-to-minimum-version ()
+  "Automatic downloads pin to the minimum supported native module version."
+  (let ((ghostel--minimum-module-version "0.7.1")
+        (captured-version :unset)
+        (download-dest nil))
+    (cl-letf (((symbol-function 'ghostel--module-download-url)
+               (lambda (&optional version)
+                 (setq captured-version version)
+                 "https://example.invalid/releases/download/v0.7.1/ghostel-module-x86_64-linux.so"))
+              ((symbol-function 'ghostel--download-file)
+               (lambda (_url dest)
+                 (setq download-dest dest)
+                 t))
+              ((symbol-function 'message)
+               (lambda (&rest _))))
+      (should (ghostel--download-module "C:/ghostel/"))
+      (should (equal "0.7.1" captured-version))
+      (should (equal (downcase (expand-file-name
+                                (concat "ghostel-module" module-file-suffix)
+                                "C:/ghostel/"))
+                     (downcase download-dest))))))
+
+(ert-deftest ghostel-test-download-module-prefix-uses-requested-version ()
+  "Prefix downloads pass the requested release version through unchanged."
+  (let ((ghostel--minimum-module-version "0.7.1")
+        (captured-version :unset)
+        (captured-latest nil)
+        (loaded-module nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'locate-library)
+                 (lambda (_) "C:/ghostel/ghostel.el"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) "0.8.0"))
+                ((symbol-function 'ghostel--download-module)
+                 (lambda (_dir &optional version latest-release)
+                   (setq captured-version version
+                         captured-latest latest-release)
+                   t))
+                ((symbol-function 'module-load)
+                 (lambda (path)
+                   (setq loaded-module path)))
+                ((symbol-function 'message)
+                 (lambda (&rest _))))
+        (ghostel-download-module '(4))
+        (should (equal "0.8.0" captured-version))
+        (should-not captured-latest)
+        (should (equal (downcase (expand-file-name
+                                  (concat "ghostel-module" module-file-suffix)
+                                  "C:/ghostel/"))
+                       (downcase loaded-module)))))))
+
+(ert-deftest ghostel-test-download-module-prefix-empty-uses-latest ()
+  "Prefix download treats blank input as a request for the latest release."
+  (let ((captured-version :unset)
+        (captured-latest nil)
+        (loaded-module nil))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'locate-library)
+                 (lambda (_) "C:/ghostel/ghostel.el"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) ""))
+                ((symbol-function 'ghostel--download-module)
+                 (lambda (_dir &optional version latest-release)
+                   (setq captured-version version
+                         captured-latest latest-release)
+                   t))
+                ((symbol-function 'module-load)
+                 (lambda (path)
+                   (setq loaded-module path)))
+                ((symbol-function 'message)
+                 (lambda (&rest _))))
+        (ghostel-download-module '(4))
+        (should (null captured-version))
+        (should captured-latest)
+        (should (equal (downcase (expand-file-name
+                                  (concat "ghostel-module" module-file-suffix)
+                                  "C:/ghostel/"))
+                       (downcase loaded-module)))))))
+
+(ert-deftest ghostel-test-download-module-prefix-rejects-too-old-version ()
+  "Prefix download rejects versions below the minimum supported version."
+  (let ((ghostel--minimum-module-version "0.7.1"))
+    (let ((comp-enable-subr-trampolines nil)
+          (native-comp-enable-subr-trampolines nil))
+      (cl-letf (((symbol-function 'locate-library)
+                 (lambda (_) "C:/ghostel/ghostel.el"))
+                ((symbol-function 'file-exists-p)
+                 (lambda (_) nil))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _) "0.7.0")))
+        (should-error (ghostel-download-module '(4))
+                      :type 'user-error)))))
 
 (ert-deftest ghostel-test-compile-module-invokes-zig-build ()
   "Source compilation runs zig build directly."
@@ -2787,9 +2896,14 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-project-universal-arg
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
-    ghostel-test-package-version
     ghostel-test-compile-module-invokes-zig-build
     ghostel-test-module-compile-command-uses-zig-build
+    ghostel-test-module-download-url-uses-requested-version
+    ghostel-test-module-download-url-uses-latest-release
+    ghostel-test-download-module-defaults-to-minimum-version
+    ghostel-test-download-module-prefix-uses-requested-version
+    ghostel-test-download-module-prefix-empty-uses-latest
+    ghostel-test-download-module-prefix-rejects-too-old-version
     ghostel-test-module-version-match
     ghostel-test-module-version-mismatch
     ghostel-test-module-version-newer-than-minimum

@@ -80,7 +80,8 @@ pre-built binary** or **compile from source** (controlled by
 `ghostel-module-auto-install`, default `ask`).  You can also trigger these
 manually:
 
-- `M-x ghostel-download-module` — download a pre-built binary from GitHub releases
+- `M-x ghostel-download-module` — download the minimum supported pre-built binary
+- `C-u M-x ghostel-download-module` — choose a specific release tag (leave blank for latest)
 - `M-x ghostel-module-compile` — build from source via `zig build`
 
 ## Building from source
@@ -116,10 +117,10 @@ zig build -Doptimize=ReleaseFast
 
 When installed from MELPA, `M-x ghostel-module-compile` builds the native
 module from source using `zig build`.  Zig's package manager fetches the
-ghostty dependency automatically — no git submodule needed.
+ghostty dependency automatically.
 
-Alternatively, download a **pre-built binary** via
-`M-x ghostel-download-module`.
+Alternatively, download a **pre-built binary** via `M-x ghostel-download-module`
+(or `C-u M-x ghostel-download-module` to pick a specific release).
 
 ## Shell Integration
 
