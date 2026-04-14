@@ -6,7 +6,7 @@ EVIL_DIR       ?= $(XDG_CACHE_HOME)/evil
 
 ELC := ghostel.elc ghostel-debug.elc
 
-.PHONY: all build test test-all test-evil lint melpazoid byte-compile bench bench-quick clean
+.PHONY: all build test test-native test-all test-evil lint melpazoid byte-compile bench bench-quick clean
 
 all: build test-all test-evil lint
 
@@ -23,8 +23,10 @@ build:
 test: $(ELC)
 	$(EMACS) --batch -Q -L . -l ert -l test/ghostel-test.el -f ghostel-test-run-elisp
 
-test-all: build $(ELC)
-	$(EMACS) --batch -Q -L . -l ert -l test/ghostel-test.el -f ghostel-test-run
+test-native: build $(ELC)
+	$(EMACS) --batch -Q -L . -l ert -l test/ghostel-test.el -f ghostel-test-run-native
+
+test-all: test test-native
 
 test-evil:
 	@if [ ! -d "$(EVIL_DIR)" ]; then \

@@ -31,6 +31,24 @@
       (cons (string-to-number (match-string 1 info))
             (string-to-number (match-string 2 info))))))
 
+(defun ghostel-test--wait-for (proc pred &optional timeout)
+  "Poll PROC until PRED returns non-nil, or TIMEOUT seconds (default 5).
+Signal an ERT failure if TIMEOUT is reached or PROC exits before PRED
+succeeds."
+  (let* ((timeout (or timeout 5))
+         (deadline (+ (float-time) timeout))
+         result)
+    (while (and (not (setq result (funcall pred)))
+                (< (float-time) deadline)
+                (process-live-p proc))
+      (accept-process-output proc 0.05))
+    (unless result
+      (ert-fail
+       (if (process-live-p proc)
+           (format "Timed out after %.1fs waiting for predicate" timeout)
+         (format "Process %s exited before predicate succeeded" (process-name proc)))))
+    result))
+
 ;; -----------------------------------------------------------------------
 ;; Test: terminal creation
 ;; -----------------------------------------------------------------------
@@ -158,21 +176,6 @@
       (should (string-match-p "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" state))))) ; 40 x's on row
 
 ;; -----------------------------------------------------------------------
-;; Test: scrollback
-;; -----------------------------------------------------------------------
-
-(ert-deftest ghostel-test-scrollback ()
-  "Test scrollback by overflowing visible rows."
-  (let ((term (ghostel--new 5 80 100)))
-    (dotimes (i 10)
-      (ghostel--write-input term (format "line %d\r\n" i)))
-    (let ((state (ghostel--debug-state term)))
-      (should (string-match-p "line [6-9]" state)))       ; recent lines visible
-    (ghostel--scroll term -5)
-    (let ((state (ghostel--debug-state term)))
-      (should (string-match-p "line [0-4]" state)))))     ; scrollback shows earlier lines
-
-;; -----------------------------------------------------------------------
 ;; Test: scrollback is materialized into the Emacs buffer (vterm parity)
 ;; -----------------------------------------------------------------------
 
@@ -200,6 +203,43 @@ This is the vterm-style growing-buffer model that lets `isearch' and
             ;; empty cursor row is trimmed to nothing by the renderer
             ;; and therefore contributes no additional line.
             (should (= 12 (count-lines (point-min) (point-max))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-scrollback-bootstrap-not-blank ()
+  "First-time scrollback materialization must contain actual content.
+Regression test: when the initial (mostly empty) viewport was rendered
+and then a burst of output overflowed the screen, the promotion
+optimisation incorrectly kept the stale empty rows as scrollback
+instead of fetching the real content from libghostty."
+  (let ((buf (generate-new-buffer " *ghostel-test-sb-bootstrap*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 1000))
+                 (inhibit-read-only t))
+            ;; Render the initial (nearly empty) viewport so the buffer
+            ;; has 5 rows of stale content — simulates a fresh terminal.
+            (ghostel--write-input term "$ \r\n")
+            (ghostel--redraw term t)
+            ;; Now a burst of output overflows the viewport.
+            (dotimes (i 15)
+              (ghostel--write-input term (format "line-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            ;; The scrollback region (above the viewport) must contain
+            ;; the actual output, not blank lines from the old viewport.
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "\\$ " content))   ; prompt survived
+              (should (string-match-p "line-00" content)) ; first output line
+              (should (string-match-p "line-05" content)) ; middle output line
+              ;; No blank lines in the scrollback region: every line
+              ;; before the viewport should have visible content.
+              (goto-char (point-min))
+              (let ((blank-count 0))
+                (while (and (not (eobp))
+                            (< (line-number-at-pos) (- (line-number-at-pos (point-max)) 4)))
+                  (when (looking-at-p "^$")
+                    (setq blank-count (1+ blank-count)))
+                  (forward-line 1))
+                (should (= 0 blank-count))))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-render-trims-trailing-whitespace ()
@@ -372,13 +412,18 @@ scrolling libghostty's viewport."
             (set-process-window-size proc 5 80)
             (set-process-query-on-exit-flag proc nil)
             ;; Wait for shell init
-            (dotimes (_ 30) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () ghostel--pending-output) 10)
             (ghostel--flush-pending-output)
             (let ((inhibit-read-only t)) (ghostel--redraw ghostel--term t))
             ;; Generate scrollback
             (dotimes (i 15)
               (process-send-string proc (format "echo clear-test-%d\n" i)))
-            (dotimes (_ 20) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda ()
+                                      (cl-some (lambda (s) (string-match-p "clear-test-14" s))
+                                               ghostel--pending-output))
+                                    10)
             ;; Do NOT manually flush — let ghostel-clear handle it
             (should (> (length ghostel--pending-output) 0))    ; pending output exists
             ;; Clear screen
@@ -404,25 +449,21 @@ scrolling libghostty's viewport."
         (with-current-buffer buf
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 5 80 100))
-          ;; Fill screen + scrollback with 10 lines
-          (dotimes (i 10)
-            (ghostel--write-input ghostel--term (format "line %d\r\n" i)))
-          ;; Verify content on screen and in scrollback
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should (string-match-p "line [6-9]" state)))      ; recent lines on screen
-          (ghostel--scroll ghostel--term -5)
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should (string-match-p "line [0-4]" state)))      ; early lines in scrollback
-          ;; Return to bottom and call the actual function
-          (ghostel--scroll-bottom ghostel--term)
-          (ghostel-clear-scrollback)
-          ;; Screen should be empty
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should-not (string-match-p "line [6-9]" state)))  ; screen cleared
-          ;; Scrollback should also be empty
-          (ghostel--scroll ghostel--term -10)
-          (let ((state (ghostel--debug-state ghostel--term)))
-            (should-not (string-match-p "line [0-4]" state)))) ; scrollback cleared
+          (let ((inhibit-read-only t))
+            ;; Fill screen + scrollback with 10 lines
+            (dotimes (i 10)
+              (ghostel--write-input ghostel--term (format "line %d\r\n" i)))
+            (ghostel--redraw ghostel--term t)
+            ;; Verify lines materialized in the buffer
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "line 0" content))
+              (should (string-match-p "line 9" content)))
+            ;; Clear scrollback (sends CSI 3J to libghostty)
+            (ghostel-clear-scrollback)
+            (ghostel--redraw ghostel--term t)
+            ;; Screen and scrollback should be empty
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should-not (string-match-p "line [0-9]" content)))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
@@ -715,23 +756,30 @@ than the full terminal `cols'."
             (set-process-window-size proc 25 80)
             (set-process-query-on-exit-flag proc nil)
             ;; Wait for shell init
-            (dotimes (_ 30) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (equal "" (ghostel--debug-state ghostel--term)))) 10)
             (should (process-live-p proc))                ; shell process alive
 
             ;; Run a command
             (process-send-string proc "echo GHOSTEL_TEST_OK\n")
-            (dotimes (_ 10) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (string-match-p "GHOSTEL_TEST_OK"
+                                                               (ghostel--debug-state ghostel--term))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "GHOSTEL_TEST_OK" state))) ; command output visible
 
             ;; Test typing + backspace via PTY echo
             (process-send-string proc "abc")
-            (dotimes (_ 5) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (string-match-p "abc"
+                                                               (ghostel--debug-state ghostel--term))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "abc" state)))      ; typed text visible
 
             (process-send-string proc "\x7f")
-            (dotimes (_ 5) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (string-match-p "abc"
+                                                                    (ghostel--debug-state ghostel--term)))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "ab" state))        ; backspace removed char
               (should-not (string-match-p "abc" state)))  ; no abc after BS
@@ -830,18 +878,23 @@ Mirrors the real zsh case where the directory still contains a
             (set-process-window-size proc 25 80)
             (set-process-query-on-exit-flag proc nil)
             ;; Wait for fish init (may need longer for DA query handshake)
-            (dotimes (_ 50) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (equal "" (ghostel--debug-state ghostel--term)))) 10)
             (should (process-live-p proc))
 
             ;; Type "abc" then backspace
             (process-send-string proc "abc")
-            (dotimes (_ 10) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (string-match-p "abc"
+                                                               (ghostel--debug-state ghostel--term))))
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "abc" state)))
 
             ;; Send backspace (\x7f) and verify it works
             (process-send-string proc "\x7f")
-            (dotimes (_ 10) (accept-process-output proc 0.2))
+            (ghostel-test--wait-for proc
+                                    (lambda () (not (string-match-p "abc"
+                                                                    (ghostel--debug-state ghostel--term)))))
             (ghostel--flush-pending-output)
             (let ((state (ghostel--debug-state ghostel--term)))
               (should (string-match-p "ab" state))
@@ -2405,13 +2458,13 @@ buffer and hand nil to the native module."
       (should-not scroll-bottom-called)
       (should-not ghostel--force-next-redraw))))
 
-(ert-deftest ghostel-test-scroll-forwards-mouse-tracking ()
-  "Scroll-up/down forward events when mouse tracking is active."
+(ert-deftest ghostel-test-scroll-intercept-forwards-mouse-tracking ()
+  "Scroll intercept forwards events when mouse tracking is active."
   (let ((ghostel--term 'fake)
         (ghostel--process 'fake)
         (ghostel--copy-mode-active nil)
+        (ghostel--scroll-intercept-active t)
         (mouse-event-args nil)
-        (scroll-called nil)
         ;; Fake wheel-up event at row 5, col 10
         (fake-event `(wheel-up (,(selected-window) 1 (10 . 5) 0))))
     ;; Mouse tracking active: ghostel--mouse-event returns non-nil
@@ -2419,51 +2472,57 @@ buffer and hand nil to the native module."
                (lambda (_term action button row col mods)
                  (setq mouse-event-args (list action button row col mods))
                  t))
-              ((symbol-function 'scroll-down)
-               (lambda (&optional _) (setq scroll-called t)))
               ((symbol-function 'process-live-p) (lambda (_p) t)))
-      (ghostel--scroll-up fake-event)
+      (ghostel--scroll-intercept-up fake-event)
       (should mouse-event-args)
       (should (equal 0 (nth 0 mouse-event-args)))   ; action = press
       (should (equal 4 (nth 1 mouse-event-args)))   ; button 4 = scroll up
       (should (equal 5 (nth 2 mouse-event-args)))   ; row
       (should (equal 10 (nth 3 mouse-event-args)))  ; col
-      (should-not scroll-called))
+      ;; Event should NOT be re-dispatched
+      (should ghostel--scroll-intercept-active)
+      (should-not unread-command-events))
     ;; Reset and test scroll-down with a wheel-down event
-    (setq mouse-event-args nil scroll-called nil)
+    (setq mouse-event-args nil)
     (let ((fake-down-event `(wheel-down (,(selected-window) 1 (10 . 5) 0))))
       (cl-letf (((symbol-function 'ghostel--mouse-event)
                  (lambda (_term action button row col mods)
                    (setq mouse-event-args (list action button row col mods))
                    t))
-                ((symbol-function 'scroll-up)
-                 (lambda (&optional _) (setq scroll-called t)))
                 ((symbol-function 'process-live-p) (lambda (_p) t)))
-        (ghostel--scroll-down fake-down-event)
+        (ghostel--scroll-intercept-down fake-down-event)
         (should mouse-event-args)
         (should (equal 5 (nth 1 mouse-event-args)))   ; button 5 = scroll down
-        (should-not scroll-called)))))
+        (should ghostel--scroll-intercept-active)
+        (should-not unread-command-events)))))
 
-(ert-deftest ghostel-test-scroll-fallback-no-mouse-tracking ()
-  "Scroll-up/down fall back to Emacs window scroll when mouse tracking is off."
+(ert-deftest ghostel-test-scroll-intercept-fallthrough ()
+  "Scroll intercept re-dispatches when mouse tracking is off."
   (let ((ghostel--term 'fake)
         (ghostel--process 'fake)
         (ghostel--copy-mode-active nil)
-        (scroll-down-arg nil)
-        (scroll-up-arg nil)
+        (ghostel--scroll-intercept-active t)
         (fake-up-event `(wheel-up (,(selected-window) 1 (10 . 5) 0)))
         (fake-down-event `(wheel-down (,(selected-window) 1 (10 . 5) 0))))
+    ;; Mouse tracking off: ghostel--mouse-event returns nil
     (cl-letf (((symbol-function 'ghostel--mouse-event)
                (lambda (_term _action _button _row _col _mods) nil))
-              ((symbol-function 'scroll-down)
-               (lambda (&optional n) (setq scroll-down-arg n)))
-              ((symbol-function 'scroll-up)
-               (lambda (&optional n) (setq scroll-up-arg n)))
               ((symbol-function 'process-live-p) (lambda (_p) t)))
-      (ghostel--scroll-up fake-up-event)
-      (should (equal 3 scroll-down-arg))
-      (ghostel--scroll-down fake-down-event)
-      (should (equal 3 scroll-up-arg)))))
+      ;; Test wheel-up re-dispatch
+      (ghostel--scroll-intercept-up fake-up-event)
+      ;; Intercept should be disabled so the event loop skips our map
+      (should-not ghostel--scroll-intercept-active)
+      ;; Event should be pushed back for re-processing
+      (should (equal fake-up-event (car unread-command-events)))
+      ;; Clean up for next assertion
+      (setq unread-command-events nil)
+      (ghostel--reenable-scroll-intercept)
+      ;; Test wheel-down re-dispatch
+      (ghostel--scroll-intercept-down fake-down-event)
+      (should-not ghostel--scroll-intercept-active)
+      (should (equal fake-down-event (car unread-command-events)))
+      (setq unread-command-events nil)
+      (ghostel--reenable-scroll-intercept))))
 
 (ert-deftest ghostel-test-control-key-bindings ()
   "All non-exception C-<letter> keys should be bound in ghostel-mode-map."
@@ -2476,6 +2535,26 @@ buffer and hand nil to the native module."
         (should binding))))
   ;; C-@ should also be bound (sends NUL)
   (should (lookup-key ghostel-mode-map (kbd "C-@"))))
+
+(ert-deftest ghostel-test-c-g-binding ()
+  "C-g should be bound to `ghostel-send-C-g' in ghostel-mode-map."
+  (should (eq (lookup-key ghostel-mode-map (kbd "C-g"))
+              #'ghostel-send-C-g)))
+
+(ert-deftest ghostel-test-c-g-exits-copy-mode ()
+  "C-g should be bound in copy-mode-map to exit copy mode."
+  (should (eq (lookup-key ghostel-copy-mode-map (kbd "C-g"))
+              #'ghostel-copy-mode-exit)))
+
+(ert-deftest ghostel-test-inhibit-quit ()
+  "ghostel-mode should set inhibit-quit buffer-locally."
+  (let ((buf (generate-new-buffer " *ghostel-test-inhibit-quit*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (should (eq inhibit-quit t))
+          (should (local-variable-p 'inhibit-quit)))
+      (kill-buffer buf))))
 
 (ert-deftest ghostel-test-meta-key-bindings ()
   "All non-exception M-<letter> keys should be bound in ghostel-mode-map."
@@ -2630,12 +2709,44 @@ ncurses apps like htop at start-up size and breaks live resize."
                 (should (equal '("/bin/sh" "-c") (seq-take cmd 2)))
                 (should (string-match-p "stty .* rows 43 columns 137"
                                         (nth 2 cmd)))
+                (should (string-match-p "-ixon" (nth 2 cmd)))
                 (should-not (seq-some (lambda (s) (string-prefix-p "LINES=" s))
                                       captured-env))
                 (should-not (seq-some (lambda (s) (string-prefix-p "COLUMNS=" s))
                                       captured-env))
                 (should (member "TERM=xterm-256color" captured-env))
                 (should (member "COLORTERM=truecolor" captured-env)))
+            (when (process-live-p proc)
+              (delete-process proc))))))))
+
+(ert-deftest ghostel-test-start-process-local-bash-integration-keeps-early-echo ()
+  "Local bash integration must keep `stty echo' in the wrapper.
+Old bash versions can initialize readline before the ENV-injected
+integration script runs, so input echo must be enabled before exec."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/bash")
+               (ghostel-shell-integration t)
+               (default-directory "/tmp/")
+               (proc (ghostel--start-process)))
+          (unwind-protect
+              (let ((cmd (process-command proc)))
+                (should (equal '("/bin/sh" "-c") (seq-take cmd 2)))
+                (should (string-match-p "stty .* -ixon echo\\b" (nth 2 cmd)))
+                (should (string-match-p "exec /bin/bash --posix" (nth 2 cmd)))
+                (should (member "GHOSTEL_BASH_INJECT=1" captured-env))
+                (should (seq-some (lambda (s) (string-prefix-p "ENV=" s))
+                                  captured-env)))
             (when (process-live-p proc)
               (delete-process proc))))))))
 
@@ -2684,12 +2795,7 @@ ncurses apps like htop at start-up size and breaks live resize."
 
 ;;; SIGWINCH delivery tests — verify the PTY actually sends the signal
 
-(defun ghostel-test--sigwinch-wait-for (proc pred timeout)
-  "Wait up to TIMEOUT seconds for PRED to become non-nil on PROC output."
-  (let ((deadline (+ (float-time) timeout)))
-    (while (and (not (funcall pred))
-                (< (float-time) deadline))
-      (accept-process-output proc 0.05))))
+;; Uses ghostel-test--wait-for defined at the top of this file.
 
 (defconst ghostel-test--bash (executable-find "bash")
   "Absolute path to bash, or nil if not found.
@@ -2721,15 +2827,16 @@ is broken on this system."
           ;; Install a SIGWINCH trap that prints a marker to stdout.
           (process-send-string
            proc "trap 'printf \"__WINCH__\\n\"' WINCH\n")
-          ;; Wait a bit for shell to consume the trap command.
-          (sleep-for 0.3)
+          ;; Wait for shell to start and consume the trap command.
+          ;; Bash with readline needs more startup time than /bin/sh.
+          (sleep-for 0.5)
           ;; Clear output so we only see post-resize output.
           (setq output "")
           ;; Now trigger a resize — this is what Emacs does after
           ;; adjust-window-size-function returns a (width . height).
           (set-process-window-size proc 30 120)
           ;; Wait up to 2 seconds for trap to fire.
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__WINCH__" output)) 2.0)
           (should (string-match-p "__WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2768,7 +2875,7 @@ printf '\\033[H\\033[2J'; exec %s"
           (sleep-for 0.3)
           (setq output "")
           (set-process-window-size proc 30 120)
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__WINCH__" output)) 2.0)
           (should (string-match-p "__WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2824,7 +2931,7 @@ while :; do sleep 0.1; done'\n")
                   ;; Emacs calls set-process-window-size with the returned size.
                   (should (equal size (cons 120 30)))
                   (set-process-window-size proc (cdr size) (car size))))))
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__CHILD_WINCH__" output)) 2.0)
           (should (string-match-p "__CHILD_WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2867,7 +2974,7 @@ foreground process group."
 while :; do sleep 0.1; done'\n")
           (sleep-for 0.5)
           (set-process-window-size proc 30 120)
-          (ghostel-test--sigwinch-wait-for
+          (ghostel-test--wait-for
            proc (lambda () (string-match-p "__CHILD_WINCH__" output)) 2.0)
           (should (string-match-p "__CHILD_WINCH__" output)))
       (when (and proc (process-live-p proc))
@@ -2921,9 +3028,12 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-scroll-on-input-self-insert
     ghostel-test-scroll-on-input-send-event
     ghostel-test-scroll-on-input-disabled
-    ghostel-test-scroll-forwards-mouse-tracking
-    ghostel-test-scroll-fallback-no-mouse-tracking
+    ghostel-test-scroll-intercept-forwards-mouse-tracking
+    ghostel-test-scroll-intercept-fallthrough
     ghostel-test-control-key-bindings
+    ghostel-test-c-g-binding
+    ghostel-test-c-g-exits-copy-mode
+    ghostel-test-inhibit-quit
     ghostel-test-meta-key-bindings
     ghostel-test-copy-mode-recenter
     ghostel-test-send-next-key-control-x
@@ -2946,6 +3056,12 @@ while :; do sleep 0.1; done'\n")
   "Run only pure Elisp tests (no native module required)."
   (ert-run-tests-batch-and-exit
    `(member ,@ghostel-test--elisp-tests)))
+
+(defun ghostel-test-run-native ()
+  "Run only tests that require the native module."
+  (ert-run-tests-batch-and-exit
+   `(and "^ghostel-test-"
+         (not (member ,@ghostel-test--elisp-tests)))))
 
 (defun ghostel-test-run ()
   "Run all ghostel tests."

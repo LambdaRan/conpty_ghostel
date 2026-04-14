@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.13.0
+;; Version: 0.14.0
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -265,7 +265,7 @@ When nil, falls back to `tramp-default-method'."
                  string))
 
 (defcustom ghostel-keymap-exceptions
-  '("C-c" "C-x" "C-u" "C-h" "C-g" "M-x" "M-o" "M-:" "C-\\")
+  '("C-c" "C-x" "C-u" "C-h" "M-x" "M-o" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
 These keys pass through to Emacs instead."
   :type '(repeat string))
@@ -391,7 +391,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.13.0"
+(defconst ghostel--minimum-module-version "0.14.0"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -408,9 +408,7 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function ghostel--mouse-event "ghostel-module")
 (declare-function ghostel--new "ghostel-module")
 (declare-function ghostel--redraw "ghostel-module" (term &optional full))
-(declare-function ghostel--scroll "ghostel-module")
 (declare-function ghostel--scroll-bottom "ghostel-module")
-(declare-function ghostel--scroll-top "ghostel-module")
 (declare-function ghostel--set-default-colors "ghostel-module")
 (declare-function ghostel--set-palette "ghostel-module")
 (declare-function ghostel--set-size "ghostel-module")
@@ -671,6 +669,74 @@ variable re-enables automatic renaming for the next title update.")
   "List of prompt positions as (buffer-line . exit-status) pairs.
 Used for prompt navigation and optional re-application after full redraws.")
 
+(defvar-local ghostel--scroll-intercept-active nil
+  "Non-nil when ghostel's scroll-event intercept is active.
+Used as the activation key in `emulation-mode-map-alists'.")
+
+
+
+;;; Scroll intercept via emulation-mode-map-alists
+;;
+;; We need highest-priority interception of wheel events so that terminal
+;; mouse tracking (vim, htop, etc.) receives scroll events.  When mouse
+;; tracking is off, we fall through to whatever scroll package the user
+;; has configured (ultra-scroll, pixel-scroll-precision-mode, etc.).
+
+(defun ghostel--scroll-intercept-up (event)
+  "Intercept wheel-up EVENT for terminal mouse tracking.
+If the terminal is tracking mouse events, forward as button 4.
+Otherwise, re-dispatch EVENT through the normal event loop so the
+user's scroll package handles it."
+  (interactive "e")
+  (unless (ghostel--forward-scroll-event event 4)
+    (ghostel--redispatch-scroll-event event)))
+
+(defun ghostel--scroll-intercept-down (event)
+  "Intercept wheel-down EVENT for terminal mouse tracking.
+If the terminal is tracking mouse events, forward as button 5.
+Otherwise, re-dispatch EVENT through the normal event loop so the
+user's scroll package handles it."
+  (interactive "e")
+  (unless (ghostel--forward-scroll-event event 5)
+    (ghostel--redispatch-scroll-event event)))
+
+(defun ghostel--redispatch-scroll-event (event)
+  "Re-dispatch scroll EVENT through the event loop without our intercept.
+Temporarily disables the emulation-map intercept and pushes the event
+back as unread input.  The next key-lookup therefore skips our map and
+finds the user's scroll handler.  A `pre-command-hook' re-enables the
+intercept before that handler runs, so subsequent events are intercepted
+again."
+  (setq ghostel--scroll-intercept-active nil)
+  (push event unread-command-events)
+  ;; pre-command-hook fires *after* key lookup but *before* the command,
+  ;; so the re-dispatched event is looked up with our intercept disabled
+  ;; and the intercept is back on before the next event after that.
+  (add-hook 'pre-command-hook #'ghostel--reenable-scroll-intercept nil t))
+
+(defun ghostel--reenable-scroll-intercept ()
+  "Re-enable the scroll-event intercept after a re-dispatched event."
+  (setq ghostel--scroll-intercept-active t)
+  (remove-hook 'pre-command-hook #'ghostel--reenable-scroll-intercept t))
+
+(defvar ghostel--scroll-intercept-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-4]    #'ghostel--scroll-intercept-up)
+    (define-key map [mouse-5]    #'ghostel--scroll-intercept-down)
+    (define-key map [wheel-up]   #'ghostel--scroll-intercept-up)
+    (define-key map [wheel-down] #'ghostel--scroll-intercept-down)
+    map)
+  "Keymap for `emulation-mode-map-alists' to intercept scroll events.
+Active only in ghostel buffers where `ghostel--scroll-intercept-active'
+is non-nil.")
+
+(defvar ghostel--emulation-alist
+  `((ghostel--scroll-intercept-active . ,ghostel--scroll-intercept-map))
+  "Alist for `emulation-mode-map-alists'.")
+
+(unless (memq 'ghostel--emulation-alist emulation-mode-map-alists)
+  (push 'ghostel--emulation-alist emulation-mode-map-alists))
+
 
 
 ;;; Keymap
@@ -729,6 +795,7 @@ Used for prompt navigation and optional re-application after full redraws.")
     (define-key map (kbd "C-c C-z")   #'ghostel-send-C-z)
     (define-key map (kbd "C-c C-\\")  #'ghostel-send-C-backslash)
     (define-key map (kbd "C-c C-d")   #'ghostel-send-C-d)
+    (define-key map (kbd "C-g")       #'ghostel-send-C-g)
     (define-key map (kbd "C-c C-t")   #'ghostel-copy-mode)
     (define-key map (kbd "C-c M-w")   #'ghostel-copy-all)
     (define-key map (kbd "C-c C-y")   #'ghostel-paste)
@@ -737,11 +804,6 @@ Used for prompt navigation and optional re-application after full redraws.")
     ;; Prompt navigation (OSC 133)
     (define-key map (kbd "C-c C-n")   #'ghostel-next-prompt)
     (define-key map (kbd "C-c C-p")   #'ghostel-previous-prompt)
-    ;; Mouse wheel for scrollback
-    (define-key map (kbd "<mouse-4>")       #'ghostel--scroll-up)
-    (define-key map (kbd "<mouse-5>")       #'ghostel--scroll-down)
-    (define-key map (kbd "<wheel-up>")      #'ghostel--scroll-up)
-    (define-key map (kbd "<wheel-down>")    #'ghostel--scroll-down)
     ;; Mouse click events (for terminal mouse tracking)
     (define-key map (kbd "<down-mouse-1>")  #'ghostel--mouse-press)
     (define-key map (kbd "<mouse-1>")       #'ghostel--mouse-release)
@@ -1015,6 +1077,14 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
   (interactive)
   (ghostel--send-encoded "d" "ctrl"))
 
+(defun ghostel-send-C-g ()
+  "Send \\`C-g' to the terminal.
+Clears `quit-flag' which Emacs sets when \\`C-g' is pressed with
+`inhibit-quit' non-nil."
+  (interactive)
+  (setq quit-flag nil)
+  (ghostel--send-key (string 7)))
+
 
 ;;; Paste / yank
 
@@ -1137,31 +1207,6 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             row col
                             (ghostel--mouse-mods event)))))
 
-(defun ghostel--scroll-up (&optional event)
-  "Scroll the Emacs window up (toward older scrollback).
-When the terminal has mouse tracking enabled, forward EVENT as a
-scroll event to the running application instead."
-  (interactive "e")
-  (unless (ghostel--forward-scroll-event event 4) ; button 4 = scroll up
-    (scroll-down 3)))
-
-(defun ghostel--scroll-down (&optional event)
-  "Scroll the Emacs window down (toward newer content).
-When the terminal has mouse tracking enabled, forward EVENT as a
-scroll event to the running application instead."
-  (interactive "e")
-  (unless (ghostel--forward-scroll-event event 5) ; button 5 = scroll down
-    (scroll-up 3)))
-
-(defun ghostel-copy-mode-scroll-up ()
-  "Scroll the Emacs window up by a page in copy mode."
-  (interactive)
-  (scroll-down-command))
-
-(defun ghostel-copy-mode-scroll-down ()
-  "Scroll the Emacs window down by a page in copy mode."
-  (interactive)
-  (scroll-up-command))
 
 (defun ghostel-copy-mode-previous-line ()
   "Move to the previous line in copy mode."
@@ -1270,24 +1315,19 @@ scroll event to the running application instead."
     ;; Normal letter keys exit copy mode and send the key to the terminal
     (define-key map [remap self-insert-command] #'ghostel-copy-mode-exit-and-send)
     (define-key map (kbd "C-c C-t") #'ghostel-copy-mode-exit)
+    (define-key map (kbd "C-g") #'ghostel-copy-mode-exit)
     (define-key map (kbd "M-w") #'ghostel-copy-mode-copy)
     (define-key map (kbd "C-w") #'ghostel-copy-mode-copy)
     ;; Prompt navigation works in copy mode too
     (define-key map (kbd "C-c C-n") #'ghostel-next-prompt)
     (define-key map (kbd "C-c C-p") #'ghostel-previous-prompt)
-    ;; Scrollback
-    (define-key map (kbd "<mouse-4>")       #'ghostel--scroll-up)
-    (define-key map (kbd "<mouse-5>")       #'ghostel--scroll-down)
-    (define-key map (kbd "<wheel-up>")      #'ghostel--scroll-up)
-    (define-key map (kbd "<wheel-down>")    #'ghostel--scroll-down)
-    (define-key map (kbd "M-v")             #'ghostel-copy-mode-scroll-up)
-    (define-key map (kbd "C-v")             #'ghostel-copy-mode-scroll-down)
     (define-key map (kbd "C-n")             #'ghostel-copy-mode-next-line)
     (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
     (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
     (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
     (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
     (define-key map (kbd "C-l")             #'ghostel-copy-mode-recenter)
+    (define-key map (kbd "C-c C-l")         #'ghostel-copy-mode-exit-and-clear)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.
@@ -1330,6 +1370,7 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
 (defun ghostel-copy-mode-exit ()
   "Exit copy mode and return to terminal mode."
   (interactive)
+  (setq quit-flag nil)
   (when ghostel--copy-mode-active
     (setq ghostel--copy-mode-active nil)
     (setq cursor-type ghostel--saved-cursor-type)
@@ -1346,6 +1387,12 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
     (goto-char (point-max))
     (ghostel--invalidate)
     (message "Copy mode exited")))
+
+(defun ghostel-copy-mode-exit-and-clear ()
+  "Exit copy mode and clear the scrollback."
+  (interactive)
+  (ghostel-copy-mode-exit)
+  (ghostel-clear-scrollback))
 
 (defun ghostel-copy-mode-exit-and-send ()
   "Exit copy mode and send the key that triggered exit to the terminal."
@@ -2030,7 +2077,7 @@ Returns nil on failure."
                                           "fi\n"
                                           integration))
              (list :env nil :args (list "--rcfile" path)
-                   :stty "erase '^?' iutf8 echo" :temp-files (list temp))))
+                   :stty "erase '^?' iutf8 -ixon echo" :temp-files (list temp))))
           ;; Zsh: ZDOTDIR replaces .zshenv search, so we restore it,
           ;; source the user's .zshenv, then load integration.
           ('zsh
@@ -2059,7 +2106,7 @@ Returns nil on failure."
                                           "    'builtin' 'unset' '_ghostel_file'\n"
                                           "}\n"))
              (list :env (list (format "ZDOTDIR=%s" remote-dir))
-                   :args nil :stty "erase '^?' iutf8"
+                   :args nil :stty "erase '^?' iutf8 -ixon"
                    :temp-dirs (list temp-dir))))
           ;; Fish: -C runs after config, so just source the script.
           ('fish
@@ -2070,7 +2117,7 @@ Returns nil on failure."
              (list :env nil
                    :args (list "-C" (format "source %s"
                                             (shell-quote-argument path)))
-                   :stty "erase '^?' iutf8" :temp-files (list temp))))))
+                   :stty "erase '^?' iutf8 -ixon" :temp-files (list temp))))))
     (error
      (message "ghostel: remote shell integration failed: %s"
               (error-message-string err))
@@ -2151,9 +2198,13 @@ on the remote host."
          ;;    whether \x7f means backspace.
          ;;  - iutf8: kernel-level UTF-8 awareness so backspace
          ;;    correctly erases multi-byte characters.
+         ;;  - -ixon: disable XON/XOFF flow control so C-q and C-s
+         ;;    pass through to the application instead of being
+         ;;    swallowed by the PTY line discipline.
          ;;  - echo: bash-only — readline buffers its own echo, so
-         ;;    we need PTY-level echo.  When bash integration is
-         ;;    active, the integration script handles echo.
+         ;;    we need PTY-level echo early in startup.  Old bash
+         ;;    versions (notably macOS /bin/bash 3.2) may initialize
+         ;;    readline before ENV-sourced integration runs.
          ;; The clear-screen hides the stty output.  exec replaces
          ;; the wrapper so only the shell process remains.
          (shell-args (cond
@@ -2165,10 +2216,9 @@ on the remote host."
          (stty-flags (cond
                       (remote-integration
                        (plist-get remote-integration :stty))
-                      ((and (eq (ghostel--detect-shell shell) 'bash)
-                            (not integration-env))
-                       "erase '^?' iutf8 echo")
-                      (t "erase '^?' iutf8")))
+                      ((eq shell-type 'bash)
+                       "erase '^?' iutf8 -ixon echo")
+                      (t "erase '^?' iutf8 -ixon")))
          (shell-command
           (list "/bin/sh" "-c"
                 (concat "stty " stty-flags
@@ -2381,13 +2431,17 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   (setq-local scroll-conservatively 101)
   (setq-local line-spacing 0)
   (add-function :after after-focus-change-function #'ghostel--focus-change)
-  (ghostel--suppress-interfering-modes))
+  (ghostel--suppress-interfering-modes)
+  (setq ghostel--scroll-intercept-active t)
+  ;; Let C-g reach the keymap instead of triggering keyboard-quit.
+  ;; When inhibit-quit is non-nil, C-g sets quit-flag and delivers
+  ;; the character through normal input dispatch.
+  (setq-local inhibit-quit t))
 
 (defun ghostel--suppress-interfering-modes ()
   "Disable global minor modes that interfere with ghostel.
 Suppresses `global-hl-line-mode' (and buffer-local `hl-line-mode') to
-prevent redraw flicker, and `pixel-scroll-precision-mode' so that
-wheel events reach ghostel's own scroll commands."
+prevent redraw flicker."
   ;; global-hl-line-mode: opt this buffer out by setting the variable
   ;; buffer-locally to nil (as documented in the hl-line.el commentary).
   (when (bound-and-true-p global-hl-line-mode)
@@ -2398,12 +2452,7 @@ wheel events reach ghostel's own scroll commands."
   ;; Buffer-local hl-line-mode
   (when (bound-and-true-p hl-line-mode)
     (setq ghostel--saved-hl-line-mode t)
-    (hl-line-mode -1))
-  ;; pixel-scroll-precision-mode: setting the variable buffer-locally to nil
-  ;; makes Emacs skip its minor-mode-map-alist entry for this buffer, so
-  ;; wheel-up/wheel-down reach ghostel-mode-map instead.
-  (when (bound-and-true-p pixel-scroll-precision-mode)
-    (setq-local pixel-scroll-precision-mode nil)))
+    (hl-line-mode -1)))
 
 
 ;;; Entry point

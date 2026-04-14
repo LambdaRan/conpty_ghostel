@@ -116,3 +116,48 @@ jobs:
         with:
           name: ghostel-module-${{ matrix.platform }}
           path: ghostel-module${{ matrix.suffix }}
+
+  test-native:
+    needs: build-native
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: x86_64-linux
+            suffix: .so
+            emacs_version: '29.4'
+          - os: ubuntu-latest
+            platform: x86_64-linux
+            suffix: .so
+            emacs_version: 'snapshot'
+          - os: macos-latest
+            platform: aarch64-macos
+            suffix: .dylib
+            emacs_version: '29.4'
+          - os: macos-latest
+            platform: aarch64-macos
+            suffix: .dylib
+            emacs_version: 'snapshot'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      - name: Install zsh
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y zsh
+
+      - name: Download native module
+        uses: actions/download-artifact@v4
+        with:
+          name: ghostel-module-${{ matrix.platform }}
+
+      - name: Run native module tests
+        run: |
+          emacs --batch -Q -L . \
+            -l ert \
+            -l test/ghostel-test.el \
+            -f ghostel-test-run-native
