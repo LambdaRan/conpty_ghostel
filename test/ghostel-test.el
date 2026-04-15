@@ -1860,6 +1860,36 @@ see `$ echo hi' right below the header's already-shown
         (re-search-forward "^hi" nil t)
         (should-not (get-text-property (match-beginning 0) 'invisible))))))
 
+(ert-deftest ghostel-test-compile-finalize-trims-trailing-blank-rows ()
+  "Regression: short commands leave a mostly-empty terminal grid.
+The ghostel renderer commits ~24 grid rows regardless of how much
+output the command produced, so `echo test' would otherwise end up
+with the footer ~20 rows below the real output.  Finalize must
+trim those trailing blank rows — ending the run with a single
+blank separator line before the footer matches `M-x compile'."
+  (ghostel-test--with-compile-buffer buf
+    (let ((inhibit-read-only t)
+          (ghostel-compile-finished-major-mode nil))
+      (setq ghostel-compile--command "echo test"
+            ghostel-compile--start-time (current-time)
+            ghostel-compile--running 'armed
+            ghostel-compile--scan-marker (copy-marker (point-max)))
+      ;; Simulate what the grid commits: short output plus ~20
+      ;; whitespace-only rows from unused terminal lines.
+      (insert "test\n")
+      (dotimes (_ 20) (insert "                                     \n"))
+      (ghostel-compile--finalize buf 0 (current-time))
+      ;; Between the real output line "test" and "Compilation
+      ;; finished" there must be at most one blank line (i.e. at most
+      ;; two newlines) — not the ~20 trailing grid rows we seeded.
+      (goto-char (point-min))
+      (re-search-forward "^test$")                              ; real output
+      (let ((after-test (point)))
+        (re-search-forward "Compilation finished at")
+        (goto-char (match-beginning 0))
+        (let ((gap (buffer-substring-no-properties after-test (point))))
+          (should (<= (cl-count ?\n gap) 2)))))))
+
 (ert-deftest ghostel-test-compile-finalize-hides-echoed-command-without-prompt-property ()
   "Regression: when the native renderer puts `ghostel-prompt' only
 on the prompt glyph itself and NOT on the echoed command that
@@ -4296,6 +4326,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-compile-finalize-footer-on-failure
     ghostel-test-compile-finalize-hides-prompts
     ghostel-test-compile-finalize-hides-echoed-command-without-prompt-property
+    ghostel-test-compile-finalize-trims-trailing-blank-rows
     ghostel-test-compile-finalize-colors-errors
     ghostel-test-compile-spurious-d-without-c-is-ignored
     ghostel-test-compile-on-finish-only-first-d-counts

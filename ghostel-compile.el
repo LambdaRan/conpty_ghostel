@@ -331,6 +331,22 @@ the process buffer — exactly what we don't want."
     (cancel-timer ghostel--input-timer)
     (setq ghostel--input-timer nil)))
 
+(defun ghostel-compile--trim-trailing-blanks (start)
+  "Delete trailing whitespace-only content in START..(point-max).
+The ghostel renderer commits the full terminal grid to the buffer,
+so a short command (`echo test') leaves ~24 rows of trailing
+spaces and newlines that would otherwise wedge the footer far
+below the real output.  Find the last non-whitespace position in
+the scan region and delete everything after it, leaving a single
+trailing newline so the footer's leading `\\n' produces a blank
+separator line — matching `M-x compile's output format."
+  (save-excursion
+    (goto-char (point-max))
+    (skip-chars-backward " \t\n" start)
+    (when (< (point) (point-max))
+      (delete-region (point) (point-max))
+      (insert "\n"))))
+
 (defun ghostel-compile--finalize (buffer exit end-time)
   "Insert header/footer, hide prompts, parse errors for BUFFER.
 EXIT is the command exit status; END-TIME its completion time.
@@ -361,6 +377,11 @@ same as in any compilation buffer."
                    exit (buffer-name buffer)))
         (when (and start ghostel-compile-hide-prompts)
           (ghostel-compile--hide-prompts start (point-max)))
+        ;; Strip the blank terminal-grid rows the renderer committed
+        ;; after the real output — keeps a short command's footer
+        ;; right below its output instead of 20+ rows below it.
+        (when start
+          (ghostel-compile--trim-trailing-blanks start))
         (ghostel-compile--clear-markers)
         (ghostel-compile--teardown-terminal)
         ;; Switch major mode now that the shell is dead.  Preserve state
