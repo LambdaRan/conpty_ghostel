@@ -251,8 +251,44 @@ clickable even if the program did not use OSC 8 hyperlink escapes."
 (defcustom ghostel-enable-file-detection t
   "Automatically detect and linkify file:line references in terminal output.
 When non-nil, patterns like /path/to/file.el:42 are made clickable,
-opening the file at the given line in another window."
+opening the file at the given line in another window.  Automatically
+disabled when `default-directory' is a TRAMP path, because each
+candidate would require a remote `file-exists-p' round-trip per
+redraw."
   :type 'boolean)
+
+(defcustom ghostel-file-detection-path-regex
+  "[[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']+"
+  "Regex matching the PATH portion of a file:line[:col] reference.
+This is the middle of the full detection pattern; ghostel wraps it
+with a fixed leading path-boundary anchor (line start or any
+non-path character) and a fixed `:LINE[:COL]' tail, so any match
+is guaranteed to end in `:DIGITS'.
+
+The matched path is resolved against `default-directory'; linkification
+only applies when that file exists.  The default matches absolute
+paths, explicit `./' paths, and bare relative paths containing at
+least one `/' (e.g. compiler output like `src/main.rs').  Paths
+embedded in punctuation like `(/home/user/index.js:17:5)' are
+supported via the fixed anchor.
+
+Performance: each match triggers a filesystem check on every redraw.
+Broadening this pattern (for example to match bare `file.go' without
+a `/') will cause `file-exists-p' to be called for every matching
+token, which can be expensive on slow or network filesystems (NFS,
+FUSE).  The default uses non-backtracking character classes so the
+per-redraw scan stays cheap."
+  :type 'regexp)
+
+(defconst ghostel--file-detection-leading-anchor
+  "\\(?:^\\|[^[:alnum:]_./-]\\)"
+  "Fixed anchor placed before `ghostel-file-detection-path-regex'.")
+
+(defconst ghostel--file-detection-tail
+  "\\(?::[0-9]+\\(?::[0-9]+\\)?\\)?"
+  "Fixed optional `:LINE[:COL]' tail.
+When absent, the match is linkified as a bare file/directory
+reference opened at its start.")
 
 (defcustom ghostel-module-auto-install 'ask
   "What to do when the native module is missing at load time.
@@ -1482,17 +1518,23 @@ stripped so the copied text matches the original terminal content."
 (defun ghostel--open-link (url)
   "Open URL, dispatching by scheme.
 file:// URIs open in Emacs; http(s) and other schemes use `browse-url'.
-fileref: URIs (from auto-detected file:line patterns) open the file
-at the given line in another window."
+fileref: URIs (from auto-detected file[:line[:col]] patterns) open
+the file at the given position in another window.  A fileref without
+a line suffix opens at the start of the file or directory."
   (when (and url (stringp url))
     (cond
-     ((string-match "\\`fileref:\\(.*\\):\\([0-9]+\\)\\'" url)
+     ((string-match "\\`fileref:\\(.*?\\)\\(?::\\([0-9]+\\)\\(?::\\([0-9]+\\)\\)?\\)?\\'" url)
       (let ((file (match-string 1 url))
-            (line (string-to-number (match-string 2 url))))
+            (line (and (match-string 2 url)
+                       (string-to-number (match-string 2 url))))
+            (col (and (match-string 3 url)
+                      (string-to-number (match-string 3 url)))))
         (when (file-exists-p file)
           (find-file-other-window file)
-          (goto-char (point-min))
-          (forward-line (1- line)))))
+          (when line
+            (goto-char (point-min))
+            (forward-line (1- (max 1 line)))
+            (when col (move-to-column (max 0 (1- col))))))))
      ((string-match "\\`file://\\(?:localhost\\)?\\(/.*\\)" url)
       (find-file (url-unhex-string (match-string 1 url))))
      ((string-match-p "\\`[a-z]+://" url)
@@ -1531,25 +1573,42 @@ materialized scrollback on every redraw."
                 (put-text-property beg mend 'help-echo url)
                 (put-text-property beg mend 'mouse-face 'highlight)
                 (put-text-property beg mend 'keymap ghostel-link-map))))))
-      ;; Pass 2: file:line references (e.g. "./foo.el:42" or "/tmp/bar.rs:10")
-      (when ghostel-enable-file-detection
+      ;; Pass 2: file:line[:col] references (e.g. "./foo.el:42",
+      ;; "/tmp/bar.rs:10", or bare relative paths like "src/main.rs:42:4"
+      ;; from compiler output).  The full regex is assembled from fixed anchor
+      ;; + user-tunable path + fixed `:LINE[:COL]' tail so group 1 (path) and
+      ;; group 2 (line[:col]) are always present — no nil-guarding needed in
+      ;; the hot loop.  A small hash memoizes `file-exists-p' so repeated paths
+      ;; in a redraw (common in multi-line compiler diagnostics) don't re-stat.
+      ;; Skip entirely over TRAMP: every candidate would `expand-file-name' to
+      ;; a remote path and `file-exists-p' would do a network round-trip on
+      ;; every redraw, stalling the timer on high-latency links.
+      (when (and ghostel-enable-file-detection
+                 (not (file-remote-p default-directory)))
         (goto-char begin)
-        (while (re-search-forward
-                "\\(?:\\./\\|/\\)[^ \t\n\r:\"<>]+:[0-9]+"
-                end t)
-          (let ((beg (match-beginning 0))
-                (mend (match-end 0)))
-            (unless (get-text-property beg 'help-echo)
-              (let* ((text (match-string-no-properties 0))
-                     (sep (string-match ":[0-9]+\\'" text))
-                     (path (substring text 0 sep))
-                     (line (substring text (1+ sep)))
-                     (abs-path (expand-file-name path)))
-                (when (file-exists-p abs-path)
-                  (put-text-property beg mend 'help-echo
-                                     (concat "fileref:" abs-path ":" line))
-                  (put-text-property beg mend 'mouse-face 'highlight)
-                  (put-text-property beg mend 'keymap ghostel-link-map))))))))))
+        (let ((full-regex (concat ghostel--file-detection-leading-anchor
+                                  "\\(" ghostel-file-detection-path-regex "\\)"
+                                  "\\(" ghostel--file-detection-tail "\\)"))
+              (seen (make-hash-table :test 'equal)))
+          (while (re-search-forward full-regex end t)
+            (let ((beg (match-beginning 1))
+                  (mend (match-end 2)))
+              (unless (get-text-property beg 'help-echo)
+                (let* ((path (match-string-no-properties 1))
+                       (loc (match-string-no-properties 2))
+                       (abs-path (expand-file-name path))
+                       (cached (gethash abs-path seen 'unset))
+                       (exists (if (eq cached 'unset)
+                                   (puthash abs-path (file-exists-p abs-path) seen)
+                                 cached)))
+                  (when exists
+                    (put-text-property beg mend 'help-echo
+                                       (if (> (length loc) 0)
+                                           (concat "fileref:" abs-path ":"
+                                                   (substring loc 1))
+                                         (concat "fileref:" abs-path)))
+                    (put-text-property beg mend 'mouse-face 'highlight)
+                    (put-text-property beg mend 'keymap ghostel-link-map)))))))))))
 
 
 (defun ghostel--compensate-wide-chars ()

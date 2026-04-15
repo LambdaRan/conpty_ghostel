@@ -596,11 +596,11 @@ Emacs 31.0.50:
 
 | Backend              | Plain ASCII | URL-heavy |
 |----------------------|------------:|----------:|
-| ghostel              |    65 MB/s  |  42 MB/s  |
-| ghostel (no detect)  |    64 MB/s  |  65 MB/s  |
-| vterm                |    29 MB/s  |  24 MB/s  |
-| eat                  |   3.9 MB/s  | 3.0 MB/s  |
-| term                 |   4.8 MB/s  | 4.1 MB/s  |
+| ghostel              |    70 MB/s  |  56 MB/s  |
+| ghostel (no detect)  |    70 MB/s  |  70 MB/s  |
+| vterm                |    34 MB/s  |  27 MB/s  |
+| eat                  |   4.4 MB/s  | 3.5 MB/s  |
+| term                 |   5.6 MB/s  | 4.7 MB/s  |
 
 Ghostel scans terminal output for URLs and file paths, making them clickable.
 The "no detect" row shows throughput with this detection disabled
@@ -665,7 +665,7 @@ powering Neovim's built-in terminal.
 | Drag-and-drop                 | Yes       | No      |
 | Auto module download          | Yes       | No      |
 | Scrollback default            | ~5,000    | 1,000   |
-| PTY throughput (plain ASCII)  | 65 MB/s   | 29 MB/s |
+| PTY throughput (plain ASCII)  | 70 MB/s   | 34 MB/s |
 | Default redraw rate           | ~30 fps   | ~10 fps |
 
 ### Key differences
@@ -694,9 +694,9 @@ the shell and TRAMP-aware remote directory tracking.
 
 **Performance.**  In PTY throughput benchmarks (5 MB streamed through `cat`,
 both backends configured with ~1,000 lines of scrollback), ghostel is
-roughly 2x faster than vterm on plain ASCII data (65 vs 29 MB/s).  On
-URL-heavy output ghostel still comes out ahead of vterm (42 vs 24 MB/s);
-with link detection disabled ghostel reaches 65 MB/s regardless of input.
+roughly 2x faster than vterm on plain ASCII data (70 vs 34 MB/s).  On
+URL-heavy output ghostel pulls further ahead of vterm (56 vs 27 MB/s);
+with link detection disabled ghostel reaches 70 MB/s regardless of input.
 See the [Performance](#performance) section above for full numbers and how
 to run the benchmark suite yourself.
 

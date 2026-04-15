@@ -1297,7 +1297,119 @@ the reply waits for the redraw timer."
       (cl-letf (((symbol-function 'find-file-other-window)
                  (lambda (f) (setq opened f))))
         (ghostel--open-link (format "fileref:%s:10" test-file)))
-      (should (equal test-file opened)))))                 ; fileref opens correct file
+      (should (equal test-file opened)))                   ; fileref opens correct file
+    ;; Helper: find the first fileref help-echo anywhere in the buffer.
+    (cl-flet ((find-fileref ()
+                (save-excursion
+                  (let ((pos (point-min)) found)
+                    (while (and (not found) pos (< pos (point-max)))
+                      (let ((he (get-text-property pos 'help-echo)))
+                        (when (and he (string-prefix-p "fileref:" he))
+                          (setq found he)))
+                      (setq pos (next-single-property-change
+                                 pos 'help-echo nil (point-max))))
+                    found))))
+      ;; Bare relative path (Rust/Go/TS compiler output)
+      (let ((dir (file-name-directory test-file))
+            (rel "ghostel.el"))
+        ;; Nonexistent bare relative path: no link
+        (with-temp-buffer
+          (setq default-directory dir)
+          (insert (format "   --> wrapped/%s:43\n" rel))
+          (let ((ghostel-enable-url-detection t))
+            (ghostel--detect-urls))
+          (should (null (find-fileref))))           ; nonexistent bare path skipped
+        ;; Existing bare relative path: linkified with line AND column preserved
+        (with-temp-buffer
+          (setq default-directory (file-name-parent-directory dir))
+          (insert (format "  --> %s/%s:43:4\n"
+                          (file-name-nondirectory (directory-file-name dir))
+                          rel))
+          (let ((ghostel-enable-url-detection t))
+            (ghostel--detect-urls))
+          (let ((he (find-fileref)))
+            (should (and he (string-prefix-p "fileref:" he)))
+            (should (and he (string-suffix-p ":43:4" he)))))) ; col preserved
+      ;; Path embedded in punctuation (Python traceback style) must match
+      (with-temp-buffer
+        (insert (format "  at foo (%s:10:5)\n" test-file))
+        (let ((ghostel-enable-url-detection t))
+          (ghostel--detect-urls))
+        (let ((he (find-fileref)))
+          (should (and he (string-prefix-p "fileref:" he)))   ; paren-wrapped path matched
+          (should (and he (string-suffix-p ":10:5" he)))
+          ;; Trailing `)' must NOT be absorbed into the path
+          (should (and he (not (string-suffix-p ")" he))))))
+      ;; Wrapper chars (backtick, paren, bracket, brace, quotes) around a
+      ;; path-only reference must not bleed into the match.
+      (dolist (wrap '(("`" . "`") ("(" . ")") ("[" . "]") ("{" . "}")
+                      ("'" . "'") ("\"" . "\"")))
+        (with-temp-buffer
+          (insert (format "see %s%s%s here\n" (car wrap) test-file (cdr wrap)))
+          (let ((ghostel-enable-url-detection t))
+            (ghostel--detect-urls))
+          (let ((he (find-fileref)))
+            (should (and he (string-prefix-p "fileref:" he)))
+            (should (and he (string-suffix-p test-file he)))    ; no wrapper tail
+            (should (and he (not (string-suffix-p (cdr wrap) he)))))))
+      ;; Bare filename without a slash must NOT match (avoids FS stat storms)
+      (with-temp-buffer
+        (setq default-directory (file-name-directory test-file))
+        (insert "main.go:12:5: undefined: foo\n")
+        (let ((ghostel-enable-url-detection t))
+          (ghostel--detect-urls))
+        (should (null (find-fileref))))            ; bare filename skipped
+      ;; TRAMP `default-directory' disables file detection entirely — otherwise
+      ;; every candidate would trigger a remote stat per redraw.
+      (with-temp-buffer
+        (setq default-directory "/ssh:example.com:/tmp/")
+        (insert (format "see %s here\n" test-file))
+        (let ((ghostel-enable-url-detection t))
+          (ghostel--detect-urls))
+        (should (null (find-fileref))))            ; TRAMP → detection skipped
+      ;; Custom path regex can opt into broader matching (bare filenames)
+      (with-temp-buffer
+        (setq default-directory (file-name-directory test-file))
+        (insert "ghostel.el:42 here\n")
+        (let ((ghostel-enable-url-detection t)
+              (ghostel-file-detection-path-regex
+               "[[:alnum:]_.][^ \t\n\r:\"<>]*"))
+          (ghostel--detect-urls))
+        (should (find-fileref)))                   ; custom path regex opts in
+      ;; Path-only reference (no `:line' suffix): /absolute and ./relative
+      ;; both linkify when the file exists.
+      (with-temp-buffer
+        (insert (format "see %s here\n" test-file))
+        (let ((ghostel-enable-url-detection t))
+          (ghostel--detect-urls))
+        (let ((he (find-fileref)))
+          (should (and he (string-prefix-p "fileref:" he)))
+          (should (and he (not (string-match-p ":[0-9]+\\'" he)))))) ; no line
+      ;; Path-only reference for a nonexistent file is not linkified.
+      (with-temp-buffer
+        (insert "see /no/such/path/exists here\n")
+        (let ((ghostel-enable-url-detection t))
+          (ghostel--detect-urls))
+        (should (null (find-fileref))))
+      ;; ghostel--open-link with :line:col positions the cursor
+      (let ((opened nil) (col-arg nil))
+        (cl-letf (((symbol-function 'find-file-other-window)
+                   (lambda (f) (setq opened f)))
+                  ((symbol-function 'move-to-column)
+                   (lambda (c &optional _force) (setq col-arg c))))
+          (ghostel--open-link (format "fileref:%s:10:7" test-file)))
+        (should (equal test-file opened))
+        (should (equal 6 col-arg)))                  ; :col 7 → column 6 (0-indexed)
+      ;; ghostel--open-link with path-only fileref opens the file without
+      ;; moving point past `point-min'.
+      (let ((opened nil) (moved nil))
+        (cl-letf (((symbol-function 'find-file-other-window)
+                   (lambda (f) (setq opened f)))
+                  ((symbol-function 'forward-line)
+                   (lambda (&rest _) (setq moved t))))
+          (ghostel--open-link (format "fileref:%s" test-file)))
+        (should (equal test-file opened))
+        (should (null moved))))))                    ; no line → no forward-line
 
 ;; -----------------------------------------------------------------------
 ;; Test: OSC 133 prompt marker parsing
