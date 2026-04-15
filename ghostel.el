@@ -192,6 +192,38 @@ Each function is called with two arguments: the buffer and the
 exit event string."
   :type 'hook)
 
+(defcustom ghostel-command-finish-functions nil
+  "Hook run when a shell command finishes (OSC 133 D marker).
+Each function is called with two arguments: the buffer and the
+exit status (an integer, or nil if the shell did not report one).
+
+Requires the shell to emit OSC 133 semantic prompt markers.  Bash,
+zsh, and fish shell integration bundled with ghostel emits these
+markers automatically when `ghostel-shell-integration' is enabled.
+
+The hook fires synchronously from the terminal parser, so consumers
+that need a fully rendered buffer should defer their own work via
+`run-at-time'.  Errors in hook functions are demoted to messages
+via `with-demoted-errors', so a misbehaving hook does not break
+the parser or stop later hooks — except when `debug-on-error' is
+non-nil, in which case the error is re-signalled so the debugger
+can fire (standard `with-demoted-errors' semantics)."
+  :type 'hook)
+
+(defcustom ghostel-command-start-functions nil
+  "Hook run when a shell command starts running (OSC 133 C marker).
+Each function is called with one argument: the buffer.
+
+Requires shell integration; this fires from the shell's
+preexec/DEBUG hook just before the user's command runs.  Useful
+for distinguishing a real command's lifecycle from prompt
+redraws (which emit D markers without a preceding C).
+
+Errors in hook functions are demoted to messages via
+`with-demoted-errors' (re-signalled when `debug-on-error' is
+non-nil so the debugger can fire)."
+  :type 'hook)
+
 (defcustom ghostel-eval-cmds '(("find-file" find-file)
                                ("find-file-other-window" find-file-other-window)
                                ("dired" dired)
@@ -223,8 +255,44 @@ clickable even if the program did not use OSC 8 hyperlink escapes."
 (defcustom ghostel-enable-file-detection t
   "Automatically detect and linkify file:line references in terminal output.
 When non-nil, patterns like /path/to/file.el:42 are made clickable,
-opening the file at the given line in another window."
+opening the file at the given line in another window.  Automatically
+disabled when `default-directory' is a TRAMP path, because each
+candidate would require a remote `file-exists-p' round-trip per
+redraw."
   :type 'boolean)
+
+(defcustom ghostel-file-detection-path-regex
+  "[[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']+"
+  "Regex matching the PATH portion of a file:line[:col] reference.
+This is the middle of the full detection pattern; ghostel wraps it
+with a fixed leading path-boundary anchor (line start or any
+non-path character) and a fixed `:LINE[:COL]' tail, so any match
+is guaranteed to end in `:DIGITS'.
+
+The matched path is resolved against `default-directory'; linkification
+only applies when that file exists.  The default matches absolute
+paths, explicit `./' paths, and bare relative paths containing at
+least one `/' (e.g. compiler output like `src/main.rs').  Paths
+embedded in punctuation like `(/home/user/index.js:17:5)' are
+supported via the fixed anchor.
+
+Performance: each match triggers a filesystem check on every redraw.
+Broadening this pattern (for example to match bare `file.go' without
+a `/') will cause `file-exists-p' to be called for every matching
+token, which can be expensive on slow or network filesystems (NFS,
+FUSE).  The default uses non-backtracking character classes so the
+per-redraw scan stays cheap."
+  :type 'regexp)
+
+(defconst ghostel--file-detection-leading-anchor
+  "\\(?:^\\|[^[:alnum:]_./-]\\)"
+  "Fixed anchor placed before `ghostel-file-detection-path-regex'.")
+
+(defconst ghostel--file-detection-tail
+  "\\(?::[0-9]+\\(?::[0-9]+\\)?\\)?"
+  "Fixed optional `:LINE[:COL]' tail.
+When absent, the match is linkified as a bare file/directory
+reference opened at its start.")
 
 (defcustom ghostel-module-auto-install 'ask
   "What to do when the native module is missing at load time.
@@ -276,6 +344,13 @@ If nil, search in PATH then in the ghostel package directory."
   :type '(choice (const :tag "Auto-detect" nil)
                  (file :tag "Custom path"))
   :group 'ghostel)
+
+(defcustom ghostel-ignore-cursor-change nil
+  "When non-nil, ignore terminal requests to change cursor shape or visibility.
+Useful when editor-owned cursor behavior should take precedence over
+terminal-driven cursor changes.  Copy mode restores `cursor-type' to its
+default value."
+  :type 'boolean)
 
 (defcustom ghostel-scroll-on-input t
   "Automatically scroll to the bottom when typing in the terminal.
@@ -420,7 +495,11 @@ Bump this only when the Elisp code requires a newer native module
 (defun ghostel--module-platform-tag ()
   "Return platform tag for the current system, e.g. \"x86_64-linux\".
 Returns nil if the platform is not recognized."
-  (let* ((arch (car (split-string system-configuration "-")))
+  (let* ((raw-arch (car (split-string system-configuration "-")))
+         (arch (pcase raw-arch
+                 ("amd64" "x86_64")
+                 ("arm64" "aarch64")
+                 (_ raw-arch)))
          (os (cond
               ((eq system-type 'darwin) "macos")
               ((eq system-type 'gnu/linux) "linux")
@@ -621,6 +700,7 @@ DIR is the module directory."
                        (concat "Native module not found: " mod
                                "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))
 
+
 ;;; Internal variables
 
 (defvar-local ghostel--term nil
@@ -1121,21 +1201,26 @@ Use `ghostel-yank-pop' afterwards to cycle through older kills."
 
 (defun ghostel-yank-pop ()
   "Replace the just-yanked text with the next kill ring entry.
-Must be called after `ghostel-yank' or `ghostel-yank-pop'.
-Sends backspaces to erase the previous yank, then pastes the next entry."
+After `ghostel-yank' or `ghostel-yank-pop', cycles through the
+kill ring by erasing the previous paste and inserting the next entry.
+Otherwise, opens a `completing-read' browser over `kill-ring' and
+pastes the selected entry into the terminal."
   (interactive)
-  (unless (memq last-command '(ghostel-yank ghostel-yank-pop))
-    (user-error "Previous command was not a yank"))
-  (let* ((prev-text (current-kill ghostel--yank-index t))
-         (prev-len (length prev-text)))
-    (setq ghostel--yank-index (1+ ghostel--yank-index))
-    ;; Erase previous paste: send backspaces
-    (when (and ghostel--process (process-live-p ghostel--process))
-      (process-send-string ghostel--process
-                           (make-string prev-len ?\x7f)))
-    ;; Paste the next entry
-    (ghostel--paste-text (current-kill ghostel--yank-index t))
-    (setq this-command 'ghostel-yank-pop)))
+  (if (memq last-command '(ghostel-yank ghostel-yank-pop))
+      (let* ((prev-text (current-kill ghostel--yank-index t))
+             (prev-len (length prev-text)))
+        (setq ghostel--yank-index (1+ ghostel--yank-index))
+        ;; Erase previous paste: send backspaces
+        (when (and ghostel--process (process-live-p ghostel--process))
+          (process-send-string ghostel--process
+                               (make-string prev-len ?\x7f)))
+        ;; Paste the next entry
+        (ghostel--paste-text (current-kill ghostel--yank-index t))
+        (setq this-command 'ghostel-yank-pop))
+    ;; No preceding yank: browse kill ring and paste selection
+    (when-let* ((text (completing-read "Paste from kill ring: "
+                                       kill-ring nil t)))
+      (ghostel--paste-text text))))
 
 
 ;;; Drag and drop
@@ -1457,17 +1542,23 @@ stripped so the copied text matches the original terminal content."
 (defun ghostel--open-link (url)
   "Open URL, dispatching by scheme.
 file:// URIs open in Emacs; http(s) and other schemes use `browse-url'.
-fileref: URIs (from auto-detected file:line patterns) open the file
-at the given line in another window."
+fileref: URIs (from auto-detected file[:line[:col]] patterns) open
+the file at the given position in another window.  A fileref without
+a line suffix opens at the start of the file or directory."
   (when (and url (stringp url))
     (cond
-     ((string-match "\\`fileref:\\(.*\\):\\([0-9]+\\)\\'" url)
+     ((string-match "\\`fileref:\\(.*?\\)\\(?::\\([0-9]+\\)\\(?::\\([0-9]+\\)\\)?\\)?\\'" url)
       (let ((file (match-string 1 url))
-            (line (string-to-number (match-string 2 url))))
+            (line (and (match-string 2 url)
+                       (string-to-number (match-string 2 url))))
+            (col (and (match-string 3 url)
+                      (string-to-number (match-string 3 url)))))
         (when (file-exists-p file)
           (find-file-other-window file)
-          (goto-char (point-min))
-          (forward-line (1- line)))))
+          (when line
+            (goto-char (point-min))
+            (forward-line (1- (max 1 line)))
+            (when col (move-to-column (max 0 (1- col))))))))
      ((string-match "\\`file://\\(?:localhost\\)?\\(/.*\\)" url)
       (find-file (url-unhex-string (match-string 1 url))))
      ((string-match-p "\\`[a-z]+://" url)
@@ -1506,25 +1597,42 @@ materialized scrollback on every redraw."
                 (put-text-property beg mend 'help-echo url)
                 (put-text-property beg mend 'mouse-face 'highlight)
                 (put-text-property beg mend 'keymap ghostel-link-map))))))
-      ;; Pass 2: file:line references (e.g. "./foo.el:42" or "/tmp/bar.rs:10")
-      (when ghostel-enable-file-detection
+      ;; Pass 2: file:line[:col] references (e.g. "./foo.el:42",
+      ;; "/tmp/bar.rs:10", or bare relative paths like "src/main.rs:42:4"
+      ;; from compiler output).  The full regex is assembled from fixed anchor
+      ;; + user-tunable path + fixed `:LINE[:COL]' tail so group 1 (path) and
+      ;; group 2 (line[:col]) are always present — no nil-guarding needed in
+      ;; the hot loop.  A small hash memoizes `file-exists-p' so repeated paths
+      ;; in a redraw (common in multi-line compiler diagnostics) don't re-stat.
+      ;; Skip entirely over TRAMP: every candidate would `expand-file-name' to
+      ;; a remote path and `file-exists-p' would do a network round-trip on
+      ;; every redraw, stalling the timer on high-latency links.
+      (when (and ghostel-enable-file-detection
+                 (not (file-remote-p default-directory)))
         (goto-char begin)
-        (while (re-search-forward
-                "\\(?:\\./\\|/\\)[^ \t\n\r:\"<>]+:[0-9]+"
-                end t)
-          (let ((beg (match-beginning 0))
-                (mend (match-end 0)))
-            (unless (get-text-property beg 'help-echo)
-              (let* ((text (match-string-no-properties 0))
-                     (sep (string-match ":[0-9]+\\'" text))
-                     (path (substring text 0 sep))
-                     (line (substring text (1+ sep)))
-                     (abs-path (expand-file-name path)))
-                (when (file-exists-p abs-path)
-                  (put-text-property beg mend 'help-echo
-                                     (concat "fileref:" abs-path ":" line))
-                  (put-text-property beg mend 'mouse-face 'highlight)
-                  (put-text-property beg mend 'keymap ghostel-link-map))))))))))
+        (let ((full-regex (concat ghostel--file-detection-leading-anchor
+                                  "\\(" ghostel-file-detection-path-regex "\\)"
+                                  "\\(" ghostel--file-detection-tail "\\)"))
+              (seen (make-hash-table :test 'equal)))
+          (while (re-search-forward full-regex end t)
+            (let ((beg (match-beginning 1))
+                  (mend (match-end 2)))
+              (unless (get-text-property beg 'help-echo)
+                (let* ((path (match-string-no-properties 1))
+                       (loc (match-string-no-properties 2))
+                       (abs-path (expand-file-name path))
+                       (cached (gethash abs-path seen 'unset))
+                       (exists (if (eq cached 'unset)
+                                   (puthash abs-path (file-exists-p abs-path) seen)
+                                 cached)))
+                  (when exists
+                    (put-text-property beg mend 'help-echo
+                                       (if (> (length loc) 0)
+                                           (concat "fileref:" abs-path ":"
+                                                   (substring loc 1))
+                                         (concat "fileref:" abs-path)))
+                    (put-text-property beg mend 'mouse-face 'highlight)
+                    (put-text-property beg mend 'keymap ghostel-link-map)))))))))))
 
 
 (defun ghostel--compensate-wide-chars ()
@@ -1577,11 +1685,31 @@ not here.  This handler only tracks prompt positions and exit status."
      ;; Prompt start — record line number.
      (push (cons (count-lines (point-min) (point-max)) nil)
            ghostel--prompt-positions))
+    ("C"
+     ;; Command output start — notify `ghostel-command-start-functions'.
+     (ghostel--run-hook-safely 'ghostel-command-start-functions
+                               (current-buffer)))
     ("D"
-     ;; Command finished — store exit status on the most recent entry.
-     (when (and ghostel--prompt-positions param)
-       (setcdr (car ghostel--prompt-positions)
-               (string-to-number param))))))
+     ;; Command finished — store exit status on the most recent entry
+     ;; and notify `ghostel-command-finish-functions'.
+     (let ((exit (and param (string-to-number param))))
+       (when (and ghostel--prompt-positions param)
+         (setcdr (car ghostel--prompt-positions) exit))
+       (ghostel--run-hook-safely 'ghostel-command-finish-functions
+                                 (current-buffer) exit)))))
+
+(defun ghostel--run-hook-safely (hook &rest args)
+  "Run HOOK with ARGS, isolating errors per handler.
+Each handler is wrapped in `with-demoted-errors' so a raising
+handler logs and the remaining hooks still run.  As with the rest
+of Emacs, `with-demoted-errors' re-signals when `debug-on-error'
+is non-nil so the debugger fires for hook authors who want it."
+  (run-hook-wrapped
+   hook
+   (lambda (fn)
+     (with-demoted-errors "ghostel: error in hook: %S"
+       (apply fn args))
+     nil)))
 
 (defun ghostel--prompt-input-start ()
   "From the start of a prompt line, move past the prompt marker to user input.
@@ -1731,8 +1859,10 @@ buffer has not been manually renamed by the user."
   "Set the cursor style based on terminal state.
 STYLE is one of: 0=bar, 1=block, 2=underline, 3=hollow-block.
 VISIBLE is t or nil.
-Skipped when copy mode is active because copy mode manages its own cursor."
-  (unless ghostel--copy-mode-active
+Skipped when copy mode is active because copy mode manages its own
+cursor, or when `ghostel-ignore-cursor-change' is non-nil."
+  (unless (or ghostel--copy-mode-active
+              ghostel-ignore-cursor-change)
     (setq cursor-type
           (if visible
               (pcase style
@@ -2368,7 +2498,11 @@ interrupted by live output updating the terminal cursor."
                          (line-beginning-position)))))
             (dolist (win (get-buffer-window-list buffer nil t))
               (when (and vs (>= pt vs))
-                (set-window-start win vs t))
+                (set-window-start win vs t)
+                ;; Reset any pixel vscroll offset left behind by
+                ;; `pixel-scroll-precision-mode'; otherwise the top
+                ;; line stays partially clipped after a redraw.
+                (set-window-vscroll win 0 t))
               (set-window-point win pt))))))))
 
 (defun ghostel-force-redraw ()

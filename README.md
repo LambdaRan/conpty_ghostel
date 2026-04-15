@@ -19,6 +19,7 @@ process, keymap, and buffer.
   - [TRAMP (Remote Terminals)](#tramp-remote-terminals)
 - [Configuration](#configuration)
 - [Commands](#commands)
+  - [Compilation mode](#compilation-mode)
 - [Running Tests](#running-tests)
 - [Performance](#performance)
 - [Ghostel vs vterm](#ghostel-vs-vterm)
@@ -393,6 +394,7 @@ individual faces with `M-x customize-face`.
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
 | `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
+| `ghostel-ignore-cursor-change`   | `nil`                | Ignore terminal-driven cursor shape/visibility changes   |
 | `ghostel-keymap-exceptions`      | `("C-c" "C-x" ...)` | Keys passed through to Emacs                             |
 | `ghostel-exit-functions`         | `nil`                | Hook run when the shell process exits                    |
 
@@ -456,6 +458,110 @@ with a project-prefixed buffer name.  To make it available from
 (add-to-list 'project-switch-commands '(ghostel-project "Ghostel") t)
 ```
 
+### Compilation mode
+
+`ghostel-compile` runs a shell command in a ghostel buffer and presents
+the result like `M-x compile` — `compilation-mode`-style header,
+footer, error highlighting, and `next-error` navigation — but backed by
+a real TTY so programs that probe `isatty(3)` (coloured output, progress
+bars, curses tools) behave as they do in a normal shell.
+
+```elisp
+(require 'ghostel-compile)
+
+(global-set-key (kbd "C-c c") #'ghostel-compile)
+```
+
+Commands:
+
+| Command                 | Description                                         |
+|-------------------------|-----------------------------------------------------|
+| `M-x ghostel-compile`   | Prompt for a command and run it (uses `compile-command`) |
+| `M-x ghostel-recompile` | Re-run the last command in its original directory   |
+
+What a run looks like — the buffer text matches `M-x compile`:
+
+```
+-*- mode: ghostel-compile -*-
+Compilation started at Wed Apr 15 08:30:11
+
+make -j4 test
+
+...command output (live, with full TTY)...
+
+Compilation finished at Wed Apr 15 08:30:19, duration 8.20 s
+```
+
+When the command finishes, the live shell and ghostel renderer are torn
+down and the buffer's major mode is switched to `ghostel-compile-view-mode`
+(derived from `compilation-mode`).  The buffer becomes a regular,
+read-only Emacs buffer with compile-mode's coloured error / line-number
+faces; the buffer never returns to an interactive ghostel terminal —
+a recompile discards it and starts fresh in the original directory.
+Point stays at the end of the output (where the renderer left it) so
+you see the latest output and the footer rather than jumping to the
+top.  `mode-line-process` shows `:run` while the command is running
+and `:exit [N]` afterwards, using the same faces `M-x compile` uses.
+
+Keybindings (in `ghostel-compile-view-mode`):
+
+| Key             | Action                                                  |
+|-----------------|---------------------------------------------------------|
+| `g`             | Re-run via `ghostel-recompile`                          |
+| `n` / `p`       | Move point to next / previous error (no auto-open)      |
+| `RET` / `mouse-2` | Jump to the source of the error under point           |
+| `M-g n` / `M-g p` | Standard `next-error` / `previous-error`              |
+| `C-c C-c`       | `compile-goto-error` (same as RET)                      |
+
+These standard `compile` options are honoured:
+
+- **`compile-command` / `compile-history`** — shared with `M-x compile`.
+  The prompt defaults to `compile-command`, the chosen command is
+  written back, and the history list is `compile-history`, so recent
+  commands round-trip between the two commands.
+- **`compilation-read-command`** — when nil, `ghostel-compile` runs
+  `compile-command` silently; pass a prefix arg to force the prompt.
+- **`compilation-ask-about-save`** — modified buffers are offered for
+  saving before launching.
+- **`compilation-auto-jump-to-first-error`** — jumps to the first error
+  after parsing.
+- **`compilation-finish-functions`** — runs with `(buffer msg)` just
+  like with `M-x compile`.
+- Output scrolling is always on (terminal behaviour — equivalent to
+  `compilation-scroll-output` non-nil).
+
+`ghostel-recompile` runs in the directory the original `ghostel-compile`
+was invoked from, regardless of which buffer you're in when you press
+`g`.
+
+Ghostel-specific customisation:
+
+| Option                                | Effect                                                                                                          |
+|---------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| `ghostel-compile-buffer-name`         | Buffer name (default `*ghostel-compile*`)                                                                        |
+| `ghostel-compile-finished-major-mode` | Major mode to switch to after each run (default `ghostel-compile-view-mode`; set to nil to stay in `ghostel-mode`) |
+| `ghostel-compile-hide-prompts`        | Hide surrounding shell prompts (default `t`)                                                                     |
+| `ghostel-compile-clear-buffer`        | Clear the buffer before each run (default `t`)                                                                   |
+| `ghostel-compile-finish-functions`    | Ghostel-specific finish hook (runs alongside `compilation-finish-functions`)                                     |
+| `ghostel-compile-debug`               | Log every OSC 133 C/D event to `*Messages*` (default `nil`)                                                      |
+
+Completion is detected via the OSC 133 `D;<exit>` semantic prompt
+marker, so shell integration (`ghostel-shell-integration`, enabled by
+default) must be active.
+
+#### Hooks for your own integrations
+
+Outside of a compile buffer, two hooks let you react to *any* shell
+command in *any* ghostel buffer:
+
+- `ghostel-command-start-functions` — called with `(BUFFER)` when the
+  shell emits OSC 133 `C` (a command starts running).
+- `ghostel-command-finish-functions` — called with `(BUFFER EXIT-STATUS)`
+  when the shell emits OSC 133 `D` (a command finishes).
+
+Errors raised by individual hook functions are caught and logged so
+one bad consumer can't break the rest.
+
 ## Running Tests
 
 Tests use ERT.  The Makefile provides convenient targets:
@@ -490,11 +596,11 @@ Emacs 31.0.50:
 
 | Backend              | Plain ASCII | URL-heavy |
 |----------------------|------------:|----------:|
-| ghostel              |    65 MB/s  |  42 MB/s  |
-| ghostel (no detect)  |    64 MB/s  |  65 MB/s  |
-| vterm                |    29 MB/s  |  24 MB/s  |
-| eat                  |   3.9 MB/s  | 3.0 MB/s  |
-| term                 |   4.8 MB/s  | 4.1 MB/s  |
+| ghostel              |    70 MB/s  |  56 MB/s  |
+| ghostel (no detect)  |    70 MB/s  |  70 MB/s  |
+| vterm                |    34 MB/s  |  27 MB/s  |
+| eat                  |   4.4 MB/s  | 3.5 MB/s  |
+| term                 |   5.6 MB/s  | 4.7 MB/s  |
 
 Ghostel scans terminal output for URLs and file paths, making them clickable.
 The "no detect" row shows throughput with this detection disabled
@@ -559,7 +665,7 @@ powering Neovim's built-in terminal.
 | Drag-and-drop                 | Yes       | No      |
 | Auto module download          | Yes       | No      |
 | Scrollback default            | ~5,000    | 1,000   |
-| PTY throughput (plain ASCII)  | 65 MB/s   | 29 MB/s |
+| PTY throughput (plain ASCII)  | 70 MB/s   | 34 MB/s |
 | Default redraw rate           | ~30 fps   | ~10 fps |
 
 ### Key differences
@@ -588,9 +694,9 @@ the shell and TRAMP-aware remote directory tracking.
 
 **Performance.**  In PTY throughput benchmarks (5 MB streamed through `cat`,
 both backends configured with ~1,000 lines of scrollback), ghostel is
-roughly 2x faster than vterm on plain ASCII data (65 vs 29 MB/s).  On
-URL-heavy output ghostel still comes out ahead of vterm (42 vs 24 MB/s);
-with link detection disabled ghostel reaches 65 MB/s regardless of input.
+roughly 2x faster than vterm on plain ASCII data (70 vs 34 MB/s).  On
+URL-heavy output ghostel pulls further ahead of vterm (56 vs 27 MB/s);
+with link detection disabled ghostel reaches 70 MB/s regardless of input.
 See the [Performance](#performance) section above for full numbers and how
 to run the benchmark suite yourself.
 

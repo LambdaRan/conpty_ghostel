@@ -112,7 +112,10 @@ Simulates compiler output or build logs with linkifiable content."
                  "warning: unused variable at ./src/render.zig:156:13\r\n"
                  "Download: https://cdn.example.org/releases/v2.1.0/pkg.tar.gz\r\n"
                  "  File \"/opt/lib/python3/site.py\", line 73, in main\r\n"
-                 "More info: https://github.com/user/repo/issues/42\r\n"))
+                 "More info: https://github.com/user/repo/issues/42\r\n"
+                 "  --> retroact-macros/src/lib.rs:43:4\r\n"
+                 "pkg/server/handler.go:128:5: undefined: Foo\r\n"
+                 "ERROR in src/components/Button.tsx:17 TS2304: Cannot find name\r\n"))
         (parts nil)
         (total 0))
     (while (< total size)
