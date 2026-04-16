@@ -1969,6 +1969,15 @@ Downstream consumers (notably `ghostel-compile') depend on it."
                                              ghostel-compile--scan-marker (copy-marker (point-max)))
                                        (insert "/tmp/x.c:42:5: error: bad\n"))
                                      (ghostel-compile--finalize buf 1 (current-time))
+                                     ;; Force font-lock to apply faces.  Older compile.el (Emacs
+                                     ;; 28.x) relies on font-lock keywords to set
+                                     ;; `compilation-line-number' / `compilation-error' faces, so
+                                     ;; in batch mode (no `font-lock-mode' active) the digits stay
+                                     ;; bare unless we explicitly fontify.  Modern compile.el
+                                     ;; (Emacs 30+) puts the properties directly via
+                                     ;; `compilation--put-prop' and doesn't need this — but
+                                     ;; calling `font-lock-ensure' is harmless there.
+                                     (font-lock-ensure (point-min) (point-max))
                                      ;; The file-name region should carry either a `compilation-message'
                                      ;; text property or `compilation-error' face via font-lock-face.
                                      ;; Scan the whole `/tmp/x.c' match instead of pinning a point,
