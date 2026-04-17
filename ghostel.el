@@ -79,6 +79,7 @@
 (require 'cl-lib)
 (require 'project)
 (require 'term)
+(require 'text-property-search)
 (require 'tramp)
 (require 'url-parse)
 (require 'face-remap)
@@ -915,9 +916,12 @@ is non-nil.")
     (define-key map (kbd "C-c C-y")   #'ghostel-paste)
     (define-key map (kbd "C-c C-l")   #'ghostel-clear-scrollback)
     (define-key map (kbd "C-c C-q")   #'ghostel-send-next-key)
+    ;; Hyperlink navigation (OSC 8, auto-detected URLs, file:line refs)
+    (define-key map (kbd "C-c C-n")   #'ghostel-next-hyperlink)
+    (define-key map (kbd "C-c C-p")   #'ghostel-previous-hyperlink)
     ;; Prompt navigation (OSC 133)
-    (define-key map (kbd "C-c C-n")   #'ghostel-next-prompt)
-    (define-key map (kbd "C-c C-p")   #'ghostel-previous-prompt)
+    (define-key map (kbd "C-c M-n")   #'ghostel-next-prompt)
+    (define-key map (kbd "C-c M-p")   #'ghostel-previous-prompt)
     ;; Mouse click events (for terminal mouse tracking)
     (define-key map (kbd "<down-mouse-1>")  #'ghostel--mouse-press)
     (define-key map (kbd "<mouse-1>")       #'ghostel--mouse-release)
@@ -1448,9 +1452,12 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
     (define-key map (kbd "C-g") #'ghostel-copy-mode-exit)
     (define-key map (kbd "M-w") #'ghostel-copy-mode-copy)
     (define-key map (kbd "C-w") #'ghostel-copy-mode-copy)
+    ;; Hyperlink navigation works in copy mode too
+    (define-key map (kbd "C-c C-n") #'ghostel-next-hyperlink)
+    (define-key map (kbd "C-c C-p") #'ghostel-previous-hyperlink)
     ;; Prompt navigation works in copy mode too
-    (define-key map (kbd "C-c C-n") #'ghostel-next-prompt)
-    (define-key map (kbd "C-c C-p") #'ghostel-previous-prompt)
+    (define-key map (kbd "C-c M-n") #'ghostel-next-prompt)
+    (define-key map (kbd "C-c M-p") #'ghostel-previous-prompt)
     (define-key map (kbd "C-n")             #'ghostel-copy-mode-next-line)
     (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
     (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
@@ -1626,6 +1633,60 @@ a line suffix opens at the start of the file or directory."
   "Open the hyperlink at point."
   (interactive)
   (ghostel--open-link (get-text-property (point) 'help-echo)))
+
+(defun ghostel--find-next-link (from)
+  "Return start position of the first hyperlink after FROM, or nil.
+A hyperlink is any region with a non-nil `help-echo' property —
+covers OSC 8 links, auto-detected URLs, and `fileref:' references."
+  (save-excursion
+    (goto-char from)
+    (when-let* ((match (text-property-search-forward
+                        'help-echo nil (lambda (_ v) v) t)))
+      (prop-match-beginning match))))
+
+(defun ghostel--find-previous-link (from)
+  "Return start position of the first hyperlink before FROM, or nil."
+  (save-excursion
+    (goto-char from)
+    (when-let* ((match (text-property-search-backward
+                        'help-echo nil (lambda (_ v) v) t)))
+      (prop-match-beginning match))))
+
+(defun ghostel--goto-hyperlink (direction)
+  "Jump to the next/previous hyperlink.  DIRECTION is `next' or `previous'.
+Wraps around when no link is found in the requested direction.
+Signals `user-error' if the buffer has no hyperlinks at all."
+  (let* ((search (if (eq direction 'next)
+                     #'ghostel--find-next-link
+                   #'ghostel--find-previous-link))
+         (target (funcall search (point))))
+    (unless target
+      (let ((wrap-from (if (eq direction 'next) (point-min) (point-max))))
+        (setq target (funcall search wrap-from))
+        (when target (message "Wrapped"))))
+    (if target
+        (goto-char target)
+      (user-error "No hyperlinks in buffer"))))
+
+(defun ghostel-next-hyperlink (&optional n)
+  "Enter copy mode and move point to the Nth next hyperlink.
+A hyperlink is any OSC 8 link, auto-detected URL, or `file:line'
+reference in the buffer.  Wraps to `point-min' when no link is found
+after point.  Press RET to follow the link at point."
+  (interactive "p")
+  (unless ghostel--copy-mode-active
+    (ghostel-copy-mode))
+  (dotimes (_ (or n 1))
+    (ghostel--goto-hyperlink 'next)))
+
+(defun ghostel-previous-hyperlink (&optional n)
+  "Enter copy mode and move point to the Nth previous hyperlink.
+Wraps to `point-max' when no link is found before point."
+  (interactive "p")
+  (unless ghostel--copy-mode-active
+    (ghostel-copy-mode))
+  (dotimes (_ (or n 1))
+    (ghostel--goto-hyperlink 'previous)))
 
 (defun ghostel--detect-urls (&optional begin end)
   "Scan a buffer region for plain-text URLs and file:line references.

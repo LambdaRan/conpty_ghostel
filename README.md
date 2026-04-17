@@ -169,8 +169,10 @@ test "$INSIDE_EMACS" = 'ghostel'; and source "$EMACS_GHOSTEL_PATH/etc/ghostel.fi
 | `M-y`       | Yank-pop (cycle through kill ring)     |
 | `C-c C-y`   | Paste from kill ring                   |
 | `C-c C-l`   | Clear scrollback                       |
-| `C-c C-n`   | Jump to next prompt                    |
-| `C-c C-p`   | Jump to previous prompt                |
+| `C-c C-n`   | Jump to next hyperlink                 |
+| `C-c C-p`   | Jump to previous hyperlink             |
+| `C-c M-n`   | Jump to next prompt                    |
+| `C-c M-p`   | Jump to previous prompt                |
 | `C-c C-q`   | Send next key literally (escape hatch) |
 | Mouse wheel | Scroll through scrollback              |
 
@@ -189,8 +191,10 @@ Normal letter keys exit copy mode and send the key to the terminal.
 | `C-n` / `C-p` | Move line (scrolls at edges)     |
 | `M-v` / `C-v` | Scroll page up / down            |
 | `M-<` / `M->` | Jump to top / bottom of buffer   |
-| `C-c C-n`     | Jump to next prompt              |
-| `C-c C-p`     | Jump to previous prompt          |
+| `C-c C-n`     | Jump to next hyperlink           |
+| `C-c C-p`     | Jump to previous hyperlink       |
+| `C-c M-n`     | Jump to next prompt              |
+| `C-c M-p`     | Jump to previous prompt          |
 | `C-l`         | Recenter viewport                |
 | `C-c C-t`     | Exit without copying             |
 | `a`–`z`       | Exit and send key to terminal    |
@@ -231,7 +235,7 @@ history — even outside copy mode.
 ### Shell Integration
 - Automatic injection for bash, zsh, and fish — no shell RC edits needed
 - **OSC 7** — directory tracking (`default-directory` follows the shell's cwd, TRAMP-aware for remote hosts)
-- **OSC 133** — semantic prompt markers, enabling prompt-to-prompt navigation with `C-c C-n` / `C-c C-p`
+- **OSC 133** — semantic prompt markers, enabling prompt-to-prompt navigation with `C-c M-n` / `C-c M-p`
 - **OSC 2** — title tracking (buffer is renamed from the terminal title)
 - **OSC 51** — call whitelisted Emacs functions from shell scripts (see [Calling Elisp from the Shell](#calling-elisp-from-the-shell))
 - **OSC 52** — clipboard support (opt-in, for remote sessions)
@@ -443,6 +447,8 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel-send-next-key`    | Send next key literally                      |
 | `M-x ghostel-next-prompt`      | Jump to next shell prompt                    |
 | `M-x ghostel-previous-prompt`  | Jump to previous shell prompt                |
+| `M-x ghostel-next-hyperlink`   | Jump to next hyperlink (OSC 8, URL, file ref) |
+| `M-x ghostel-previous-hyperlink` | Jump to previous hyperlink                 |
 | `M-x ghostel-force-redraw`     | Force a full terminal redraw                 |
 | `M-x ghostel-debug-typing-latency` | Measure per-keystroke typing latency     |
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |

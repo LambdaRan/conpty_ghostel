@@ -1424,6 +1424,88 @@ the reply waits for the redraw timer."
         (should (equal test-file opened))
         (should (null moved))))))                    ; no line → no forward-line
 
+(ert-deftest ghostel-test-hyperlink-navigation ()
+  "Test `ghostel-next-hyperlink' / `ghostel-previous-hyperlink' search."
+  ;; Buffer layout (1-indexed positions):
+  ;;   "AAA [LINK1] BBB [LINK2] CCC"
+  ;;    123 4      5 6 7      8 9...
+  (cl-flet ((setup ()
+              (let ((buf (generate-new-buffer " *hyperlink-nav-test*")))
+                (with-current-buffer buf
+                  (insert "AAA ")                    ; 1..4
+                  (let ((l1 (point)))                ; 5
+                    (insert "LINK1")                 ; 5..9
+                    (put-text-property l1 (point) 'help-echo "https://one"))
+                  (insert " BBB ")                   ; 10..14
+                  (let ((l2 (point)))                ; 15
+                    (insert "LINK2")                 ; 15..19
+                    (put-text-property l2 (point) 'help-echo "https://two"))
+                  (insert " CCC"))                   ; 20..23
+                buf)))
+    ;; Forward from before any link lands on first link.
+    (let ((buf (setup)))
+      (unwind-protect
+          (with-current-buffer buf
+            (should (equal 5 (ghostel--find-next-link (point-min))))
+            (should (equal 5 (ghostel--find-next-link 2)))
+            ;; From inside link1, skip to link2.
+            (should (equal 15 (ghostel--find-next-link 5)))
+            (should (equal 15 (ghostel--find-next-link 7)))
+            ;; From inside link2, nothing after.
+            (should (null (ghostel--find-next-link 15)))
+            (should (null (ghostel--find-next-link 17)))
+            (should (null (ghostel--find-next-link (point-max)))))
+        (kill-buffer buf)))
+    ;; Backward.
+    (let ((buf (setup)))
+      (unwind-protect
+          (with-current-buffer buf
+            (should (equal 15 (ghostel--find-previous-link (point-max))))
+            (should (equal 15 (ghostel--find-previous-link 22)))
+            ;; From inside link2, find link1.
+            (should (equal 5 (ghostel--find-previous-link 15)))
+            (should (equal 5 (ghostel--find-previous-link 17)))
+            ;; From inside link1, nothing before.
+            (should (null (ghostel--find-previous-link 5)))
+            (should (null (ghostel--find-previous-link 7)))
+            (should (null (ghostel--find-previous-link (point-min)))))
+        (kill-buffer buf)))
+    ;; Empty buffer: no links at all.
+    (with-temp-buffer
+      (should (null (ghostel--find-next-link (point-min))))
+      (should (null (ghostel--find-previous-link (point-max)))))
+    ;; Buffer with no links but some text.
+    (with-temp-buffer
+      (insert "just some text with no links")
+      (should (null (ghostel--find-next-link (point-min))))
+      (should (null (ghostel--find-previous-link (point-max)))))
+    ;; Commands are interactive.
+    (should (commandp #'ghostel-next-hyperlink))
+    (should (commandp #'ghostel-previous-hyperlink))))
+
+(ert-deftest ghostel-test-hyperlink-navigation-wrap ()
+  "Test that `ghostel--goto-hyperlink' wraps and errors cleanly."
+  ;; Wrap: from past the last link, next jumps back to first.
+  (with-temp-buffer
+    (insert "AAA LINK1 BBB LINK2 CCC")
+    (put-text-property 5 10 'help-echo "https://one")
+    (put-text-property 15 20 'help-echo "https://two")
+    (goto-char (point-max))
+    ;; No link after point — wraps to link1.
+    (let ((inhibit-message t))
+      (ghostel--goto-hyperlink 'next))
+    (should (equal 5 (point)))
+    ;; At point-min, going backward wraps to the last link.
+    (goto-char (point-min))
+    (let ((inhibit-message t))
+      (ghostel--goto-hyperlink 'previous))
+    (should (equal 15 (point))))
+  ;; No links at all → user-error.
+  (with-temp-buffer
+    (insert "no links here at all")
+    (should-error (ghostel--goto-hyperlink 'next) :type 'user-error)
+    (should-error (ghostel--goto-hyperlink 'previous) :type 'user-error)))
+
 ;; -----------------------------------------------------------------------
 ;; Test: OSC 133 prompt marker parsing
 ;; -----------------------------------------------------------------------
