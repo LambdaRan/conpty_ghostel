@@ -2826,6 +2826,25 @@ prevent redraw flicker."
 
 ;;; Entry point
 
+(defun ghostel--init-buffer (buffer)
+  "Initialize BUFFER as a ghostel terminal if it isn't one already.
+Terminal dimensions come from BUFFER's displayed window when one
+exists, otherwise from the selected window.  The terminal resizes
+itself via `window-size-change-functions' once the buffer is
+displayed, so a mismatch at creation time self-corrects."
+  (with-current-buffer buffer
+    (unless (derived-mode-p 'ghostel-mode)
+      (ghostel-mode)
+      (setq ghostel--managed-buffer-name (buffer-name))
+      (let* ((w (or (get-buffer-window buffer t) (selected-window)))
+             (height (if (window-live-p w) (window-body-height w) 24))
+             (width  (if (window-live-p w) (window-max-chars-per-line w) 80)))
+        (setq ghostel--term
+              (ghostel--new height width ghostel-max-scrollback))
+        (setq ghostel--term-rows height)
+        (ghostel--apply-palette ghostel--term))
+      (ghostel--start-process))))
+
 ;;;###autoload
 (defun ghostel (&optional arg)
   "Start a new Ghostel terminal.  If the buffer already exists, switch to it.
@@ -2845,16 +2864,7 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
                        (get-buffer-create ghostel-buffer-name)))))
     (pop-to-buffer buffer (append display-buffer--same-window-action
                                   '((category . comint))))
-    (unless (derived-mode-p 'ghostel-mode)
-      (ghostel-mode)
-      (setq ghostel--managed-buffer-name (buffer-name))
-      (let* ((height (window-body-height))
-             (width (window-max-chars-per-line)))
-        (setq ghostel--term
-              (ghostel--new height width ghostel-max-scrollback))
-        (setq ghostel--term-rows height)
-        (ghostel--apply-palette ghostel--term))
-      (ghostel--start-process))))
+    (ghostel--init-buffer buffer)))
 
 (defun ghostel-exec (buffer program &optional args)
   "Run PROGRAM with ARGS as a ghostel terminal in BUFFER.

@@ -580,10 +580,18 @@ happens to be current after the kill."
         existing
       (when existing
         (kill-buffer existing))
-      (let ((ghostel-buffer-name ghostel-compile-buffer-name)
-            (default-directory dir))
-        (ghostel))
-      (get-buffer ghostel-compile-buffer-name))))
+      ;; Create the buffer without displaying it — `ghostel-compile'
+      ;; places it via `display-buffer' afterwards.  Going through the
+      ;; interactive `ghostel' command would `pop-to-buffer' here,
+      ;; which hijacks the caller's window *and* pollutes the window's
+      ;; previous-buffers history (making later `display-buffer' calls
+      ;; pick the same window via `display-buffer-in-previous-window').
+      (ghostel--load-module t)
+      (let ((buffer (get-buffer-create ghostel-compile-buffer-name)))
+        (with-current-buffer buffer
+          (setq-local default-directory dir))
+        (ghostel--init-buffer buffer)
+        buffer))))
 
 
 ;;; Public `ghostel-compile' entry point
@@ -643,8 +651,7 @@ Requires shell integration; see `ghostel-shell-integration'."
             ghostel-compile--scan-marker nil)
       (ghostel-compile--set-mode-line-running)
       (ghostel--flush-output (concat command "\n")))
-    (pop-to-buffer buffer (append display-buffer--same-window-action
-                                  '((category . comint))))))
+    (display-buffer buffer '(nil (allow-no-window . t)))))
 
 (defun ghostel-recompile (&optional edit-command)
   "Re-run the last `ghostel-compile' command in its original directory.
