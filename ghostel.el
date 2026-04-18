@@ -2433,6 +2433,16 @@ matches the PTY window size, and stores the process in
             "COLORTERM=truecolor")
            extra-env
            process-environment))
+         ;; Large TUI redraws (Claude Code, pi on resize) can emit
+         ;; hundreds of KB in one write.  Before Emacs 31,
+         ;; `process-adaptive-read-buffering' defaults to t and
+         ;; throttles the filter to ~40 KB/s for bursty processes,
+         ;; making resize feel like a slow cascade.
+         ;; Also raise the per-read cap so one filter call can
+         ;; consume a full redraw frame.  Both are captured at
+         ;; `make-process' time, so they must be let-bound here.
+         (process-adaptive-read-buffering nil)
+         (read-process-output-max (max read-process-output-max (* 1024 1024)))
          (proc (make-process
                 :name "ghostel"
                 :buffer (current-buffer)

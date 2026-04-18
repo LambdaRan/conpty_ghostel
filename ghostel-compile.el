@@ -467,6 +467,9 @@ local machine happens to have)."
                         ;; Defeat pagers (git grep, etc.).
                         "PAGER=")
                   (copy-sequence process-environment)))
+         ;; See `ghostel--spawn-pty' for why these are set.
+         (process-adaptive-read-buffering nil)
+         (read-process-output-max (max read-process-output-max (* 1024 1024)))
          (proc (make-process
                 :name "ghostel-compile"
                 :buffer buffer

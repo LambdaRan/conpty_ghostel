@@ -5176,6 +5176,49 @@ integration script runs, so input echo must be enabled before exec."
             (when (process-live-p proc)
               (delete-process proc))))))))
 
+(ert-deftest ghostel-test-spawn-pty-disables-adaptive-read-buffering ()
+  "`ghostel--spawn-pty' must disable adaptive read buffering and raise
+`read-process-output-max'.  Before Emacs 31 the former defaulted to t
+and throttled bursty TUI redraws."
+  (let ((captured-adaptive 'unset)
+        (captured-max nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-adaptive process-adaptive-read-buffering
+                       captured-max read-process-output-max)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let ((proc (ghostel--spawn-pty "/bin/sh" nil 24 80
+                                        "-ixon" nil nil)))
+          (unwind-protect
+              (progn
+                (should (null captured-adaptive))
+                (should (>= captured-max (* 1024 1024))))
+            (when (process-live-p proc)
+              (delete-process proc))))))))
+
+(ert-deftest ghostel-test-compile-spawn-disables-adaptive-read-buffering ()
+  "`ghostel-compile--spawn' must disable adaptive read buffering and
+raise `read-process-output-max'.  Same reason as
+`ghostel--spawn-pty' (issue #85)."
+  (let ((captured-adaptive 'unset)
+        (captured-max nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-adaptive process-adaptive-read-buffering
+                       captured-max read-process-output-max)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let ((proc (ghostel-compile--spawn "true" (current-buffer) 24 80)))
+          (unwind-protect
+              (progn
+                (should (null captured-adaptive))
+                (should (>= captured-max (* 1024 1024))))
+            (when (process-live-p proc)
+              (delete-process proc))))))))
+
 ;; -----------------------------------------------------------------------
 ;; Tests: window resize
 ;; -----------------------------------------------------------------------
