@@ -239,6 +239,7 @@ history — even outside copy mode.
 - **OSC 2** — title tracking (buffer is renamed from the terminal title)
 - **OSC 51** — call whitelisted Emacs functions from shell scripts (see [Calling Elisp from the Shell](#calling-elisp-from-the-shell))
 - **OSC 52** — clipboard support (opt-in, for remote sessions)
+- **OSC 9 / OSC 777** — desktop notifications and ConEmu progress reports (percentage shown in the mode line; see [Notifications and Progress](#notifications-and-progress))
 - `INSIDE_EMACS` and `EMACS_GHOSTEL_PATH` environment variables
 
 ### TRAMP (Remote Terminals)
@@ -358,6 +359,64 @@ if [[ "$INSIDE_EMACS" = 'ghostel' ]]; then
 fi
 ```
 
+### Notifications and Progress
+
+Ghostel recognises two notification protocols used by terminal programs:
+
+- **OSC 9** (iTerm2 form): `ESC ] 9 ; BODY ST` — body only.
+- **OSC 777** (rxvt `notify`): `ESC ] 777 ; notify ; TITLE ; BODY ST` — title + body.
+
+Both route to `ghostel-notification-function` with `(TITLE BODY)`.  The
+default handler, `ghostel-default-notify`, uses the
+[alert](https://github.com/jwiegley/alert) package when installed — it
+picks a sensible backend per platform (`osascript` on macOS, libnotify
+on Linux, Growl, terminal-notifier, etc.) and is configurable via
+`alert-default-style`.  Install it from MELPA with `M-x package-install
+RET alert RET`.
+
+When `alert` isn't available, ghostel falls back to `message`, which
+only appears in the echo area.  Set `ghostel-notification-function` to
+nil to silence notifications entirely, or to your own function to route
+them elsewhere.
+
+ConEmu's **OSC 9;4** progress protocol is also recognised: build tools,
+AI agents like Claude Code, and other long-running commands emit it to
+report completion percentage.  Ghostel dispatches these to
+`ghostel-progress-function` with `(STATE PROGRESS)` where STATE is one of
+`remove`, `set`, `error`, `indeterminate`, `pause` and PROGRESS is an
+integer 0-100 or nil.  The default handler, `ghostel-default-progress`,
+updates `mode-line-process` in the terminal buffer:
+
+- `[42%]` — running at 42% done
+- `[...]` — indeterminate progress
+- `[err 73%]` — error (shown in the `error` face)
+- `[paused 25%]` — paused
+- (cleared) — removed
+
+#### Example: spinner.el in the mode line
+
+For a fancier visual indicator during indeterminate progress, swap
+`ghostel-progress-function` for a handler backed by
+[spinner.el](https://github.com/Malabarba/spinner.el):
+
+```elisp
+(require 'spinner)
+(defvar-local my/ghostel-spinner nil)
+(defun my/ghostel-progress (state progress)
+  (pcase state
+    ((or 'set 'indeterminate)
+     (unless my/ghostel-spinner
+       (setq my/ghostel-spinner (spinner-create 'progress-bar t))
+       (spinner-start my/ghostel-spinner))
+     (when (eq state 'set)
+       (setq mode-line-process (format " [%d%%]" (or progress 0)))))
+    ((or 'remove 'error 'pause)
+     (when my/ghostel-spinner
+       (spinner-stop my/ghostel-spinner)
+       (setq my/ghostel-spinner nil)))))
+(setq ghostel-progress-function #'my/ghostel-progress)
+```
+
 ### Color Palette
 
 The 16 ANSI colors are defined as Emacs faces inheriting from `term-color-*`:
@@ -397,6 +456,8 @@ individual faces with `M-x customize-face`.
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
+| `ghostel-notification-function`  | `ghostel-default-notify` | Handler for OSC 9 / OSC 777 desktop notifications (nil disables) |
+| `ghostel-progress-function`      | `ghostel-default-progress` | Handler for OSC 9;4 ConEmu progress reports (nil disables) |
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
 | `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
 | `ghostel-ignore-cursor-change`   | `nil`                | Ignore terminal-driven cursor shape/visibility changes   |

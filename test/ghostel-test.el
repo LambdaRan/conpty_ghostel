@@ -1084,6 +1084,360 @@ Mirrors the real zsh case where the directory still contains a
       (ghostel--write-input term "\e]52;c;?\e\\")
       (should (equal nil kill-ring)))))                     ; osc52 query ignored
 
+(ert-deftest ghostel-test-osc9-notification ()
+  "OSC 9 iTerm2-style notifications reach `ghostel-notification-function'."
+  (let ((term (ghostel--new 25 80 1000))
+        (calls nil))
+    (cl-letf (((symbol-function 'ghostel--handle-notification)
+               (lambda (title body) (push (cons title body) calls))))
+      ;; Plain iTerm2 notification, ST terminator.
+      (ghostel--write-input term "\e]9;Hello world\e\\")
+      (should (equal '(("" . "Hello world")) calls))
+
+      ;; BEL terminator
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;bell form\a")
+      (should (equal '(("" . "bell form")) calls))
+
+      ;; Single-character body
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;X\e\\")
+      (should (equal '(("" . "X")) calls))
+
+      ;; Empty payload: no dispatch
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;\e\\")
+      (should (equal nil calls)))))
+
+(ert-deftest ghostel-test-osc9-conemu-suppressed ()
+  "ConEmu OSC 9 sub-codes must not fire a notification.
+Covers the forms that ghostty-vt's parser accepts as valid ConEmu
+sequences (sleep, message box, tab title, wait input, emulation
+mode, prompt start).  Payloads that ghostty-vt rejects fall through
+to the notification path — see `ghostel-test-osc9-invalid-conemu-notifies'."
+  (let ((term (ghostel--new 25 80 1000))
+        (calls nil))
+    (cl-letf (((symbol-function 'ghostel--handle-notification)
+               (lambda (title body) (push (cons title body) calls)))
+              ((symbol-function 'ghostel--osc-progress)
+               (lambda (_s _p) nil)))
+      ;; 9;1;<ms> sleep, 9;2;<msg> message box, 9;3;<title> tab title
+      (ghostel--write-input term "\e]9;1;500\e\\")
+      (ghostel--write-input term "\e]9;2;hello\e\\")
+      (ghostel--write-input term "\e]9;3;tab\e\\")
+      ;; 9;5 wait-input, 9;12 prompt start
+      (ghostel--write-input term "\e]9;5\e\\")
+      (ghostel--write-input term "\e]9;12\e\\")
+      ;; 9;10 xterm emulation — bare and with valid args 0-3
+      (ghostel--write-input term "\e]9;10\e\\")
+      (ghostel--write-input term "\e]9;10;0\e\\")
+      (ghostel--write-input term "\e]9;10;3\e\\")
+      ;; Trailing bytes after a valid first-arg digit are tolerated
+      ;; (matches ghostty-vt).
+      (ghostel--write-input term "\e]9;10;01\e\\")
+      (ghostel--write-input term "\e]9;10;3x\e\\")
+      (should (equal nil calls)))))
+
+(ert-deftest ghostel-test-osc9-invalid-conemu-notifies ()
+  "Malformed ConEmu payloads fall through to notification.
+Mirrors ghostty-vt's parser: e.g. `9;10;4' and `9;10;abc' are
+invalid emulation args and surface as notifications with the raw
+payload as body."
+  (let ((term (ghostel--new 25 80 1000))
+        (calls nil))
+    (cl-letf (((symbol-function 'ghostel--handle-notification)
+               (lambda (title body) (push (cons title body) calls)))
+              ((symbol-function 'ghostel--osc-progress)
+               (lambda (_s _p) nil)))
+      (ghostel--write-input term "\e]9;10;4\e\\")
+      (should (equal '(("" . "10;4")) calls))
+
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;10;\e\\")
+      (should (equal '(("" . "10;")) calls))
+
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;10;abc\e\\")
+      (should (equal '(("" . "10;abc")) calls))
+
+      ;; Realistic iTerm2 notifications whose body starts with "5" or
+      ;; "12" must not be swallowed by the ConEmu wait-input / prompt
+      ;; sub-codes (which only accept the bare form).
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;5 minutes left\e\\")
+      (should (equal '(("" . "5 minutes left")) calls))
+
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;12 monkeys\e\\")
+      (should (equal '(("" . "12 monkeys")) calls)))))
+
+(ert-deftest ghostel-test-osc9-cwd-routing ()
+  "OSC 9;9;PATH updates the terminal's working directory.
+ConEmu's CWD-reporting alias is routed through libghostty's `setPwd'
+\(the same plumbing OSC 7 uses), so `ghostel--get-pwd' reflects the
+reported path and no notification fires."
+  (let ((term (ghostel--new 25 80 1000))
+        (notifs nil))
+    (cl-letf (((symbol-function 'ghostel--handle-notification)
+               (lambda (title body) (push (cons title body) notifs))))
+      (ghostel--write-input term "\e]9;9;/tmp/ghostel-cwd\e\\")
+      (should (equal "/tmp/ghostel-cwd" (ghostel--get-pwd term)))
+      (should (equal nil notifs)))))
+
+(ert-deftest ghostel-test-osc9-progress ()
+  "OSC 9;4 progress reports reach `ghostel-progress-function'."
+  (let ((term (ghostel--new 25 80 1000))
+        (calls nil))
+    (cl-letf (((symbol-function 'ghostel--osc-progress)
+               (lambda (state progress) (push (list state progress) calls))))
+      ;; set, with progress
+      (ghostel--write-input term "\e]9;4;1;50\e\\")
+      (should (equal '(("set" 50)) calls))
+
+      ;; set without progress defaults to 0 (matches ghostty-vt)
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;1\e\\")
+      (should (equal '(("set" 0)) calls))
+
+      ;; remove
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;0\e\\")
+      (should (equal '(("remove" nil)) calls))
+
+      ;; remove ignores trailing progress (matches ghostty-vt's "remove
+      ;; ignores progress" test)
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;0;100\e\\")
+      (should (equal '(("remove" nil)) calls))
+
+      ;; error without progress
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;2\e\\")
+      (should (equal '(("error" nil)) calls))
+
+      ;; error with progress
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;2;73\e\\")
+      (should (equal '(("error" 73)) calls))
+
+      ;; indeterminate
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;3\e\\")
+      (should (equal '(("indeterminate" nil)) calls))
+
+      ;; indeterminate ignores trailing progress
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;3;50\e\\")
+      (should (equal '(("indeterminate" nil)) calls))
+
+      ;; pause with progress
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;4;25\e\\")
+      (should (equal '(("pause" 25)) calls))
+
+      ;; Trailing semicolon is tolerated (9;4;0;)
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;0;\e\\")
+      (should (equal '(("remove" nil)) calls))
+
+      ;; Progress overflow clamps to 100
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;1;999\e\\")
+      (should (equal '(("set" 100)) calls))
+
+      ;; Huge numbers beyond u16 still parse and clamp (would overflow
+      ;; u16, but parser uses u64).
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;1;99999999999\e\\")
+      (should (equal '(("set" 100)) calls))
+
+      ;; Non-numeric progress: value falls back to the state's default
+      ;; (0 for set, nil for error/pause).
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;1;foo\e\\")
+      (should (equal '(("set" 0)) calls))
+      (setq calls nil)
+      (ghostel--write-input term "\e]9;4;2;foo\e\\")
+      (should (equal '(("error" nil)) calls)))))
+
+(ert-deftest ghostel-test-osc-progress-dispatch ()
+  "`ghostel--osc-progress' converts the state string to a symbol."
+  (let ((calls nil))
+    (let ((ghostel-progress-function
+           (lambda (state progress) (push (list state progress) calls))))
+      (ghostel--osc-progress "set" 42)
+      (should (equal '((set 42)) calls))
+      (setq calls nil)
+      (ghostel--osc-progress "remove" nil)
+      (should (equal '((remove nil)) calls))
+      ;; Unknown state strings are dropped without invoking the handler
+      ;; (defends against a Zig-side typo polluting the obarray).
+      (setq calls nil)
+      (ghostel--osc-progress "bogus" 1)
+      (should (equal nil calls)))
+    ;; nil function → no call, no error
+    (let ((ghostel-progress-function nil))
+      (should-not (ghostel--osc-progress "set" 10)))))
+
+(ert-deftest ghostel-test-osc777-notification ()
+  "OSC 777 `notify;TITLE;BODY' reaches `ghostel-notification-function'."
+  (let ((term (ghostel--new 25 80 1000))
+        (calls nil))
+    (cl-letf (((symbol-function 'ghostel--handle-notification)
+               (lambda (title body) (push (cons title body) calls))))
+      (ghostel--write-input term "\e]777;notify;Subject;Body text\e\\")
+      (should (equal '(("Subject" . "Body text")) calls))
+
+      ;; BEL terminator
+      (setq calls nil)
+      (ghostel--write-input term "\e]777;notify;T;B\a")
+      (should (equal '(("T" . "B")) calls))
+
+      ;; Empty title, empty body
+      (setq calls nil)
+      (ghostel--write-input term "\e]777;notify;;\e\\")
+      (should (equal '(("" . "")) calls))
+
+      ;; Unknown extension is dropped
+      (setq calls nil)
+      (ghostel--write-input term "\e]777;bogus;a;b\e\\")
+      (should (equal nil calls)))))
+
+(ert-deftest ghostel-test-notification-dispatch ()
+  "`ghostel--handle-notification' honours `ghostel-notification-function'.
+`run-at-time' is stubbed synchronously since the dispatcher defers
+the handler off the VT-parser callpath."
+  (cl-letf (((symbol-function 'run-at-time)
+             (lambda (_secs _rep fn &rest args) (apply fn args))))
+    (let ((calls nil))
+      (let ((ghostel-notification-function
+             (lambda (title body) (push (cons title body) calls))))
+        (ghostel--handle-notification "T" "B")
+        (should (equal '(("T" . "B")) calls)))
+      ;; nil → silently ignored
+      (let ((ghostel-notification-function nil))
+        (should-not (ghostel--handle-notification "T" "B")))
+      ;; Error in handler is demoted to message (does not propagate)
+      (let ((ghostel-notification-function (lambda (_t _b) (error "Boom")))
+            (inhibit-message t)
+            (debug-on-error nil))
+        (should-not (condition-case _
+                        (progn (ghostel--handle-notification "T" "B") nil)
+                      (error t)))))))
+
+(ert-deftest ghostel-test-notification-dispatch-current-buffer ()
+  "Dispatcher re-enters the originating buffer before calling the handler.
+Even if the user has switched to a different buffer by the time
+the deferred timer fires, the handler sees the ghostel buffer
+that emitted the escape as `current-buffer'."
+  (cl-letf (((symbol-function 'run-at-time)
+             (lambda (_secs _rep fn &rest args)
+               ;; Simulate the timer firing later, from a different
+               ;; buffer.
+               (with-temp-buffer
+                 (rename-buffer " *unrelated*" t)
+                 (apply fn args)))))
+    (let ((captured-name nil))
+      (with-temp-buffer
+        (rename-buffer "*ghostel: origin*" t)
+        (let ((ghostel-notification-function
+               (lambda (_title _body) (setq captured-name (buffer-name)))))
+          (ghostel--handle-notification "" "hi")
+          (should (equal captured-name "*ghostel: origin*")))))))
+
+(ert-deftest ghostel-test-notification-dispatch-real-timer ()
+  "Async path runs end-to-end through a real `run-at-time'.
+Every other dispatcher test stubs `run-at-time' synchronously, so
+the closure capture, `buffer-live-p' guard, `with-current-buffer'
+re-entry, and `condition-case' all go uncovered unless this test
+actually yields the event loop and observes the delayed side effect."
+  (let ((captured nil))
+    (with-temp-buffer
+      (rename-buffer "*ghostel: real-timer*" t)
+      (let ((ghostel-notification-function
+             (lambda (title body)
+               (push (list title body (buffer-name)) captured))))
+        (ghostel--handle-notification "T" "B")
+        ;; Not fired yet — still scheduled.
+        (should (equal nil captured))
+        ;; Let the 0s timer run.  `sit-for' yields even in batch mode,
+        ;; which triggers pending `run-at-time 0 nil ...' callbacks.
+        (with-timeout (1.0 (error "Timer never fired"))
+          (while (null captured) (sit-for 0.01)))
+        (should (equal '(("T" "B" "*ghostel: real-timer*")) captured))))))
+
+(ert-deftest ghostel-test-notification-dispatch-buffer-killed ()
+  "Drop notifications whose originating buffer died before timer firing.
+Uses a second notification from a live buffer as a positive
+control so we can wait on *something* and then assert the
+killed-buffer one did not fire."
+  (let ((dead-fired nil)
+        (live-fired nil))
+    (let* ((dead (generate-new-buffer " *ghostel-test-killed*")))
+      (let ((ghostel-notification-function
+             (lambda (_t _b) (setq dead-fired t))))
+        (with-current-buffer dead
+          (ghostel--handle-notification "D" "D")))
+      (kill-buffer dead))
+    (with-temp-buffer
+      (rename-buffer " *ghostel-test-live*" t)
+      (let ((ghostel-notification-function
+             (lambda (_t _b) (setq live-fired t))))
+        (ghostel--handle-notification "L" "L")
+        (with-timeout (1.0 (error "Live timer never fired"))
+          (while (null live-fired) (sit-for 0.01)))))
+    (should live-fired)
+    (should (equal nil dead-fired))))
+
+(ert-deftest ghostel-test-osc-progress-dispatch-error-isolated ()
+  "Errors in `ghostel-progress-function' are caught and demoted."
+  (let ((ghostel-progress-function (lambda (_s _p) (error "Boom")))
+        (inhibit-message t)
+        (debug-on-error nil))
+    (should-not (condition-case _
+                    (progn (ghostel--osc-progress "set" 10) nil)
+                  (error t)))))
+
+(ert-deftest ghostel-test-default-notify-uses-alert ()
+  "Route notifications through `alert' when the package is available.
+`alert' is pre-provided so the branch fires under batch mode
+without the real package installed."
+  (provide 'alert)
+  (let ((captured nil))
+    (cl-letf (((symbol-function 'alert)
+               (lambda (msg &rest kw) (setq captured (cons msg kw)))))
+      (ghostel-default-notify "Title" "body text")
+      (should captured)
+      (should (equal (car captured) "body text"))
+      (should (equal (plist-get (cdr captured) :title) "Title")))))
+
+(ert-deftest ghostel-test-default-notify-empty-title-uses-buffer-name ()
+  "When TITLE is empty, the alert uses the current buffer's name."
+  (provide 'alert)
+  (let ((captured nil))
+    (cl-letf (((symbol-function 'alert)
+               (lambda (msg &rest kw) (setq captured (cons msg kw)))))
+      (with-temp-buffer
+        (rename-buffer "*ghostel: zsh*" t)
+        (ghostel-default-notify "" "hi")
+        (should (equal (plist-get (cdr captured) :title) (buffer-name)))))))
+
+(ert-deftest ghostel-test-default-progress-modeline ()
+  "`ghostel-default-progress' sets `mode-line-process' per state."
+  (with-temp-buffer
+    (ghostel-default-progress 'set 42)
+    (should (equal " [42%]" mode-line-process))
+    (ghostel-default-progress 'indeterminate nil)
+    (should (equal " [...]" mode-line-process))
+    (ghostel-default-progress 'pause 10)
+    (should (equal " [paused 10%]" mode-line-process))
+    (ghostel-default-progress 'pause nil)
+    (should (equal " [paused]" mode-line-process))
+    (ghostel-default-progress 'error 99)
+    (should (string-match-p "\\[err 99%\\]" mode-line-process))
+    (ghostel-default-progress 'remove nil)
+    (should (null mode-line-process))))
+
 (ert-deftest ghostel-test-osc-partial-does-not-starve-later ()
   "A partial OSC must not cannibalize or starve a following complete OSC.
 Input \"\\e]7;PARTIAL\\e]52;c;aGVsbG8=\\a\" would, under a naive
@@ -5600,6 +5954,15 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-osc51-eval
     ghostel-test-osc51-eval-unknown
     ghostel-test-osc51-eval-catches-errors
+    ghostel-test-osc-progress-dispatch
+    ghostel-test-osc-progress-dispatch-error-isolated
+    ghostel-test-notification-dispatch
+    ghostel-test-notification-dispatch-current-buffer
+    ghostel-test-notification-dispatch-real-timer
+    ghostel-test-notification-dispatch-buffer-killed
+    ghostel-test-default-notify-uses-alert
+    ghostel-test-default-notify-empty-title-uses-buffer-name
+    ghostel-test-default-progress-modeline
     ghostel-test-flush-pending-output-preserves-buffer
     ghostel-test-copy-mode-cursor
     ghostel-test-ignore-cursor-change

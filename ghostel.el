@@ -246,6 +246,30 @@ Disabled by default for security: a malicious escape sequence in
 command output could silently overwrite your clipboard."
   :type 'boolean)
 
+(defcustom ghostel-notification-function #'ghostel-default-notify
+  "Function called for OSC 9 / OSC 777 desktop notifications.
+Called with two string arguments: TITLE and BODY.  Title is empty
+for iTerm2-style OSC 9 notifications, which only carry a body.
+Set to nil to ignore notifications.
+
+The handler is invoked asynchronously via `run-at-time', with the
+originating ghostel buffer as `current-buffer', so it may block or
+spawn processes freely without stalling the terminal."
+  :type '(choice (const :tag "Disabled" nil) function))
+
+(defcustom ghostel-progress-function #'ghostel-default-progress
+  "Function called for ConEmu OSC 9;4 progress reports.
+Called with two arguments: STATE (one of the symbols `remove',
+`set', `error', `indeterminate', `pause') and PROGRESS (an integer
+0-100, or nil when not reported).  Set to nil to ignore progress
+reports.
+
+The handler runs synchronously on the VT-parser callpath because
+progress updates are expected to feed the mode line or similar
+cheap UI.  A slow handler here will stall terminal output — defer
+expensive work via `run-at-time' on your own if you need it."
+  :type '(choice (const :tag "Disabled" nil) function))
+
 (defcustom ghostel-enable-url-detection t
   "Automatically detect and linkify URLs in terminal output.
 When non-nil, plain-text URLs (http:// and https://) are made
@@ -1984,6 +2008,99 @@ Only acts when `ghostel-enable-osc52' is non-nil."
         (kill-new text)
         (when (fboundp 'gui-set-selection)
           (gui-set-selection 'CLIPBOARD text))))))
+
+(defun ghostel-default-notify (title body)
+  "Default handler for OSC 9 / OSC 777 notifications.
+Uses the `alert' package (https://github.com/jwiegley/alert) when
+available - it picks a sensible backend per platform (osascript on
+macOS, libnotify on Linux, Growl, terminal-notifier, etc.).  Falls
+back to `message' when alert isn't installed.  TITLE is the
+notification summary; when empty (iTerm2-style OSC 9) the buffer
+name is used.  BODY is the notification text.
+
+Runs deferred off the VT-parser callpath by
+`ghostel--handle-notification' with the originating ghostel buffer
+current, so `buffer-name' here gives the terminal buffer's name."
+  (let ((summary (if (or (null title) (string-empty-p title))
+                     (buffer-name)
+                   title)))
+    (if (and (require 'alert nil t) (fboundp 'alert))
+        (alert body :title summary)
+      (message "%s: %s" summary body))))
+
+(defun ghostel-default-progress (state progress)
+  "Default handler for OSC 9;4 ConEmu progress reports.
+Updates `mode-line-process' to show the current STATE and
+PROGRESS (an integer 0-100 or nil).  STATE is one of the symbols
+`remove', `set', `error', `indeterminate', `pause'."
+  (let ((new-val
+         (pcase state
+           ('remove        nil)
+           ('set           (format " [%d%%]" (or progress 0)))
+           ('indeterminate " [...]")
+           ('error         (propertize (if progress
+                                           (format " [err %d%%]" progress)
+                                         " [err]")
+                                       'face 'error))
+           ('pause         (if progress
+                               (format " [paused %d%%]" progress)
+                             " [paused]"))
+           ;; Unknown state: keep the current mode-line value rather
+           ;; than silently clearing it, so a future Zig-side state is
+           ;; visible-but-stale instead of disappearing.
+           (_              mode-line-process))))
+    (unless (equal new-val mode-line-process)
+      (setq mode-line-process new-val)
+      (force-mode-line-update))))
+
+(defun ghostel--handle-notification (title body)
+  "Dispatch TITLE and BODY to `ghostel-notification-function'.
+Called synchronously from the native VT parser; the user handler
+is invoked off the callpath via `run-at-time' so a slow backend
+\(DBus, osascript, etc.) can't stall terminal output.  The
+originating ghostel buffer is made current for the handler, so
+`buffer-name' etc. report the terminal buffer and not whatever was
+current when the timer happened to fire.  Errors in the handler
+are caught and logged — an unhandled error in a timer callback
+does not crash the process filter, but it does produce a backtrace
+in batch runs."
+  (when ghostel-notification-function
+    (let ((buf (current-buffer))
+          (fn ghostel-notification-function))
+      (run-at-time
+       0 nil
+       (lambda ()
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             ;; Only `error' is caught here — `quit' (C-g) is allowed
+             ;; to propagate so a user can interrupt a hung handler.
+             ;; Emacs' timer machinery swallows a propagated quit.
+             (condition-case err
+                 (funcall fn title body)
+               (error
+                (message "ghostel: notification handler error: %s"
+                         (error-message-string err)))))))))))
+
+(defun ghostel--osc-progress (state-str progress)
+  "Dispatch ConEmu OSC 9;4 progress to `ghostel-progress-function'.
+STATE-STR is the state name as a string (sent from the native
+module); it is converted to a known symbol via an explicit allowlist
+to avoid polluting the obarray if a future Zig-side typo sneaks in.
+Unknown state strings are silently dropped.
+PROGRESS is an integer 0-100 or nil."
+  (when ghostel-progress-function
+    (let ((state-sym (pcase state-str
+                       ("remove"        'remove)
+                       ("set"           'set)
+                       ("error"         'error)
+                       ("indeterminate" 'indeterminate)
+                       ("pause"         'pause))))
+      (when state-sym
+        (condition-case err
+            (funcall ghostel-progress-function state-sym progress)
+          (error
+           (message "ghostel: progress handler error: %s"
+                    (error-message-string err))))))))
 
 (defun ghostel--flush-output (data)
   "Write DATA back to the shell process (response from terminal)."

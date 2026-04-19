@@ -341,9 +341,168 @@ fn dispatchPostWriteOscs(env: emacs.Env, term: *Terminal, data: []const u8) void
                     param_val,
                 );
             },
+            // OSC 9: iTerm2 desktop notification, with ConEmu sub-codes
+            // carved out (see `dispatchOsc9`).
+            9 => dispatchOsc9(env, term, osc.payload),
+            // OSC 777: rxvt "notify" extension — `notify;TITLE;BODY`.
+            777 => dispatchOsc777(env, osc.payload),
             else => {},
         }
     }
+}
+
+/// Dispatch OSC 9.  The iTerm2 form is `9;<body>` with no title; ConEmu
+/// overloads the same code with `9;<subcode>[;...]` for unrelated things
+/// (progress, tab titles, env vars, etc.).  Ghostel implements two of the
+/// sub-codes — `9;4` progress reports (routed to `ghostel--osc-progress`)
+/// and `9;9` CWD reporting (routed through libghostty's `setPwd`, same as
+/// OSC 7).  Other recognised ConEmu sub-codes are silently dropped so
+/// stray control sequences don't pop spurious notifications.  Anything
+/// that isn't a valid ConEmu sub-code falls through to
+/// `ghostel--handle-notification` as an iTerm2 notification.  The
+/// validation rules here mirror ghostty-vt's osc9.zig so ghostel's
+/// drop/route/notify split stays consistent with upstream's parse.
+fn dispatchOsc9(env: emacs.Env, term: *Terminal, payload: []const u8) void {
+    if (payload.len == 0) return;
+
+    const first = payload[0];
+    if (first >= '0' and first <= '9') {
+        // Parse the leading digit run.
+        var i: usize = 0;
+        while (i < payload.len and payload[i] >= '0' and payload[i] <= '9') : (i += 1) {}
+        const subcode_str = payload[0..i];
+        const rest = payload[i..];
+        const subcode = std.fmt.parseInt(u16, subcode_str, 10) catch {
+            dispatchOsc9Notification(env, payload);
+            return;
+        };
+
+        // OSC 9;4: progress report.  Valid forms start with `;<digit>`;
+        // anything else falls through to the iTerm2 notification path.
+        if (subcode == 4 and rest.len >= 2 and rest[0] == ';') {
+            if (dispatchOsc9Progress(env, rest[1..])) return;
+        }
+
+        // OSC 9;9: ConEmu CWD reporting — same payload shape as OSC 7,
+        // so we route it through `term.setPwd` (libghostty-vt discards
+        // OSC 9, so this is the one place it gets picked up).
+        if (subcode == 9 and rest.len >= 2 and rest[0] == ';') {
+            const path = rest[1..];
+            if (path.len > 0) {
+                const gs = gt.GhosttyString{ .ptr = path.ptr, .len = path.len };
+                term.setPwd(&gs) catch {};
+            }
+            return;
+        }
+
+        // Other recognised ConEmu sub-codes — silently dropped.  Each
+        // check mirrors ghostty-vt's parser closely enough that payloads
+        // it would reject fall through to the notification path below
+        // (with two deliberate divergences — 9;5 and 9;12, see below).
+        const is_conemu = switch (subcode) {
+            1, 2, 3, 6, 7, 8, 11 => rest.len >= 1 and rest[0] == ';',
+            // `9;5` (wait-input) and `9;12` (prompt start) take no
+            // arguments.  ghostty-vt happens to consume trailing bytes
+            // too, but matching that would swallow iTerm2 notifications
+            // whose body starts with "5" or "12" (e.g. "5 minutes left")
+            // — a realistic UX footgun — so we only treat these as
+            // ConEmu when nothing follows the subcode.
+            5, 12 => rest.len == 0,
+            // `9;10` (bare) or `9;10;0..3[...]` → ConEmu xterm
+            // emulation.  Anything else (`9;10;4`, `9;10;`, `9;10;abc`)
+            // is invalid per ghostty-vt and must notify.  Matches
+            // upstream's lax treatment of trailing bytes after a valid
+            // first arg digit (e.g. `9;10;01`, `9;10;3x` → emulation).
+            10 => rest.len == 0 or
+                (rest.len >= 2 and rest[0] == ';' and
+                    rest[1] >= '0' and rest[1] <= '3'),
+            else => false,
+        };
+        if (is_conemu) return;
+    }
+
+    // Unrecognised `9;<digit>...` payloads fall through as iTerm2
+    // notifications with the raw body (digit run included).  That's
+    // intentional: the iTerm2 form has no sub-code namespace, so the
+    // body is whatever follows the `9;`.
+    dispatchOsc9Notification(env, payload);
+}
+
+fn dispatchOsc9Notification(env: emacs.Env, body: []const u8) void {
+    _ = env.call2(
+        emacs.sym.@"ghostel--handle-notification",
+        env.makeString(""),
+        env.makeString(body),
+    );
+}
+
+/// Parse the payload that follows `9;4;` and dispatch to Elisp.  Returns
+/// true if a progress event was emitted.
+///
+/// State semantics mirror ghostty-vt's parser at the protocol level:
+///   - `set`  (1) defaults progress to 0 when unreported.
+///   - `error` (2) / `pause` (4) accept an optional progress value.
+///   - `remove` (0) / `indeterminate` (3) ignore any trailing progress.
+///
+/// Trailing-semicolon handling is slightly more forgiving than upstream:
+/// `9;4;1;` and `9;4;1;50;` are treated the same as `9;4;1` and
+/// `9;4;1;50`, whereas ghostty-vt's parseUnsigned returns null on the
+/// trailing `;`.  Matters only for exotic emitters.
+fn dispatchOsc9Progress(env: emacs.Env, data: []const u8) bool {
+    if (data.len == 0) return false;
+    const state_digit = data[0];
+    const state_str: []const u8 = switch (state_digit) {
+        '0' => "remove",
+        '1' => "set",
+        '2' => "error",
+        '3' => "indeterminate",
+        '4' => "pause",
+        else => return false,
+    };
+
+    // Default progress: `set` starts at 0; all other states start nil.
+    var progress_val = if (state_digit == '1') env.makeInteger(0) else env.nil();
+    const accepts_progress = state_digit != '0' and state_digit != '3';
+
+    if (accepts_progress and data.len >= 3 and data[1] == ';') {
+        var tail = data[2..];
+        // Trim trailing `;` so `9;4;0;` and similar don't fail to parse.
+        while (tail.len > 0 and tail[tail.len - 1] == ';') tail.len -= 1;
+        if (tail.len > 0) {
+            // u64 is wide enough to absorb garbage like `99999999999`
+            // without overflowing parseInt; the result is clamped to 100
+            // regardless.
+            if (std.fmt.parseInt(u64, tail, 10)) |n| {
+                const clamped: i64 = @intCast(@min(n, 100));
+                progress_val = env.makeInteger(clamped);
+            } else |_| {}
+        }
+    }
+
+    _ = env.call2(
+        emacs.sym.@"ghostel--osc-progress",
+        env.makeString(state_str),
+        progress_val,
+    );
+    return true;
+}
+
+/// Dispatch OSC 777: `notify;TITLE;BODY`.  Any other extension is ignored
+/// (rxvt defines `notify` as the only one we care about).
+fn dispatchOsc777(env: emacs.Env, payload: []const u8) void {
+    const first_semi = std.mem.indexOfScalar(u8, payload, ';') orelse return;
+    if (!std.mem.eql(u8, payload[0..first_semi], "notify")) return;
+    const after_ext = payload[first_semi + 1 ..];
+    // Title and body are separated by the next `;`.  If no separator,
+    // treat the whole remainder as body with empty title.
+    const second_semi = std.mem.indexOfScalar(u8, after_ext, ';');
+    const title = if (second_semi) |s| after_ext[0..s] else "";
+    const body = if (second_semi) |s| after_ext[s + 1 ..] else after_ext;
+    _ = env.call2(
+        emacs.sym.@"ghostel--handle-notification",
+        env.makeString(title),
+        env.makeString(body),
+    );
 }
 
 /// Send `OSC N;rgb:RRRR/GGGG/BBBB <term>` for a dynamic color (OSC 10/11).
