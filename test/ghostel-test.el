@@ -3141,6 +3141,178 @@ normally."
         (let ((kill-buffer-query-functions nil))
           (kill-buffer buf-name))))))
 
+(ert-deftest ghostel-test-compile-reconciles-vt-size-to-outwin ()
+  "`ghostel-compile--start' must resize the VT to the output window.
+
+`prepare-buffer' sizes the VT from the selected window (the only
+dimensions available before `display-buffer').  If the compile
+buffer ends up in a smaller window, the PTY's `set-process-window-size'
+agrees with the output window but the VT still thinks it has the
+selected-window width, so early output wraps at the wrong column.
+`--start' must call `ghostel--set-size' with the output-window
+dimensions *before* rendering the header, and `--spawn' must receive
+the same dimensions so PTY and VT always agree."
+  (let* ((buf-name "*ghostel-test-compile-size*")
+         (set-size-calls nil)
+         (spawn-calls nil)
+         (call-order nil)
+         (inhibit-message t)
+         (save-some-buffers-default-predicate (lambda () nil))
+         (ghostel-compile-finished-major-mode nil))
+    (when (get-buffer buf-name)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf-name)))
+    (unwind-protect
+        (cl-letf* (((symbol-function 'ghostel--load-module) #'ignore)
+                   ((symbol-function 'ghostel--new)
+                    (lambda (&rest _) 'fake-term))
+                   ((symbol-function 'ghostel--apply-palette) #'ignore)
+                   ((symbol-function 'ghostel--set-size)
+                    (lambda (_term rows cols)
+                      (push 'set-size call-order)
+                      (push (list rows cols) set-size-calls)))
+                   ((symbol-function 'ghostel-compile--render-header-live)
+                    (lambda (&rest _) (push 'render-header call-order)))
+                   ((symbol-function 'ghostel--cursor-position)
+                    (lambda (_term) (cons 0 0)))
+                   ((symbol-function 'ghostel-compile--spawn)
+                    (lambda (_cmd buf h w)
+                      (push 'spawn call-order)
+                      (push (list h w) spawn-calls)
+                      (let ((p (start-process "ghostel-test-size-fake"
+                                              buf "sleep" "100")))
+                        (set-process-sentinel p #'ignore)
+                        (set-process-query-on-exit-flag p nil)
+                        (with-current-buffer buf
+                          (setq ghostel--process p))
+                        p))))
+          (let ((buf (ghostel-compile--start "true" buf-name
+                                             default-directory)))
+            (with-current-buffer buf
+              ;; The reconcile call happened.
+              (should set-size-calls)
+              ;; Reconcile must precede the header render *and* the spawn —
+              ;; otherwise the header / early command output wraps at the
+              ;; pre-reconcile column.  `call-order' is LIFO, so chronological
+              ;; order is the reverse.
+              (let ((chronological (reverse call-order)))
+                (should (equal chronological
+                               '(set-size render-header spawn))))
+              ;; Final VT size equals what was handed to the process.
+              (let ((vt-size (car set-size-calls))
+                    (pty-size (car spawn-calls)))
+                (should (equal vt-size pty-size)))
+              ;; `ghostel--term-rows' tracks the final reconciled height.
+              (should (= (car (car set-size-calls)) ghostel--term-rows))
+              ;; Clean up the fake process.
+              (let ((p ghostel--process))
+                (when (process-live-p p)
+                  (setq compilation-in-progress
+                        (delq p compilation-in-progress))
+                  (delete-process p))))))
+      (when (get-buffer buf-name)
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buf-name))))))
+
+(ert-deftest ghostel-test-compile-reconciles-skips-when-no-outwin ()
+  "If `display-buffer' returns nil, reconcile is skipped safely.
+`allow-no-window' permits `display-buffer' to choose not to show the
+buffer at all.  The `(when (and outwin ...))' guard in `--start' must
+gate the `ghostel--set-size' call so we don't crash or pass bogus
+dimensions when no output window exists."
+  (let* ((buf-name "*ghostel-test-compile-no-outwin*")
+         (set-size-called nil)
+         (inhibit-message t)
+         (save-some-buffers-default-predicate (lambda () nil))
+         (ghostel-compile-finished-major-mode nil))
+    (when (get-buffer buf-name)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf-name)))
+    (unwind-protect
+        (cl-letf* (((symbol-function 'ghostel--load-module) #'ignore)
+                   ((symbol-function 'ghostel--new)
+                    (lambda (&rest _) 'fake-term))
+                   ((symbol-function 'ghostel--apply-palette) #'ignore)
+                   ((symbol-function 'display-buffer) (lambda (&rest _) nil))
+                   ((symbol-function 'ghostel--set-size)
+                    (lambda (&rest _) (setq set-size-called t)))
+                   ((symbol-function 'ghostel-compile--render-header-live)
+                    #'ignore)
+                   ((symbol-function 'ghostel--cursor-position)
+                    (lambda (_term) (cons 0 0)))
+                   ((symbol-function 'ghostel-compile--spawn)
+                    (lambda (_cmd buf _h _w)
+                      (let ((p (start-process "ghostel-test-nowin-fake"
+                                              buf "sleep" "100")))
+                        (set-process-sentinel p #'ignore)
+                        (set-process-query-on-exit-flag p nil)
+                        (with-current-buffer buf
+                          (setq ghostel--process p))
+                        p))))
+          (let ((buf (ghostel-compile--start "true" buf-name
+                                             default-directory)))
+            (should (buffer-live-p buf))
+            (should-not set-size-called)
+            (with-current-buffer buf
+              (let ((p ghostel--process))
+                (when (process-live-p p)
+                  (setq compilation-in-progress
+                        (delq p compilation-in-progress))
+                  (delete-process p))))))
+      (when (get-buffer buf-name)
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buf-name))))))
+
+(ert-deftest ghostel-test-compile-kill-compilation-finds-live-buffer ()
+  "`kill-compilation' must locate a live ghostel-compile buffer.
+
+During the run the buffer stays in `ghostel-mode' so keystrokes reach
+the process, which means `compilation-mode' never runs.  `kill-compilation'
+calls `compilation-find-buffer' -> `compilation-buffer-internal-p',
+which is `(local-variable-p 'compilation-locs)'.  `prepare-buffer' must
+declare that variable buffer-locally so the live buffer qualifies."
+  (skip-unless (file-executable-p "/bin/sh"))
+  (let* ((buf-name "*ghostel-test-kill-compilation*")
+         (inhibit-message t)
+         (save-some-buffers-default-predicate (lambda () nil))
+         (ghostel-compile-finished-major-mode nil))
+    (when (get-buffer buf-name)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf-name)))
+    (unwind-protect
+        (let ((buf (ghostel-compile--start "cat" buf-name
+                                           default-directory)))
+          (with-current-buffer buf
+            (ghostel-test--wait-for
+             ghostel--process
+             (lambda () (eq 'run (process-status ghostel--process))))
+            ;; The live buffer passes `compilation-buffer-p' — which is
+            ;; the gate `kill-compilation' uses.
+            (should (compilation-buffer-p buf))
+            ;; From inside the buffer, `compilation-find-buffer' returns it.
+            (should (eq (compilation-find-buffer) buf))
+            ;; Also findable from an arbitrary buffer, via `next-error-find-
+            ;; buffer' — that's how `kill-compilation' reaches us when the
+            ;; user invokes it from elsewhere.
+            (should (with-temp-buffer (eq (compilation-find-buffer) buf)))
+            ;; And the buffer has a live process `kill-compilation' would
+            ;; deliver SIGINT to.
+            (should (process-live-p (get-buffer-process buf)))
+            ;; End-to-end: invoke `kill-compilation' from inside the buffer
+            ;; and wait for the process to die via SIGINT.  `cat' exits on
+            ;; SIGINT, the sentinel finalizes, and `--last-exit' reflects
+            ;; a non-zero status (signal-based termination).
+            (kill-compilation)
+            (ghostel-test--wait-for
+             ghostel--process
+             (lambda () ghostel-compile--finalized) 10)
+            (should ghostel-compile--finalized)
+            (should (numberp ghostel-compile--last-exit))
+            (should-not (zerop ghostel-compile--last-exit))))
+      (when (get-buffer buf-name)
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buf-name))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: prompt navigation
 ;; -----------------------------------------------------------------------
@@ -6465,6 +6637,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-compile-global-mode-falls-through-on-continue
     ghostel-test-compile-global-mode-falls-through-on-comint
     ghostel-test-compile-global-mode-excluded-custom-mode
+    ghostel-test-compile-reconciles-vt-size-to-outwin
+    ghostel-test-compile-reconciles-skips-when-no-outwin
     ghostel-test-viewport-start-skips-trailing-newline
     ghostel-test-anchor-window-no-clamp-without-pending-wrap
     ghostel-test-exec-errors-on-live-process

@@ -573,7 +573,18 @@ so there is no remote-integration round-trip on TRAMP buffers."
             ghostel-compile--managed-buffer-sentinel)
       (setq ghostel--term (ghostel--new height width ghostel-max-scrollback))
       (setq ghostel--term-rows height)
-      (ghostel--apply-palette ghostel--term))
+      (ghostel--apply-palette ghostel--term)
+      ;; `kill-compilation' locates our buffer via `compilation-find-buffer',
+      ;; which requires `compilation-locs' to be buffer-local (see
+      ;; `compilation-buffer-internal-p').  During the run we stay in
+      ;; `ghostel-mode' so keystrokes reach the process, so `compilation-mode'
+      ;; hasn't installed that variable yet — declare it locally now, with
+      ;; the same hash-table shape `compilation-mode' uses so any code that
+      ;; reads the value (future or third-party) doesn't trip on nil.
+      ;; Finalize switches to `ghostel-compile-view-mode', which derives from
+      ;; `compilation-mode' and will reset `compilation-locs' properly.
+      (setq-local compilation-locs
+                  (make-hash-table :test 'equal :weakness 'value)))
     buffer))
 
 
@@ -609,6 +620,18 @@ honour custom compile-mode subclasses the caller passed to
             ghostel-compile--last-exit nil
             ghostel-compile--finalized nil
             ghostel-compile--view-mode-override finished-mode)
+      ;; `prepare-buffer' sized the VT from the selected window (no
+      ;; display-buffer had happened yet).  `display-buffer' above may
+      ;; have placed the buffer in a smaller window — reconcile the VT
+      ;; to the output window *before* rendering the header, otherwise
+      ;; the header and the command's early output wrap at the wrong
+      ;; column and look garbled until the user's first resize triggers
+      ;; `ghostel--window-adjust-process-window-size'.
+      (when (and outwin ghostel--term)
+        (let ((oh (max 1 (window-body-height outwin)))
+              (ow (max 1 (window-max-chars-per-line outwin))))
+          (ghostel--set-size ghostel--term oh ow)
+          (setq ghostel--term-rows oh)))
       ;; Render the compilation header into the terminal before spawning
       ;; the command, so the user sees the "Compilation started at ..."
       ;; banner *during* the run rather than only when it finishes (the
@@ -633,11 +656,15 @@ honour custom compile-mode subclasses the caller passed to
               (forward-line (cdr (ghostel--cursor-position ghostel--term)))
               (copy-marker (point))))
       (ghostel-compile--set-mode-line-running)
+      ;; Match the VT size computed above (or fall back to the selected
+      ;; window's own dimensions when `display-buffer' didn't surface a
+      ;; window, e.g. `allow-no-window').  Use `window-max-chars-per-line'
+      ;; as the canonical width measure, matching `ghostel--spawn-pty'.
       (let* ((height (max 1 (if outwin
                                 (window-body-height outwin)
                               (window-body-height))))
              (width (max 1 (if outwin
-                               (window-body-width outwin)
+                               (window-max-chars-per-line outwin)
                              (window-max-chars-per-line))))
              (proc (ghostel-compile--spawn command buffer height width)))
         ;; Match stock `compilation-start' ordering: hook fires before
