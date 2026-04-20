@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.16.1
+;; Version: 0.16.2
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -524,7 +524,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.16.1"
+(defconst ghostel--minimum-module-version "0.16.2"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -537,6 +537,7 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function ghostel--encode-key "ghostel-module")
 (declare-function ghostel--focus-event "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
+(declare-function ghostel--alt-screen-p "ghostel-module")
 (declare-function ghostel--copy-all-text "ghostel-module")
 (declare-function ghostel--module-version "ghostel-module")
 (declare-function ghostel--mouse-event "ghostel-module")
@@ -793,6 +794,10 @@ entry points so tests run without the module present."
 
 (defvar-local ghostel--term-rows nil
   "Row count of the native terminal, for viewport/scrollback arithmetic.
+Updated whenever the terminal is created or resized.")
+
+(defvar-local ghostel--term-cols nil
+  "Column count of the native terminal.
 Updated whenever the terminal is created or resized.")
 
 (defvar-local ghostel--copy-mode-active nil
@@ -3159,23 +3164,80 @@ PROCESS is the shell process, WINDOWS is the list of windows."
     (when (and size (buffer-live-p buffer))
       (with-current-buffer buffer
         (when ghostel--term
-          (ghostel--set-size ghostel--term (max 1 height) (max 1 width))
-          (setq ghostel--term-rows height)
-          (setq ghostel--force-next-redraw t)
-          ;; Redraw synchronously so the buffer is updated before
-          ;; Emacs displays the stale content at the new window size.
-          (when ghostel--redraw-timer
-            (cancel-timer ghostel--redraw-timer)
-            (setq ghostel--redraw-timer nil))
-          ;; `ghostel--redraw-resize-active' lets `ghostel--window-anchored-p'
-          ;; treat Emacs-induced `window-start' drift (from `keep-point-visible'
-          ;; when a minibuffer-triggered resize shrinks the body) as drift,
-          ;; not as a user scroll.
-          (let ((ghostel--redraw-resize-active t))
-            (ghostel--delayed-redraw buffer)))))
+          (cond
+           ;; No change — skip entirely.
+           ((and (eql height ghostel--term-rows)
+                 (eql width ghostel--term-cols))
+            (setq size nil))
+           ;; Crop: minibuffer is active, only height shrank, width unchanged, and the
+           ;; terminal is on the primary screen.  Defer the resize so no SIGWINCH is sent
+           ;; — the Emacs window naturally hides the bottom rows, just like a normal
+           ;; buffer.  Alt-screen apps (vim, htop) own the full viewport and must be told
+           ;; the real size to re-layout, so they take the normal-resize path.  If the
+           ;; user switches focus into the ghostel window while the minibuffer is still
+           ;; open, `ghostel--commit-cropped-size' commits the smaller size then.
+           ((and (> (minibuffer-depth) 0)
+                 (eql width ghostel--term-cols)
+                 (< height ghostel--term-rows)
+                 (not (ghostel--alt-screen-p ghostel--term)))
+            (setq size nil))
+           ;; Real resize — update the terminal model and redraw.
+           (t
+            (ghostel--set-size ghostel--term (max 1 height) (max 1 width))
+            (setq ghostel--term-rows height)
+            (setq ghostel--term-cols width)
+            (setq ghostel--force-next-redraw t)
+            ;; Redraw synchronously so the buffer is updated before
+            ;; Emacs displays the stale content at the new window size.
+            (when ghostel--redraw-timer
+              (cancel-timer ghostel--redraw-timer)
+              (setq ghostel--redraw-timer nil))
+            ;; `ghostel--redraw-resize-active' lets `ghostel--window-anchored-p'
+            ;; treat Emacs-induced `window-start' drift (from `keep-point-visible'
+            ;; when a minibuffer-triggered resize shrinks the body) as drift,
+            ;; not as a user scroll.
+            (let ((ghostel--redraw-resize-active t))
+              (ghostel--delayed-redraw buffer)))))))
     ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
-    ;; after this function returns, matching eat/vterm timing.
+    ;; after this function returns.  nil suppresses the call.
     size))
+
+(defun ghostel--commit-cropped-size (window)
+  "Commit WINDOW's size if the user focused into a cropped ghostel window.
+When the minibuffer opens, `ghostel--window-adjust-process-window-size'
+skips the resize so the PTY keeps its original row count and the bottom
+rows are just hidden.  But if the user switches focus into the ghostel
+window while the minibuffer is still up, they are now actively using
+the smaller viewport — commit the size so the shell/app knows its real
+dimensions.
+
+Intended for buffer-local `window-selection-change-functions'.  When
+registered buffer-locally, Emacs calls this with WINDOW and makes its
+buffer current; we only commit when WINDOW has become the selected
+window (not when it has just been deselected)."
+  (when (and (> (minibuffer-depth) 0)
+             (window-live-p window)
+             (eq window (frame-selected-window (window-frame window)))
+             ghostel--term
+             ghostel--process
+             (process-live-p ghostel--process))
+    (let ((height (window-body-height window))
+          (width (window-max-chars-per-line window))
+          (buf (current-buffer)))
+      (unless (and (eql height ghostel--term-rows)
+                   (eql width ghostel--term-cols))
+        (ghostel--set-size ghostel--term
+                           (max 1 height) (max 1 width))
+        (setq ghostel--term-rows height
+              ghostel--term-cols width
+              ghostel--force-next-redraw t)
+        (set-process-window-size ghostel--process
+                                 (max 1 height) (max 1 width))
+        (when ghostel--redraw-timer
+          (cancel-timer ghostel--redraw-timer)
+          (setq ghostel--redraw-timer nil))
+        (let ((ghostel--redraw-resize-active t))
+          (ghostel--delayed-redraw buf))))))
 
 
 
@@ -3203,6 +3265,10 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   (add-function :after after-focus-change-function #'ghostel--focus-change)
   (add-hook 'window-selection-change-functions #'ghostel--focus-change)
   (add-hook 'window-buffer-change-functions #'ghostel--focus-change)
+  ;; Buffer-local so it only fires for windows showing this buffer, and
+  ;; receives WINDOW directly (rather than FRAME as the default binding).
+  (add-hook 'window-selection-change-functions
+            #'ghostel--commit-cropped-size nil t)
   (ghostel--suppress-interfering-modes)
   (setq ghostel--scroll-intercept-active t)
   ;; Let C-g reach the keymap instead of triggering keyboard-quit.
@@ -3245,6 +3311,7 @@ displayed, so a mismatch at creation time self-corrects."
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
         (setq ghostel--term-rows height)
+        (setq ghostel--term-cols width)
         (ghostel--apply-palette ghostel--term))
       (ghostel--start-process))))
 
@@ -3297,6 +3364,7 @@ Signals `user-error' if BUFFER already has a live ghostel process."
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
         (setq ghostel--term-rows height)
+        (setq ghostel--term-cols width)
         (ghostel--apply-palette ghostel--term)
         (ghostel--spawn-pty program args height width
                             "erase '^?' iutf8 -ixon echo" nil remote-p)))))

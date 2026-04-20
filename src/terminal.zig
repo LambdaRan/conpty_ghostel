@@ -278,6 +278,15 @@ pub fn isModeEnabled(self: *Self, mode: gt.c.GhosttyMode) bool {
     return enabled;
 }
 
+/// Returns true if the terminal is on the alternate screen buffer
+/// (DEC private modes 1049, 1047, or legacy 47 set).  Used to decide
+/// whether full-screen apps (vim, htop, less) own the viewport.
+pub fn isAltScreen(self: *Self) bool {
+    return self.isModeEnabled(@as(gt.c.GhosttyMode, 1049)) or
+        self.isModeEnabled(@as(gt.c.GhosttyMode, 1047)) or
+        self.isModeEnabled(@as(gt.c.GhosttyMode, 47));
+}
+
 /// Get the total number of rows (scrollback + active screen).
 pub fn getTotalRows(self: *Self) usize {
     var total: usize = 0;
