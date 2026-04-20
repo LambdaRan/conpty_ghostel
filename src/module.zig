@@ -187,7 +187,6 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
         }
         term.last_input_was_cr = prev_was_cr;
     }
-    term.last_input_was_cr = prev_was_cr;
 
     // Scan for OSC sequences that libghostty-vt discards (7, 51, 52, 133).
     // One pass, dispatched by code in document order.
