@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.16.2
+;; Version: 0.16.3
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -524,7 +524,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.16.2"
+(defconst ghostel--minimum-module-version "0.16.3"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -534,6 +534,7 @@ Bump this only when the Elisp code requires a newer native module
 
 (declare-function ghostel--cursor-position "ghostel-module")
 (declare-function ghostel--cursor-pending-wrap-p "ghostel-module")
+(declare-function ghostel--cursor-on-empty-row-p "ghostel-module")
 (declare-function ghostel--encode-key "ghostel-module")
 (declare-function ghostel--focus-event "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
@@ -3052,12 +3053,20 @@ No-op when `ghostel--snap-requested' (user input overrides)."
 Also resets pixel vscroll (pixel-scroll-precision-mode may leave a
 partial offset that would clip the top line after a redraw).
 
-When the TUI cursor is in pending-wrap state on the last visible row,
-PT equals `point-max' (one past the last character).  Emacs redisplay
-then classifies it as off-screen, and `scroll-conservatively' shifts
-`window-start' up by one row to make it visible — which fights the
-viewport pin and makes the block cursor disappear.  Clamp
-`window-point' back by one only in that case so it sits inside the
+Two terminal-side configurations land PT at `point-max' on the last
+visible row in a position Emacs redisplay treats as off-screen — which
+makes `scroll-conservatively' shift `window-start' up by one row,
+fighting the viewport pin and hiding the block cursor:
+
+ 1. Pending-wrap: the last printed character filled the rightmost
+    column and the next print will soft-wrap (issue #138).
+
+ 2. CUP park onto an empty trailing row, no pending-wrap: the TUI
+    moved the cursor via absolute positioning to a row that has no
+    written cells, so the row renders to an empty buffer line and PT
+    lands at `point-max' (issue #157).
+
+Clamp `window-point' back by one in either case so it sits inside the
 viewport; buffer-point is unaffected and subsequent redraws recapture
 the real cursor.  We must NOT clamp for a plain shell prompt where the
 cursor is legitimately at `point-max' after typing — doing so would
@@ -3068,8 +3077,10 @@ draw the block cursor on the last character instead of after it
   (set-window-point win (if (and (= pt (point-max))
                                  (> pt (point-min))
                                  ghostel--term
-                                 (ghostel--cursor-pending-wrap-p
-                                  ghostel--term))
+                                 (or (ghostel--cursor-pending-wrap-p
+                                      ghostel--term)
+                                     (ghostel--cursor-on-empty-row-p
+                                      ghostel--term)))
                             (1- pt)
                           pt)))
 

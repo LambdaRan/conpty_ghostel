@@ -13,7 +13,7 @@ const input = @import("input.zig");
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.16.2";
+const version = "0.16.3";
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -45,6 +45,7 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--alt-screen-p", 1, 1, &fnAltScreen, "Return t if terminal is on the alternate screen buffer.\n\n(ghostel--alt-screen-p TERM)");
     env.bindFunction("ghostel--cursor-position", 1, 1, &fnCursorPosition, "Return terminal cursor position as (COL . ROW), 0-indexed.\n\n(ghostel--cursor-position TERM)");
     env.bindFunction("ghostel--cursor-pending-wrap-p", 1, 1, &fnCursorPendingWrap, "Return t if the cursor is in pending-wrap state.\n\n(ghostel--cursor-pending-wrap-p TERM)");
+    env.bindFunction("ghostel--cursor-on-empty-row-p", 1, 1, &fnCursorOnEmptyRow, "Return t if the cursor row has no written cells or styled cells.\n\n(ghostel--cursor-on-empty-row-p TERM)");
     env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
     env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
     env.bindFunction("ghostel--copy-all-text", 1, 1, &fnCopyAllText, "Return entire scrollback as plain text string.\n\n(ghostel--copy-all-text TERM)");
@@ -1044,6 +1045,34 @@ fn fnCursorPendingWrap(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value
         return env.nil();
     }
     return if (pending) env.t() else env.nil();
+}
+
+/// (ghostel--cursor-on-empty-row-p TERM)
+/// Return t if the row containing the active cursor has no written
+/// cells and no cells with non-default style — i.e. the row renders to
+/// an empty Emacs buffer line.  Used alongside pending-wrap by
+/// `ghostel--anchor-window' to detect TUI CUP parks onto a trailing
+/// empty row, which also land `point' at `point-max' on the last
+/// visible row and would otherwise provoke a redisplay-induced scroll.
+fn fnCursorOnEmptyRow(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+
+    if (gt.c.ghostty_render_state_update(term.render_state, term.terminal) != gt.SUCCESS) return env.nil();
+
+    // Use viewport-relative cursor Y so the row index matches the
+    // viewport iterator `isRowEmptyAt' walks. Falls back to nil when
+    // the cursor isn't visible in the current viewport (e.g. scrolled
+    // into scrollback), which is also the safe answer for the clamp.
+    var has_value: bool = false;
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_HAS_VALUE, @ptrCast(&has_value));
+    if (!has_value) return env.nil();
+
+    var cy: u16 = 0;
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y, @ptrCast(&cy)) != gt.SUCCESS) {
+        return env.nil();
+    }
+    return if (render.isRowEmptyAt(term, cy)) env.t() else env.nil();
 }
 
 /// (ghostel--copy-all-text TERM)

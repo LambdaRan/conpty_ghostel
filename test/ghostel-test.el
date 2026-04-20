@@ -4022,6 +4022,88 @@ skip the clamp entirely regardless of where PT sits."
     (ghostel--write-input term "XYZXY")
     (should (ghostel--cursor-pending-wrap-p term))))
 
+(ert-deftest ghostel-test-cursor-on-empty-row-p ()
+  "`ghostel--cursor-on-empty-row-p' tracks whether the cursor row is blank."
+  (let ((term (ghostel--new 3 10 100)))
+    ;; Fresh terminal: all rows empty, cursor at (0,0).
+    (should (ghostel--cursor-on-empty-row-p term))
+    ;; Write a character: cursor row 0 now has a grapheme.
+    (ghostel--write-input term "x")
+    (should-not (ghostel--cursor-on-empty-row-p term))
+    ;; CRLF twice: cursor now at (0,2) on an empty row.
+    (ghostel--write-input term "\r\n\r\n")
+    (should (ghostel--cursor-on-empty-row-p term))
+    ;; CUP back to row 0 (1-indexed: row 1).
+    (ghostel--write-input term "\e[1;1H")
+    (should-not (ghostel--cursor-on-empty-row-p term))))
+
+(ert-deftest ghostel-test-anchor-window-clamps-on-empty-row ()
+  "`ghostel--anchor-window' clamps when cursor is CUP-parked on an empty row.
+Regression test for #157: after `ad8536e' narrowed the clamp to
+pending-wrap only, TUIs that move the cursor via CUP to a trailing
+empty row (e.g. Claude Code on focus loss) again produced the #138
+symptom — PT at `point-max', pending-wrap nil, Emacs redisplay shifts
+`window-start' by one row.  The clamp must also fire on an empty
+cursor row, not just on pending-wrap."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-empty-row*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 3 10 100))
+                 (ghostel--term term)
+                 (ghostel--term-rows 3)
+                 (inhibit-read-only t))
+            (set-window-buffer (selected-window) buf)
+            ;; Fill rows 0 and 1, then CR/LF to land on empty row 2.
+            (ghostel--write-input term "foo\r\nbar\r\n")
+            (should-not (ghostel--cursor-pending-wrap-p term))
+            (should (ghostel--cursor-on-empty-row-p term))
+            (ghostel--redraw term t)
+            (let ((win (selected-window))
+                  (pmax (point-max)))
+              ;; Precondition: PT really does land at point-max on the
+              ;; empty last row.
+              (should (= pmax (point)))
+              (ghostel--anchor-window win (point-min) pmax)
+              ;; Clamp fires: window-point pulled back by one.
+              (should (= (1- pmax) (window-point win))))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-anchor-window-no-clamp-on-populated-last-row ()
+  "`ghostel--anchor-window' must NOT clamp when the cursor row has content.
+Complements the #157 regression: when the cursor sits at `point-max' on
+the last visible row but that row has a written grapheme (e.g. a shell
+prompt after typing), neither predicate fires and the block cursor must
+stay at PT so it renders after the last character (#146 contract)."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-populated-last*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 3 10 100))
+                 (ghostel--term term)
+                 (ghostel--term-rows 3)
+                 (inhibit-read-only t))
+            (set-window-buffer (selected-window) buf)
+            ;; Walk to the last row and type a short prompt — cursor ends
+            ;; mid-row on content, well short of pending-wrap.
+            (ghostel--write-input term "\r\n\r\n$ ls")
+            (should-not (ghostel--cursor-pending-wrap-p term))
+            (should-not (ghostel--cursor-on-empty-row-p term))
+            (ghostel--redraw term t)
+            (let ((win (selected-window))
+                  (pmax (point-max)))
+              (should (= pmax (point)))
+              (ghostel--anchor-window win (point-min) pmax)
+              ;; No clamp: window-point stays at PT.
+              (should (= pmax (window-point win))))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-anchor-window-clamps-on-pending-wrap ()
   "`ghostel--anchor-window' clamps `window-point' only in pending-wrap state.
 Regression test for #138 (clamp must fire) and #146 (clamp must NOT fire
