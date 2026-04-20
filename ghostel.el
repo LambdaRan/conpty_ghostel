@@ -2429,15 +2429,24 @@ Search order: `ghostel-conpty-proxy-path', PATH, ghostel package directory."
                              load-file-name
                              buffer-file-name)))))
 
-(defun ghostel--conpty-proxy-make-process (width height)
+(defun ghostel--conpty-proxy-make-process (width height &optional extra-env)
   "Start a shell process via conpty-proxy for Windows.
-WIDTH and HEIGHT are the terminal dimensions in characters."
+WIDTH and HEIGHT are the terminal dimensions in characters.
+EXTRA-ENV is an optional list of environment variable strings
+\(e.g. shell integration env) prepended to `process-environment'."
   (let* ((proxy-path (ghostel--conpty-proxy-path)))
     (unless proxy-path
       (error "conpty_proxy.exe not found; set `ghostel-conpty-proxy-path' or add it to PATH"))
     (let* ((conpty-id (format "ghostel_%s_%s"
                               (format-time-string "%s")
                               (emacs-pid)))
+           (process-environment
+            (append
+             (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
+             extra-env
+             process-environment))
+           (process-adaptive-read-buffering nil)
+           (read-process-output-max (max read-process-output-max (* 1024 1024)))
            (proc (make-process
                   :name "ghostel"
                   :buffer (current-buffer)
@@ -2932,7 +2941,7 @@ on the remote host."
                        (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
                      integration-env))
          (proc (if (eq system-type 'windows-nt)
-                   (ghostel--conpty-proxy-make-process width height)
+                   (ghostel--conpty-proxy-make-process width height extra-env)
                  (ghostel--spawn-pty shell shell-args height width
                                      stty-flags extra-env remote-p))))
     (when remote-integration
