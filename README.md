@@ -20,6 +20,7 @@ process, keymap, and buffer.
 - [Configuration](#configuration)
 - [Commands](#commands)
   - [Compilation mode](#compilation-mode)
+  - [Eshell integration](#eshell-integration)
 - [Running Tests](#running-tests)
 - [Performance](#performance)
 - [Ghostel vs vterm](#ghostel-vs-vterm)
@@ -123,6 +124,12 @@ ghostty dependency automatically.
 Alternatively, download a **pre-built binary** via `M-x ghostel-download-module`
 (or `C-u M-x ghostel-download-module` to pick a specific release).
 
+The compiled `xterm-ghostty` terminfo entry ships pre-built in
+`terminfo/` and is identical to what `tic` would produce locally —
+no build step needed, and the file format is portable across BSD
+and ncurses systems.  Maintainers regenerate it via `make
+regen-terminfo` after bumping libghostty.
+
 ## Shell Integration
 
 Shell integration (directory tracking via OSC 7, prompt navigation via OSC 133,
@@ -168,8 +175,10 @@ test "$INSIDE_EMACS" = 'ghostel'; and source "$EMACS_GHOSTEL_PATH/etc/ghostel.fi
 | `M-y`       | Yank-pop (cycle through kill ring)     |
 | `C-c C-y`   | Paste from kill ring                   |
 | `C-c C-l`   | Clear scrollback                       |
-| `C-c C-n`   | Jump to next prompt                    |
-| `C-c C-p`   | Jump to previous prompt                |
+| `C-c C-n`   | Jump to next hyperlink                 |
+| `C-c C-p`   | Jump to previous hyperlink             |
+| `C-c M-n`   | Jump to next prompt                    |
+| `C-c M-p`   | Jump to previous prompt                |
 | `C-c C-q`   | Send next key literally (escape hatch) |
 | Mouse wheel | Scroll through scrollback              |
 
@@ -188,8 +197,10 @@ Normal letter keys exit copy mode and send the key to the terminal.
 | `C-n` / `C-p` | Move line (scrolls at edges)     |
 | `M-v` / `C-v` | Scroll page up / down            |
 | `M-<` / `M->` | Jump to top / bottom of buffer   |
-| `C-c C-n`     | Jump to next prompt              |
-| `C-c C-p`     | Jump to previous prompt          |
+| `C-c C-n`     | Jump to next hyperlink           |
+| `C-c C-p`     | Jump to previous hyperlink       |
+| `C-c M-n`     | Jump to next prompt              |
+| `C-c M-p`     | Jump to previous prompt          |
 | `C-l`         | Recenter viewport                |
 | `C-c C-t`     | Exit without copying             |
 | `a`–`z`       | Exit and send key to terminal    |
@@ -206,7 +217,9 @@ history — even outside copy mode.
 ### Terminal Emulation
 - Full VT terminal emulation via libghostty-vt
 - 256-color and RGB (24-bit true color) support
+- **`TERM=xterm-ghostty` with bundled terminfo** — apps that consult terminfo for capabilities (Claude Code, neovim, tmux, modern TUIs) discover synchronized output (DEC 2026), Kitty keyboard protocol, true color, colored underlines, focus reporting, etc., and use their fast paths.  Synchronized output in particular eliminates the choppy partial-redraw effect when Claude Code repaints over a large scrollback.  OSC 52 (clipboard) is supported but intentionally not advertised in the bundled terminfo — see Clipboard below.  Override via `ghostel-term`.
 - **OSC 4 / 10 / 11 color queries** — TUI programs can query the current palette, foreground, and background colors, so tools like `duf`, `btop`, `delta`, and anything else using `termenv` auto-detect the right light/dark theme from the Emacs face colors
+- **OSC 9 / OSC 777** — desktop notifications and ConEmu progress reports (percentage shown in the mode line; see [Notifications and Progress](#notifications-and-progress))
 - Text attributes: bold, italic, faint, underline (single/double/curly/dotted/dashed with color), strikethrough, inverse
 - Cursor styles: block, bar, underline, hollow block
 - Alternate screen buffer (for TUI apps like htop, vim, etc.)
@@ -218,7 +231,7 @@ history — even outside copy mode.
 - **File path detection** — patterns like `/path/to/file.el:42` become clickable, opening the file at the given line (toggle with `ghostel-enable-file-detection`)
 
 ### Clipboard
-- **OSC 52 clipboard** — terminal programs can set the Emacs kill ring and system clipboard (opt-in via `ghostel-enable-osc52`, useful for remote SSH sessions)
+- **OSC 52 clipboard** — terminal programs can set the Emacs kill ring and system clipboard (opt-in via `ghostel-enable-osc52`, useful for remote SSH sessions).  Note: the bundled `xterm-ghostty` terminfo intentionally **does not** advertise the `Ms` capability, so apps don't auto-discover it.  This avoids silent clipboard drops when `ghostel-enable-osc52` is at its default `nil`.  If you enable OSC 52 and want apps (neovim, tmux) to auto-detect, install upstream Ghostty's terminfo on the same path or override `TERMINFO`.
 - **Bracketed paste** — yank from kill ring sends text as a bracketed paste so shells handle it correctly
 
 ### Input
@@ -230,7 +243,7 @@ history — even outside copy mode.
 ### Shell Integration
 - Automatic injection for bash, zsh, and fish — no shell RC edits needed
 - **OSC 7** — directory tracking (`default-directory` follows the shell's cwd, TRAMP-aware for remote hosts)
-- **OSC 133** — semantic prompt markers, enabling prompt-to-prompt navigation with `C-c C-n` / `C-c C-p`
+- **OSC 133** — semantic prompt markers, enabling prompt-to-prompt navigation with `C-c M-n` / `C-c M-p`
 - **OSC 2** — title tracking (buffer is renamed from the terminal title)
 - **OSC 51** — call whitelisted Emacs functions from shell scripts (see [Calling Elisp from the Shell](#calling-elisp-from-the-shell))
 - **OSC 52** — clipboard support (opt-in, for remote sessions)
@@ -307,6 +320,116 @@ test "$INSIDE_EMACS" = 'ghostel'; and source ~/.local/share/ghostel/ghostel.fish
 The integration scripts provide directory tracking (OSC 7), prompt
 navigation (OSC 133), and `ghostel_cmd` for calling Elisp from the shell.
 
+#### Remote `xterm-ghostty` terminfo
+
+Ghostel sets `TERM=xterm-ghostty` so apps inside the buffer get the
+full capability set (synchronized output, Kitty keyboard, etc.).
+That same `TERM` value gets inherited by anything spawned inside
+the buffer — including `ssh REMOTE` and `M-x ghostel` from a TRAMP
+`default-directory`.  Remote hosts without the `xterm-ghostty`
+entry will then print `Error opening terminal: xterm-ghostty`.
+
+`ghostel-ssh-install-terminfo` (default `auto`) handles both cases.
+`auto` is enabled when `ghostel-tramp-shell-integration` is on, so
+turning on remote integration also turns on terminfo install — one
+switch.
+
+##### TRAMP-launched ghostel
+
+`M-x ghostel` from a TRAMP path (`/ssh:host:/path/`) spawns the
+shell on the remote.  Ghostel pushes the bundled compiled terminfo
+to a remote temp dir over the existing TRAMP connection (no extra
+ssh round-trip), sets `TERMINFO=<that dir>` in the remote shell's
+env, and cleans up on exit.  Both Linux (`x/`, `g/`) and macOS
+(`78/`, `67/`) layouts are written so any ncurses or BSD libcurses
+finds it.  Nothing persists on the remote.
+
+##### Outbound `ssh` from a local ghostel buffer
+
+The bundled bash/zsh/fish integration shadows `ssh` with a function
+that:
+
+1. Resolves the canonical target via `ssh -G` (normalises ssh_config
+   aliases).
+2. Looks up the target in `~/.cache/ghostel/ssh-terminfo-cache`.
+   The cache key includes a hash of the local terminfo, so libghostty
+   bumps automatically invalidate it.  Cache hit → connect with the
+   remembered `TERM`.
+3. On miss, runs a single setup ssh that probes whether the entry
+   already exists on the remote, and if not, installs it via
+   `tic -x -` into `~/.terminfo/`.  Records `ok` (use
+   `xterm-ghostty`) or `skip` (use `xterm-256color`) in the cache.
+4. Runs the user's actual ssh with the resolved `TERM`.
+
+The setup ssh is one extra connection per new host.  Without
+ControlMaster you'll see two auth prompts the first time.  Strongly
+recommended:
+
+```ssh-config
+# ~/.ssh/config
+Host *
+    ControlMaster auto
+    ControlPath   ~/.ssh/cm-%r@%h:%p
+    ControlPersist 60s
+```
+
+With this, the setup connection and the real connection share a
+single auth.  Subsequent connections within `ControlPersist` are
+free.
+
+The cache key includes a hash of the **local** terminfo, so
+libghostty bumps automatically invalidate the cache.  It does NOT
+notice when a remote's terminfo changes out-of-band (system update,
+manual `tic`).  Run `M-x ghostel-ssh-clear-terminfo-cache` to force
+re-probe.
+
+Verified working from macOS to Linux remotes.  Mixed macOS-to-macOS
+or BSD targets inherit `tic`'s native hashed-dir layout
+(`~/.terminfo/<hex>/`); `infocmp` reads the same path so they pair
+correctly.
+
+Skip-install heuristics:
+- `ssh HOST cmd` (user passes a remote command): wrapper skips
+  install for that call to avoid clashing with the user's command.
+  Connects with cached `TERM` if known, otherwise `xterm-256color`.
+  The next interactive `ssh HOST` triggers install.
+- `ssh -V`, `ssh -h`, etc. (no host resolved): pass through.
+- No `infocmp` locally: pass through.
+
+Per-call escape: prefix with `GHOSTEL_SSH_KEEP_TERM=1` to bypass
+the wrapper entirely.
+
+##### Manual install (no auto-machinery)
+
+If you'd rather not have ghostel touch remote hosts (and don't want
+the auto-cache), set `(setq ghostel-ssh-install-terminfo nil)` and
+install the entry yourself once per host.
+
+Pipe the local entry across:
+```bash
+infocmp -x xterm-ghostty | ssh REMOTE 'mkdir -p ~/.terminfo && tic -x -'
+```
+
+Or copy the bundled compiled binary from the package directory:
+```bash
+ssh REMOTE 'mkdir -p ~/.terminfo/x'
+scp <package-dir>/terminfo/x/xterm-ghostty REMOTE:~/.terminfo/x/
+# Ghostty also looks in 78/ on macOS:
+ssh REMOTE 'uname' | grep -q Darwin && {
+    ssh REMOTE 'mkdir -p ~/.terminfo/78'
+    scp <package-dir>/terminfo/78/xterm-ghostty REMOTE:~/.terminfo/78/
+}
+```
+
+After this, every shell on the remote sees `xterm-ghostty` and
+ghostel's outbound ssh wrapper is unnecessary.
+
+##### Drop the Ghostty advertisement entirely
+
+Set `(setq ghostel-term "xterm-256color")` to drop `TERM=xterm-ghostty`
+locally.  No advertisement, no terminfo gymnastics, no synchronized
+output fast-path either.
+
 ### Rendering
 - Incremental redraw — only dirty rows are re-rendered
 - Timer-based batched updates with adaptive frame rate
@@ -353,6 +476,64 @@ if [[ "$INSIDE_EMACS" = 'ghostel' ]]; then
 fi
 ```
 
+### Notifications and Progress
+
+Ghostel recognises two notification protocols used by terminal programs:
+
+- **OSC 9** (iTerm2 form): `ESC ] 9 ; BODY ST` — body only.
+- **OSC 777** (rxvt `notify`): `ESC ] 777 ; notify ; TITLE ; BODY ST` — title + body.
+
+Both route to `ghostel-notification-function` with `(TITLE BODY)`.  The
+default handler, `ghostel-default-notify`, uses the
+[alert](https://github.com/jwiegley/alert) package when installed — it
+picks a sensible backend per platform (`osascript` on macOS, libnotify
+on Linux, Growl, terminal-notifier, etc.) and is configurable via
+`alert-default-style`.  Install it from MELPA with `M-x package-install
+RET alert RET`.
+
+When `alert` isn't available, ghostel falls back to `message`, which
+only appears in the echo area.  Set `ghostel-notification-function` to
+nil to silence notifications entirely, or to your own function to route
+them elsewhere.
+
+ConEmu's **OSC 9;4** progress protocol is also recognised: build tools,
+AI agents like Claude Code, and other long-running commands emit it to
+report completion percentage.  Ghostel dispatches these to
+`ghostel-progress-function` with `(STATE PROGRESS)` where STATE is one of
+`remove`, `set`, `error`, `indeterminate`, `pause` and PROGRESS is an
+integer 0-100 or nil.  The default handler, `ghostel-default-progress`,
+updates `mode-line-process` in the terminal buffer:
+
+- `[42%]` — running at 42% done
+- `[...]` — indeterminate progress
+- `[err 73%]` — error (shown in the `error` face)
+- `[paused 25%]` — paused
+- (cleared) — removed
+
+#### Example: spinner.el in the mode line
+
+For a fancier visual indicator during indeterminate progress, swap
+`ghostel-progress-function` for a handler backed by
+[spinner.el](https://github.com/Malabarba/spinner.el):
+
+```elisp
+(require 'spinner)
+(defvar-local my/ghostel-spinner nil)
+(defun my/ghostel-progress (state progress)
+  (pcase state
+    ((or 'set 'indeterminate)
+     (unless my/ghostel-spinner
+       (setq my/ghostel-spinner (spinner-create 'progress-bar t))
+       (spinner-start my/ghostel-spinner))
+     (when (eq state 'set)
+       (setq mode-line-process (format " [%d%%]" (or progress 0)))))
+    ((or 'remove 'error 'pause)
+     (when my/ghostel-spinner
+       (spinner-stop my/ghostel-spinner)
+       (setq my/ghostel-spinner nil)))))
+(setq ghostel-progress-function #'my/ghostel-progress)
+```
+
 ### Color Palette
 
 The 16 ANSI colors are defined as Emacs faces inheriting from `term-color-*`:
@@ -377,6 +558,8 @@ individual faces with `M-x customize-face`.
 |----------------------------------|----------------------|----------------------------------------------------------|
 | `ghostel-module-auto-install`    | `ask`                | What to do when native module is missing (`ask`, `download`, `compile`, `nil`) |
 | `ghostel-shell`                  | `$SHELL`             | Shell program to run                                     |
+| `ghostel-term`                   | `"xterm-ghostty"`    | Value of `TERM` for spawned processes.  Default uses the bundled terminfo so apps can detect ghostel's full capability set.  Set to `"xterm-256color"` to fall back (drops `TERMINFO` and `TERM_PROGRAM=ghostty` too) |
+| `ghostel-ssh-install-terminfo`   | `auto`               | Install `xterm-ghostty` terminfo on remote hosts as needed.  `auto` follows `ghostel-tramp-shell-integration`.  Affects both TRAMP-launched ghostel (push terminfo over the existing TRAMP connection) and outbound `ssh` from a local buffer (install via `tic` on first connection, cache in `~/.cache/ghostel/ssh-terminfo-cache`).  Per-call ssh override: `GHOSTEL_SSH_KEEP_TERM=1` |
 | `ghostel-tramp-shells`           | `(see below)`        | Shell to use per TRAMP method (with login-shell detection) |
 | `ghostel-shell-integration`      | `t`                  | Auto-inject shell integration                            |
 | `ghostel-tramp-default-method`   | `nil`                | TRAMP method for new remote paths from OSC 7 (nil uses `tramp-default-method`) |
@@ -392,6 +575,8 @@ individual faces with `M-x customize-face`.
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
+| `ghostel-notification-function`  | `ghostel-default-notify` | Handler for OSC 9 / OSC 777 desktop notifications (nil disables) |
+| `ghostel-progress-function`      | `ghostel-default-progress` | Handler for OSC 9;4 ConEmu progress reports (nil disables) |
 | `ghostel-enable-url-detection`   | `t`                  | Linkify plain-text URLs in terminal output               |
 | `ghostel-enable-file-detection`  | `t`                  | Linkify file:line references in terminal output          |
 | `ghostel-ignore-cursor-change`   | `nil`                | Ignore terminal-driven cursor shape/visibility changes   |
@@ -442,11 +627,31 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel-send-next-key`    | Send next key literally                      |
 | `M-x ghostel-next-prompt`      | Jump to next shell prompt                    |
 | `M-x ghostel-previous-prompt`  | Jump to previous shell prompt                |
+| `M-x ghostel-next-hyperlink`   | Jump to next hyperlink (OSC 8, URL, file ref) |
+| `M-x ghostel-previous-hyperlink` | Jump to previous hyperlink                 |
 | `M-x ghostel-force-redraw`     | Force a full terminal redraw                 |
 | `M-x ghostel-debug-typing-latency` | Measure per-keystroke typing latency     |
 | `M-x ghostel-sync-theme`       | Re-sync color palette after theme change     |
+| `M-x ghostel-ssh-clear-terminfo-cache` | Clear outbound-ssh terminfo install cache (force re-probe) |
 | `M-x ghostel-download-module`  | Download pre-built native module             |
 | `M-x ghostel-module-compile`   | Compile native module from source            |
+
+### Sending input from Lisp
+
+For packages that need to inject input into a running ghostel buffer
+(agent integrations, custom keymaps, Swerty-style bindings, …) two
+public functions are provided:
+
+```elisp
+(ghostel-send-string "ls -la\n")      ; send raw bytes, newline included
+(ghostel-send-key "return")           ; send a named key through the encoder
+(ghostel-send-key "a" "ctrl")         ; C-a — respects the current terminal mode
+(ghostel-send-key "up" "shift,ctrl")  ; modifiers are comma-separated
+```
+
+Both operate on the current buffer; wrap in `with-current-buffer`
+when driving another ghostel buffer.  Calling either outside a
+ghostel buffer signals a `user-error`.
 
 ### Project integration
 
@@ -466,6 +671,19 @@ footer, error highlighting, and `next-error` navigation — but backed by
 a real TTY so programs that probe `isatty(3)` (coloured output, progress
 bars, curses tools) behave as they do in a normal shell.
 
+Each invocation spawns a fresh process via
+`shell-file-name -c COMMAND` through a PTY owned by the ghostel
+renderer — no interactive shell sits between the command and the
+user, so multi-line shell scripts are passed through verbatim and
+no shell-integration setup is required.  The process sentinel
+delivers the real exit status.
+
+`ghostel-compile` inherits the same `TERM=xterm-ghostty` and
+`TERMINFO=...` env as `M-x ghostel`, so build output gets
+synchronized output, true color, etc.  If a test runner or build
+tool gets confused by the unfamiliar `TERM`, set
+`(setq ghostel-term "xterm-256color")`.
+
 ```elisp
 (require 'ghostel-compile)
 
@@ -474,10 +692,11 @@ bars, curses tools) behave as they do in a normal shell.
 
 Commands:
 
-| Command                 | Description                                         |
-|-------------------------|-----------------------------------------------------|
-| `M-x ghostel-compile`   | Prompt for a command and run it (uses `compile-command`) |
-| `M-x ghostel-recompile` | Re-run the last command in its original directory   |
+| Command                      | Description                                              |
+|------------------------------|----------------------------------------------------------|
+| `M-x ghostel-compile`        | Prompt for a command and run it (uses `compile-command`) |
+| `M-x ghostel-recompile`      | Re-run the last command in its original directory        |
+| `M-x ghostel-compile-global-mode` | Route *all* `compile`-style calls through ghostel (opt-in) |
 
 What a run looks like — the buffer text matches `M-x compile`:
 
@@ -492,16 +711,15 @@ make -j4 test
 Compilation finished at Wed Apr 15 08:30:19, duration 8.20 s
 ```
 
-When the command finishes, the live shell and ghostel renderer are torn
-down and the buffer's major mode is switched to `ghostel-compile-view-mode`
-(derived from `compilation-mode`).  The buffer becomes a regular,
-read-only Emacs buffer with compile-mode's coloured error / line-number
-faces; the buffer never returns to an interactive ghostel terminal —
-a recompile discards it and starts fresh in the original directory.
-Point stays at the end of the output (where the renderer left it) so
-you see the latest output and the footer rather than jumping to the
-top.  `mode-line-process` shows `:run` while the command is running
-and `:exit [N]` afterwards, using the same faces `M-x compile` uses.
+When the command finishes, the live process and ghostel renderer are
+torn down and the buffer's major mode is switched to
+`ghostel-compile-view-mode` (derived from `compilation-mode`).  The
+buffer becomes a regular, read-only Emacs buffer with compile-mode's
+coloured error / line-number faces; the buffer never returns to an
+interactive ghostel terminal — a recompile discards it and starts
+fresh in the original directory.  `mode-line-process` shows
+`:run` while the command is running and `:exit [N]` afterwards, using
+the same faces `M-x compile` uses.
 
 Keybindings (in `ghostel-compile-view-mode`):
 
@@ -531,23 +749,35 @@ These standard `compile` options are honoured:
   `compilation-scroll-output` non-nil).
 
 `ghostel-recompile` runs in the directory the original `ghostel-compile`
-was invoked from, regardless of which buffer you're in when you press
-`g`.
+was invoked from, regardless of which buffer you're in when you press `g`.
+
+#### Make `compile` / `recompile` / `project-compile` use ghostel
+
+Enable `ghostel-compile-global-mode` to advise `compilation-start`
+so every caller that goes through it — `M-x compile`,
+`M-x recompile`, `M-x project-compile`, and any third-party command
+that uses `compilation-start` under the hood — runs in a ghostel
+buffer automatically.
+
+```elisp
+(require 'ghostel-compile)
+(ghostel-compile-global-mode 1)
+```
+
+`grep-mode` falls through to the stock `compilation-start`
+implementation by default, because its output parsing and
+window-management conventions don't fit a live TTY.  Extend
+`ghostel-compile-global-mode-excluded-modes` to opt other modes out.
 
 Ghostel-specific customisation:
 
-| Option                                | Effect                                                                                                          |
-|---------------------------------------|-----------------------------------------------------------------------------------------------------------------|
-| `ghostel-compile-buffer-name`         | Buffer name (default `*ghostel-compile*`)                                                                        |
-| `ghostel-compile-finished-major-mode` | Major mode to switch to after each run (default `ghostel-compile-view-mode`; set to nil to stay in `ghostel-mode`) |
-| `ghostel-compile-hide-prompts`        | Hide surrounding shell prompts (default `t`)                                                                     |
-| `ghostel-compile-clear-buffer`        | Clear the buffer before each run (default `t`)                                                                   |
-| `ghostel-compile-finish-functions`    | Ghostel-specific finish hook (runs alongside `compilation-finish-functions`)                                     |
-| `ghostel-compile-debug`               | Log every OSC 133 C/D event to `*Messages*` (default `nil`)                                                      |
-
-Completion is detected via the OSC 133 `D;<exit>` semantic prompt
-marker, so shell integration (`ghostel-shell-integration`, enabled by
-default) must be active.
+| Option                                       | Effect                                                                                                             |
+|----------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| `ghostel-compile-buffer-name`                | Buffer name (default `*ghostel-compile*`)                                                                          |
+| `ghostel-compile-finished-major-mode`        | Major mode to switch to after each run (default `ghostel-compile-view-mode`; set to nil to stay in `ghostel-mode`) |
+| `ghostel-compile-finish-functions`           | Ghostel-specific finish hook (runs alongside `compilation-finish-functions`)                                       |
+| `ghostel-compile-global-mode-excluded-modes` | Modes for which the global advice falls through to stock `compile` (default `(grep-mode)`)                         |
+| `ghostel-compile-debug`                      | Log lifecycle events to `*Messages*` (default `nil`)                                                               |
 
 #### Hooks for your own integrations
 
@@ -561,6 +791,49 @@ command in *any* ghostel buffer:
 
 Errors raised by individual hook functions are caught and logged so
 one bad consumer can't break the rest.
+
+### Eshell integration
+
+`ghostel-eshell-visual-command-mode` makes eshell run "visual" commands
+— programs in `eshell-visual-commands`, `eshell-visual-subcommands`,
+and `eshell-visual-options` (vim, htop, less, top, `git log`'s pager,
+…) — inside a dedicated ghostel buffer instead of the default
+`term-mode` fallback, so they get a real terminal emulator.
+
+```elisp
+(require 'ghostel-eshell)
+(add-hook 'eshell-load-hook #'ghostel-eshell-visual-command-mode)
+```
+
+When the program exits, the buffer stays on `[Process exited]` so
+you can read any remaining output (window point snaps to the end so
+it's visible without scrolling).  Press `q` to dismiss the dead
+buffer.  Set `eshell-destroy-buffer-when-process-dies` to `t` to
+kill the buffer automatically on exit instead.
+
+To run an ad-hoc command in a ghostel buffer without editing
+`eshell-visual-commands`, use the `ghostel` eshell built-in:
+
+```
+~ $ ghostel nethack
+```
+
+Add a shorter alias if you like:
+
+```elisp
+(defalias 'eshell/v 'eshell/ghostel)    ;; then:  ~ $ v nethack
+```
+
+Customisation:
+
+| Option                       | Effect                                                                                                                    |
+|------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `ghostel-eshell-track-title` | When non-nil, let programs rename the visual-command buffer via OSC title escapes.  Default `nil` (keeps `*vim*` stable). |
+
+The public primitive behind the mode is `ghostel-exec BUFFER PROGRAM
+&optional ARGS`, which launches an arbitrary program in a ghostel
+buffer with no shell integration applied.  Useful for building your
+own integrations.
 
 ## Running Tests
 
@@ -596,11 +869,11 @@ Emacs 31.0.50:
 
 | Backend              | Plain ASCII | URL-heavy |
 |----------------------|------------:|----------:|
-| ghostel              |    70 MB/s  |  56 MB/s  |
-| ghostel (no detect)  |    70 MB/s  |  70 MB/s  |
-| vterm                |    34 MB/s  |  27 MB/s  |
-| eat                  |   4.4 MB/s  | 3.5 MB/s  |
-| term                 |   5.6 MB/s  | 4.7 MB/s  |
+| ghostel              |    87 MB/s  |  64 MB/s  |
+| ghostel (no detect)  |    86 MB/s  |  86 MB/s  |
+| vterm                |    35 MB/s  |  27 MB/s  |
+| eat                  |   4.7 MB/s  | 3.5 MB/s  |
+| term                 |   5.7 MB/s  | 4.7 MB/s  |
 
 Ghostel scans terminal output for URLs and file paths, making them clickable.
 The "no detect" row shows throughput with this detection disabled
@@ -652,6 +925,8 @@ powering Neovim's built-in terminal.
 | Cursor styles                 | 4 types   | 3 types |
 | OSC 8 hyperlinks              | Yes       | No      |
 | Plain-text URL/file detection | Yes       | No      |
+| OSC 9 / 777 notifications     | Yes       | No      |
+| OSC 9;4 progress reports      | Yes       | No      |
 | Kitty keyboard protocol       | Yes       | No      |
 | Mouse passthrough (SGR)       | Yes       | No      |
 | Bracketed paste               | Yes       | Yes     |

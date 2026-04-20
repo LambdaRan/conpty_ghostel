@@ -86,6 +86,35 @@ fn formatColor(color: gt.ColorRgb, buf: *[7]u8) []const u8 {
     return buf[0..7];
 }
 
+/// Tri-state cache of the per-cell raw handle. Used by `buildRowContent`
+/// so cells that need both the semantic-content check (in-prompt) and
+/// the wide-spacer check (empty grapheme) only pay for one
+/// `cells_get(RAW)` call.
+const RawTag = enum { unset, loaded, failed };
+
+/// Lazily populate `out` with the raw cell; memoizes success/failure
+/// in `tag` so repeated calls within one cell do not re-issue the get.
+///
+/// The cache assumes `cells_get(RAW)` is idempotent for a given
+/// iterator position (which it is in libghostty today — it returns a
+/// handle into already-materialized cell data).  If that ever
+/// changes, a failed first call would become sticky for the rest of
+/// the current cell.
+fn loadRawCell(cells: gt.RenderStateRowCells, out: *gt.c.GhosttyCell, tag: *RawTag) bool {
+    switch (tag.*) {
+        .unset => {
+            if (gt.c.ghostty_render_state_row_cells_get(cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(out)) == gt.SUCCESS) {
+                tag.* = .loaded;
+                return true;
+            }
+            tag.* = .failed;
+            return false;
+        },
+        .loaded => return true,
+        .failed => return false,
+    }
+}
+
 /// Read the style for the current cell from the render state.
 fn readCellStyle(cells: gt.RenderStateRowCells) CellStyle {
     var style: CellStyle = .{};
@@ -493,16 +522,19 @@ fn buildRowContent(
             continue;
         }
 
+        // Raw cell handle, fetched lazily for the semantic-content and
+        // wide-spacer checks that each need it. Without the shared slot,
+        // empty prompt padding would pay for two cells_get(RAW) calls.
+        var raw_cell: gt.c.GhosttyCell = undefined;
+        var raw_tag: RawTag = .unset;
+
         // Track leading prompt characters via cell-level semantic content.
         if (in_prompt) {
-            var raw_cell: gt.c.GhosttyCell = undefined;
             var semantic: c_int = 0; // GHOSTTY_CELL_SEMANTIC_OUTPUT
-            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell)) == gt.SUCCESS) {
+            if (loadRawCell(term.row_cells, &raw_cell, &raw_tag)) {
                 _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, @ptrCast(&semantic));
             }
-            if (semantic == gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT) {
-                // Will be updated below after chars are counted
-            } else {
+            if (semantic != gt.c.GHOSTTY_CELL_SEMANTIC_PROMPT) {
                 in_prompt = false;
             }
         }
@@ -529,10 +561,9 @@ fn buildRowContent(
             // Wide-character spacer tails occupy a terminal cell but must
             // not produce output — the preceding wide cell already accounts
             // for 2 visual columns in Emacs.
-            var raw_cell_wide: gt.c.GhosttyCell = undefined;
             var wide: c_int = gt.c.GHOSTTY_CELL_WIDE_NARROW;
-            if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell_wide)) == gt.SUCCESS) {
-                _ = gt.c.ghostty_cell_get(raw_cell_wide, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
+            if (loadRawCell(term.row_cells, &raw_cell, &raw_tag)) {
+                _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
             }
             if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) {
                 has_wide = true;
@@ -887,6 +918,12 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
     // A change means the top row is no longer the row we materialized
     // → wipe the buffer and let the delta-sync below re-fetch everything
     // fresh from libghostty.
+    //
+    // When the hash matches (no rotation), stash it in `cached_row0_hash`
+    // and reuse at end-of-redraw. Promotion / insert-at-tail don't shift
+    // row 0, so the start-of-redraw hash is still valid. Trim and
+    // rotation-erase invalidate the cache.
+    var cached_row0_hash: ?u64 = null;
     if (term.wrote_since_redraw and term.scrollback_in_buffer > 0 and term.first_scrollback_row_hash != 0) {
         const new_hash = computeFirstScrollbackRowHash(term);
         // computeFirstScrollbackRowHash scrolled libghostty's viewport to
@@ -901,6 +938,8 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
             term.scrollback_in_buffer = 0;
             term.first_scrollback_row_hash = 0;
             force_full = true;
+        } else {
+            cached_row0_hash = new_hash;
         }
     }
 
@@ -1005,7 +1044,9 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
         }
     } else if (libghostty_sb < term.scrollback_in_buffer) {
         // libghostty's scrollback cap evicted the oldest rows — trim the
-        // same number of lines from the top of the buffer.
+        // same number of lines from the top of the buffer. Trim shifts
+        // row 0 so the start-of-redraw hash is stale.
+        cached_row0_hash = null;
         const delta = term.scrollback_in_buffer - libghostty_sb;
         env.gotoCharN(1);
         if (env.forwardLine(@as(i64, @intCast(delta))) == 0) {
@@ -1253,10 +1294,21 @@ pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
     }
 
     // Update the cached first-scrollback-row hash for the next redraw's
-    // rotation check. Always re-sample (cheap) because previous-redraw
-    // promotion/insert/trim could have shifted the row at index 0.
+    // rotation check. Reuse the start-of-redraw hash when it's still
+    // valid (no rotation, no trim) — avoids a second scroll-to-top +
+    // render_state_update round trip per redraw.
+    //
+    // If nothing was written AND we didn't populate `cached_row0_hash`
+    // at the top, row 0 cannot have moved since the previous redraw
+    // set `first_scrollback_row_hash`, so skip the compute entirely.
+    // This covers cursor-only redraws and idle-timer fires.
     if (term.scrollback_in_buffer > 0) {
-        term.first_scrollback_row_hash = computeFirstScrollbackRowHash(term);
+        if (cached_row0_hash) |h| {
+            term.first_scrollback_row_hash = h;
+        } else if (term.wrote_since_redraw) {
+            term.first_scrollback_row_hash = computeFirstScrollbackRowHash(term);
+        }
+        // else: no writes, no cached hash → existing value is still current.
     } else {
         term.first_scrollback_row_hash = 0;
     }

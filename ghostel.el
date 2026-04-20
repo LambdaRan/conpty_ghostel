@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.14.0
+;; Version: 0.16.1
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -37,48 +37,52 @@
 ;; Usage:
 ;;
 ;;   M-x ghostel          Open a new terminal
+;;   M-x ghostel-project  Open a terminal in the current project root
 ;;   M-x ghostel-other    Switch to next terminal or create one
 ;;
 ;; Key bindings in the terminal buffer:
 ;;
 ;;   Most keys are sent directly to the shell.  Keys in
 ;;   `ghostel-keymap-exceptions' (C-c, C-x, M-x, etc.) pass through
-;;   to Emacs.  Terminal control keys use a C-c prefix:
+;;   to Emacs.  Terminal control and navigation use a C-c prefix:
 ;;
-;;   C-c C-c   Interrupt        C-c C-z   Suspend
-;;   C-c C-d   EOF              C-c C-\   Quit
-;;   C-c C-t   Copy mode        C-c C-y   Paste
-;;   C-c C-l   Clear scrollback C-c C-q   Send next key literally
-;;   C-y       Yank             M-y       Yank-pop
+;;   C-c C-c   Interrupt          C-c C-z   Suspend
+;;   C-c C-d   EOF                C-c C-\   Quit
+;;   C-c C-t   Copy mode          C-c C-y   Paste
+;;   C-c C-l   Clear scrollback   C-c C-q   Send next key literally
+;;   C-c M-w   Copy scrollback    C-y / M-y Yank / yank-pop
+;;   C-c C-n / C-c C-p            Next/previous hyperlink
+;;   C-c M-n / C-c M-p            Next/previous prompt (OSC 133)
 ;;
 ;; Copy mode (C-c C-t) freezes the display and enables standard Emacs
 ;; navigation.  Set mark with C-SPC, select text, then M-w to copy.
-;; Soft-wrapped newlines and trailing whitespace are stripped
-;; automatically.
 ;;
 ;; Shell integration:
 ;;
-;;   For directory tracking (OSC 7), source the appropriate script
-;;   from etc/ in your shell configuration:
+;;   Directory tracking (OSC 7), prompt navigation (OSC 133), and the
+;;   `ghostel_cmd' helper are auto-injected for bash, zsh, and fish —
+;;   no shell rc changes needed.  Controlled by `ghostel-shell-integration'
+;;   (default t); set it to nil to source etc/ghostel.{bash,zsh,fish}
+;;   manually instead.
 ;;
-;;     # bash (~/.bashrc)
-;;     [[ "$INSIDE_EMACS" = 'ghostel' ]] && \
-;;       source "$EMACS_GHOSTEL_PATH/etc/ghostel.bash"
+;; Native module:
 ;;
-;;     # zsh (~/.zshrc)
-;;     [[ "$INSIDE_EMACS" = 'ghostel' ]] && \
-;;       source "$EMACS_GHOSTEL_PATH/etc/ghostel.zsh"
+;;   A pre-built binary is downloaded automatically on first use.  To
+;;   build from source instead (requires Zig 0.15.2+), run zig build
+;;   from the project root, or M-x ghostel-module-compile.  M-x
+;;   ghostel-download-module re-fetches the pre-built binary.
 ;;
-;; Building the native module (requires Zig 0.15.2+):
-;;
-;;   Run zig build from the project root,
-;;   or M-x ghostel-module-compile from within Emacs.
+;; See also: evil-ghostel.el (evil-mode integration), ghostel-compile.el
+;; (TTY-backed M-x compile replacement), ghostel-eshell.el (eshell
+;; visual-command integration).  TRAMP paths as `default-directory'
+;; spawn remote shells; see README.md for details.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'project)
 (require 'term)
+(require 'text-property-search)
 (require 'tramp)
 (require 'url-parse)
 (require 'face-remap)
@@ -98,6 +102,47 @@
                            (or (getenv "SHELL") "/bin/sh"))
   "Shell program to run in the terminal."
   :type 'string)
+
+(defcustom ghostel-term "xterm-ghostty"
+  "Value of `TERM' for ghostel processes.
+
+The default \"xterm-ghostty\" advertises ghostel's capability set via
+the bundled terminfo entry: synchronized output (DEC 2026), Kitty
+keyboard protocol, true color, colored underlines, focus reporting,
+and more.  Apps that key off these capabilities — Claude Code, modern
+TUIs, neovim, tmux — will use their fast paths.  Notably,
+synchronized output eliminates choppy partial-redraw effects when
+Claude Code or similar TUIs repaint over a large scrollback.
+
+OSC 52 clipboard is supported (`ghostel-enable-osc52', off by
+default) but intentionally NOT advertised in the bundled terminfo,
+to avoid silent yank drops when the option is disabled.
+
+Set to \"xterm-256color\" to fall back to a generic terminal.  When
+`ghostel-term' is not \"xterm-ghostty\", the bundled terminfo and
+`TERM_PROGRAM=ghostty' are not advertised, so nothing claims to be
+Ghostty.  This is also the right setting if outbound `ssh' from a
+ghostel buffer trips up on remote hosts that lack the xterm-ghostty
+terminfo entry."
+  :type '(choice (const :tag "Ghostty (recommended)" "xterm-ghostty")
+                 (const :tag "Generic xterm-256color" "xterm-256color")
+                 (string :tag "Other")))
+
+(defcustom ghostel-ssh-install-terminfo 'auto
+  "Install xterm-ghostty terminfo on remote hosts as needed.
+Affects both `M-x ghostel' from a TRAMP `default-directory' (push
+over the existing TRAMP connection) and outbound `ssh' from a
+local ghostel buffer (install via `tic' on first connection,
+cached in `~/.cache/ghostel/ssh-terminfo-cache').
+
+Values: `auto' (default; enabled when
+`ghostel-tramp-shell-integration' is non-nil), t, nil.  Always
+disabled when `ghostel-term' is not \"xterm-ghostty\".  See the
+README for the full design and per-call escape hatch."
+  :type '(choice
+          (const :tag "Auto (follow `ghostel-tramp-shell-integration')" auto)
+          (const :tag "Always" t)
+          (const :tag "Never" nil)))
 
 (defcustom ghostel-tramp-shells
   '(("ssh" login-shell)
@@ -154,7 +199,7 @@ Set to 0 to disable immediate redraws."
 
 (defcustom ghostel-immediate-redraw-interval 0.05
   "Maximum seconds since last keystroke for immediate redraw.
-Output arriving within this interval of a `ghostel--send-key'
+Output arriving within this interval of a `ghostel--send-string'
 call is considered interactive echo and redrawn immediately
 when the output size is below `ghostel-immediate-redraw-threshold'."
   :type 'number)
@@ -245,6 +290,30 @@ access the local clipboard directly.
 Disabled by default for security: a malicious escape sequence in
 command output could silently overwrite your clipboard."
   :type 'boolean)
+
+(defcustom ghostel-notification-function #'ghostel-default-notify
+  "Function called for OSC 9 / OSC 777 desktop notifications.
+Called with two string arguments: TITLE and BODY.  Title is empty
+for iTerm2-style OSC 9 notifications, which only carry a body.
+Set to nil to ignore notifications.
+
+The handler is invoked asynchronously via `run-at-time', with the
+originating ghostel buffer as `current-buffer', so it may block or
+spawn processes freely without stalling the terminal."
+  :type '(choice (const :tag "Disabled" nil) function))
+
+(defcustom ghostel-progress-function #'ghostel-default-progress
+  "Function called for ConEmu OSC 9;4 progress reports.
+Called with two arguments: STATE (one of the symbols `remove',
+`set', `error', `indeterminate', `pause') and PROGRESS (an integer
+0-100, or nil when not reported).  Set to nil to ignore progress
+reports.
+
+The handler runs synchronously on the VT-parser callpath because
+progress updates are expected to feed the mode line or similar
+cheap UI.  A slow handler here will stall terminal output — defer
+expensive work via `run-at-time' on your own if you need it."
+  :type '(choice (const :tag "Disabled" nil) function))
 
 (defcustom ghostel-enable-url-detection t
   "Automatically detect and linkify URLs in terminal output.
@@ -466,7 +535,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.14.0"
+(defconst ghostel--minimum-module-version "0.16.1"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -475,6 +544,7 @@ Bump this only when the Elisp code requires a newer native module
 ;; Declare native module functions for the byte compiler
 
 (declare-function ghostel--cursor-position "ghostel-module")
+(declare-function ghostel--cursor-pending-wrap-p "ghostel-module")
 (declare-function ghostel--encode-key "ghostel-module")
 (declare-function ghostel--focus-event "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
@@ -680,25 +750,52 @@ DIR is the module directory."
       (unless noninteractive
         (ghostel--ensure-module dir)))))
 
-;; Load the native module
-(unless (featurep 'ghostel-module)
-  (let* ((dir (file-name-directory (or load-file-name buffer-file-name)))
-         (mod (expand-file-name
-               (concat "ghostel-module" module-file-suffix) dir)))
-    (unless (or (file-exists-p mod) noninteractive)
-      (ghostel--ensure-module dir))
-    (if (file-exists-p mod)
+(defun ghostel--load-module (&optional prompt-user)
+  "Ensure the ghostel native module is loaded.
+When the module file is missing, trigger `ghostel-module-auto-install'.
+When PROMPT-USER is non-nil (called from an interactive command like
+`ghostel'), failures signal `user-error' so the calling flow aborts.
+Otherwise (load time), failures `display-warning' instead so the user
+can still compile ghostel, read docs, and so on.
+
+The guard also honours `ghostel--new' being already `fboundp', which
+covers the pure-Elisp test path where `cl-letf' stubs the native
+entry points so tests run without the module present."
+  (unless (or (featurep 'ghostel-module)
+              (fboundp 'ghostel--new))
+    (let* ((dir (file-name-directory (or load-file-name
+                                         (locate-library "ghostel")
+                                         buffer-file-name)))
+           (mod (expand-file-name
+                 (concat "ghostel-module" module-file-suffix) dir)))
+      (unless (or (file-exists-p mod) noninteractive)
+        (ghostel--ensure-module dir))
+      (cond
+       ((file-exists-p mod)
         (condition-case err
             (progn
               (module-load mod)
               (ghostel--check-module-version dir))
           (error
-           (display-warning 'ghostel
-                            (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
-                                    (error-message-string err)))))
-      (display-warning 'ghostel
-                       (concat "Native module not found: " mod
-                               "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))
+           (if prompt-user
+               (user-error "Failed to load ghostel native module: %s"
+                           (error-message-string err))
+             (display-warning
+              'ghostel
+              (format "Failed to load native module: %s\nTry M-x ghostel-module-compile to rebuild"
+                      (error-message-string err)))))))
+       (prompt-user
+        (user-error "Ghostel native module not found: %s.  Run M-x ghostel-download-module or M-x ghostel-module-compile"
+                    mod))
+       (t
+        (display-warning
+         'ghostel
+         (concat "Native module not found: " mod
+                 "\nRun M-x ghostel-download-module or M-x ghostel-module-compile")))))))
+
+;; Load the native module now so the rest of this file (declare-function,
+;; feature consumers) sees it.  Failure is non-fatal at load time.
+(ghostel--load-module)
 
 
 ;;; Internal variables
@@ -722,6 +819,55 @@ Updated whenever the terminal is created or resized.")
 (defvar-local ghostel--force-next-redraw nil
   "When non-nil, redraw regardless of synchronized output mode.")
 
+(defvar ghostel--redraw-resize-active nil
+  "Dynamically bound to t inside a resize-triggered `ghostel--delayed-redraw'.
+Read by `ghostel--window-anchored-p' so the redraw keeps auto-following
+windows anchored even when Emacs redisplay drifted `window-start' below
+the anchor between redraws (e.g. via `keep-point-visible' when the
+minibuffer shrinks the window).  Not set for output-driven redraws,
+clear-scrollback, copy-exit, or snap-to-input — those either reset
+`ghostel--scroll-positions' or set `ghostel--snap-requested', both of
+which already produce the intended anchoring.")
+
+(defvar-local ghostel--snap-requested nil
+  "When non-nil, the next redraw should anchor `window-start' to the viewport.
+Set by `ghostel--snap-to-input' on user-initiated input (typing, paste,
+yank, drop) and cleared by `ghostel--delayed-redraw' after the anchor
+runs.  When nil, a redraw preserves the existing `window-start' if the
+user has scrolled into the scrollback, so live output and Emacs commands
+do not yank the view back to the prompt.")
+
+(defvar-local ghostel--last-anchor-position nil
+  "Buffer position where the anchor last set `window-start'.
+Used by `ghostel--delayed-redraw' to tell windows that are following
+the viewport (window-start at or past this anchor) from windows the
+user has scrolled into the scrollback (window-start below this anchor).
+Robust across redraws that shift viewport-start without the user
+scrolling — e.g. live output that grows the buffer, or a window resize
+that changes `ghostel--term-rows'.")
+
+(defvar-local ghostel--scroll-positions nil
+  "Alist of (WINDOW . (WS-KEY WP-KEY WP-COL)) for scrolled windows.
+Each entry is a window viewing this buffer that is currently in the
+scrollback (not following the viewport).  WS-KEY and WP-KEY are
+multi-line content keys (see `ghostel--line-key') at `window-start'
+and `window-point' respectively; WP-COL is the column of
+`window-point' within its line.  Content-based (rather than byte
+positions or line numbers) so lookups survive the native redraw's
+buffer reshuffles (eraseBuffer + re-insert, scrollback eviction,
+viewport rewrite) while libghostty's logical content is preserved.
+
+The alist is rebuilt each redraw.  The pre-redraw pass in
+`ghostel--delayed-redraw' uses a heuristic to distinguish Emacs
+clamping `window-start' to `point-min' (restore from saved key) from a
+legitimate user scroll to a different valid position (refresh saved
+key to match).  The heuristic misfires if Emacs moves `window-start'
+to a non-`point-min' non-saved position (e.g. programmatic
+`recenter', `follow-mode', window split layouts); in that case the
+saved key is refreshed to the new content and the original scroll
+intent is lost.  That's an accepted tradeoff for avoiding a
+`post-command-hook' that would fire on every keystroke.")
+
 (defvar-local ghostel--has-wide-chars nil
   "Set by the native renderer when wide characters are present.
 Cleared before each redraw; checked afterwards to decide whether
@@ -729,7 +875,7 @@ pixel-based trailing-space compensation is needed.")
 
 
 (defvar-local ghostel--last-send-time nil
-  "Time of the last `ghostel--send-key' call, for immediate-redraw detection.")
+  "Time of the last `ghostel--send-string' call, for immediate-redraw detection.")
 
 (defvar-local ghostel--input-buffer nil
   "Accumulated keystrokes waiting to be flushed to the PTY.")
@@ -768,8 +914,14 @@ If the terminal is tracking mouse events, forward as button 4.
 Otherwise, re-dispatch EVENT through the normal event loop so the
 user's scroll package handles it."
   (interactive "e")
-  (unless (ghostel--forward-scroll-event event 4)
-    (ghostel--redispatch-scroll-event event)))
+  ;; Wheel events on an unselected window are dispatched with
+  ;; `current-buffer' set to the selected window's buffer.  Run the
+  ;; intercept in the event's own buffer so buffer-local state
+  ;; (`ghostel--term', `ghostel--scroll-intercept-active', the
+  ;; `pre-command-hook' re-enable) lands in the ghostel buffer.
+  (with-current-buffer (window-buffer (posn-window (event-start event)))
+    (unless (ghostel--forward-scroll-event event 4)
+      (ghostel--redispatch-scroll-event event))))
 
 (defun ghostel--scroll-intercept-down (event)
   "Intercept wheel-down EVENT for terminal mouse tracking.
@@ -777,8 +929,9 @@ If the terminal is tracking mouse events, forward as button 5.
 Otherwise, re-dispatch EVENT through the normal event loop so the
 user's scroll package handles it."
   (interactive "e")
-  (unless (ghostel--forward-scroll-event event 5)
-    (ghostel--redispatch-scroll-event event)))
+  (with-current-buffer (window-buffer (posn-window (event-start event)))
+    (unless (ghostel--forward-scroll-event event 5)
+      (ghostel--redispatch-scroll-event event))))
 
 (defun ghostel--redispatch-scroll-event (event)
   "Re-dispatch scroll EVENT through the event loop without our intercept.
@@ -855,7 +1008,7 @@ is non-nil.")
             (define-key map (kbd key-str)
                         (let ((code (- c 96)))
                           (lambda () (interactive)
-                            (ghostel--send-key (string code)))))))))
+                            (ghostel--send-string (string code)))))))))
     ;; Meta keys — bind all M-<letter> so they reach the terminal
     ;; instead of running Emacs commands like forward-word.
     (dolist (c (number-sequence ?a ?z))
@@ -864,11 +1017,14 @@ is non-nil.")
           (define-key map (kbd key-str) #'ghostel--send-event))))
     ;; C-@ (NUL, same as C-SPC) — used by programs like Emacs-in-terminal
     (define-key map (kbd "C-@")
-                (lambda () (interactive) (ghostel--send-key "\x00")))
+                (lambda () (interactive) (ghostel--send-string "\x00")))
     ;; C-y: yank from Emacs kill ring into the terminal
     (define-key map (kbd "C-y")       #'ghostel-yank)
     (when (eq system-type 'darwin)
       (define-key map (kbd "s-v")     #'ghostel-yank))
+    ;; Clipboard media keys
+    (define-key map (kbd "<XF86Paste>") #'ghostel-yank)
+    (define-key map (kbd "<XF86Copy>")  #'kill-ring-save)
     (define-key map (kbd "M-y")       #'ghostel-yank-pop)
     ;; Terminal control via C-c prefix (pass through to Emacs, then handled here)
     (define-key map (kbd "C-c C-c")   #'ghostel-send-C-c)
@@ -881,9 +1037,12 @@ is non-nil.")
     (define-key map (kbd "C-c C-y")   #'ghostel-paste)
     (define-key map (kbd "C-c C-l")   #'ghostel-clear-scrollback)
     (define-key map (kbd "C-c C-q")   #'ghostel-send-next-key)
+    ;; Hyperlink navigation (OSC 8, auto-detected URLs, file:line refs)
+    (define-key map (kbd "C-c C-n")   #'ghostel-next-hyperlink)
+    (define-key map (kbd "C-c C-p")   #'ghostel-previous-hyperlink)
     ;; Prompt navigation (OSC 133)
-    (define-key map (kbd "C-c C-n")   #'ghostel-next-prompt)
-    (define-key map (kbd "C-c C-p")   #'ghostel-previous-prompt)
+    (define-key map (kbd "C-c M-n")   #'ghostel-next-prompt)
+    (define-key map (kbd "C-c M-p")   #'ghostel-previous-prompt)
     ;; Mouse click events (for terminal mouse tracking)
     (define-key map (kbd "<down-mouse-1>")  #'ghostel--mouse-press)
     (define-key map (kbd "<mouse-1>")       #'ghostel--mouse-release)
@@ -913,13 +1072,13 @@ of waiting for a continuation keystroke."
     (cond
      ;; Control character (C-@=0, C-a=1 through C-_=31)
      ((and (integerp event) (<= event 31))
-      (ghostel--send-key (string event)))
+      (ghostel--send-string (string event)))
      ;; ASCII (32-127)
      ((and (integerp event) (<= event 127))
-      (ghostel--send-key (string event)))
+      (ghostel--send-string (string event)))
      ;; Non-ASCII character without modifier bits — send as UTF-8
      ((and (integerp event) (< event #x400000))
-      (ghostel--send-key (encode-coding-string (string event) 'utf-8)))
+      (ghostel--send-string (encode-coding-string (string event) 'utf-8)))
      ;; Modified key (M-x, C-M-a, etc.) or function key — use encoder
      (t
       (let* ((base (event-basic-type event))
@@ -950,17 +1109,17 @@ of waiting for a continuation keystroke."
             (ghostel--send-encoded key-name mod-str)
           (message "ghostel: unrecognized key %S" event)))))))
 
-(defun ghostel--send-key (key)
-  "Send KEY string to the terminal process.
+(defun ghostel--send-string (string)
+  "Send STRING as raw bytes to the terminal process.
 Records the send time for immediate-redraw detection and optionally
 coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
   (when (and ghostel--process (process-live-p ghostel--process))
     (setq ghostel--last-send-time (current-time))
     (if (and (> ghostel-input-coalesce-delay 0)
-             (= (length key) 1))
+             (= (length string) 1))
         ;; Coalesce single-char keystrokes
         (progn
-          (push key ghostel--input-buffer)
+          (push string ghostel--input-buffer)
           (unless ghostel--input-timer
             (setq ghostel--input-timer
                   (run-with-timer ghostel-input-coalesce-delay nil
@@ -974,7 +1133,10 @@ coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
           (process-send-string ghostel--process
                                (apply #'concat (nreverse ghostel--input-buffer)))
           (setq ghostel--input-buffer nil)))
-      (process-send-string ghostel--process key))))
+      (process-send-string ghostel--process string))))
+
+(define-obsolete-function-alias 'ghostel--send-key
+  #'ghostel--send-string "0.16.0")
 
 (defun ghostel--flush-input (buffer)
   "Flush coalesced input in BUFFER to the PTY."
@@ -1011,7 +1173,7 @@ Falls back to raw escape sequences if the encoder doesn't produce output."
         ;; immediate-redraw detection (ghostel--flush-output doesn't do this).
         (setq ghostel--last-send-time (current-time))
       (let ((seq (ghostel--raw-key-sequence key-name mods)))
-        (when seq (ghostel--send-key seq))))))
+        (when seq (ghostel--send-string seq))))))
 
 (defun ghostel--raw-key-sequence (key-name mods)
   "Build a raw escape sequence for KEY-NAME with MODS.
@@ -1081,18 +1243,30 @@ Returns the sequence string, or nil for unknown keys."
       (format "\e[%d;%d~" param (1+ mod-num))
     (format "\e[%d~" param)))
 
+(defun ghostel--snap-to-input ()
+  "Return the window to the live viewport on user input.
+Resets the terminal engine's viewport out of scrollback and sets
+`ghostel--snap-requested' so the delayed redraw anchors
+`window-start' to the viewport (and clears any pixel vscroll left
+by `pixel-scroll-precision-mode' or similar scrollers).  No-op
+when `ghostel-scroll-on-input' is nil.  Call from any path where
+the user's action implies \"show me the prompt\" — typed input,
+paste, yank, drop."
+  (when (and ghostel-scroll-on-input ghostel--term)
+    (ghostel--scroll-bottom ghostel--term)
+    (setq ghostel--snap-requested t)
+    (setq ghostel--force-next-redraw t)))
+
 (defun ghostel--self-insert ()
   "Send the last typed character to the terminal."
   (interactive)
-  (when (and ghostel-scroll-on-input ghostel--term)
-    (ghostel--scroll-bottom ghostel--term)
-    (setq ghostel--force-next-redraw t))
+  (ghostel--snap-to-input)
   (let* ((keys (this-command-keys))
          (char (aref keys (1- (length keys))))
          (str (if (and (characterp char) (< char 128))
                   (string char)
                 (encode-coding-string (string char) 'utf-8))))
-    (ghostel--send-key str)))
+    (ghostel--send-string str)))
 
 (defun ghostel--send-event ()
   "Send the current key event to the terminal via the key encoder.
@@ -1100,15 +1274,15 @@ Extracts the base key name and modifiers from `last-command-event'
 and routes through the ghostty key encoder, which respects terminal
 modes (application cursor keys, Kitty keyboard protocol, etc.)."
   (interactive)
-  (when (and ghostel-scroll-on-input ghostel--term)
-    (ghostel--scroll-bottom ghostel--term)
-    (setq ghostel--force-next-redraw t))
+  (ghostel--snap-to-input)
   (let* ((event last-command-event)
          (base (event-basic-type event))
          (mods (event-modifiers event))
          (key-name (cond
                     ;; backtab is Emacs's name for S-TAB
                     ((eq base 'backtab) "tab")
+                    ;; Terminal mode sends ASCII 127 for the backspace key
+                    ((and (integerp base) (= base 127)) "backspace")
                     ;; Integer base (character key)
                     ((integerp base)
                      (and (< base 128) (string base)))
@@ -1135,6 +1309,30 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
       (ghostel--send-encoded key-name mod-str))))
 
 
+;;; Public input API
+
+(defun ghostel-send-string (string)
+  "Send STRING to the terminal process in the current ghostel buffer.
+Signals a `user-error' when called outside a ghostel buffer.  STRING
+is passed through unchanged, including any embedded control
+characters; callers are responsible for UTF-8 encoding if needed."
+  (unless (derived-mode-p 'ghostel-mode)
+    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--send-string string))
+
+(defun ghostel-send-key (key-name &optional mods)
+  "Send KEY-NAME with optional MODS to the terminal's key encoder.
+KEY-NAME is a string like \"a\", \"return\", or \"up\".  MODS is a
+comma-separated modifier string like \"ctrl\" or \"shift,ctrl\", or
+nil for no modifiers.  The encoder respects the terminal's current
+mode (application cursor keys, Kitty keyboard protocol, etc.).
+
+Signals a `user-error' when called outside a ghostel buffer."
+  (unless (derived-mode-p 'ghostel-mode)
+    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--send-encoded key-name (or mods "")))
+
+
 ;;; Terminal control commands (C-c prefix)
 
 (defun ghostel-send-C-c ()
@@ -1150,7 +1348,7 @@ modes (application cursor keys, Kitty keyboard protocol, etc.)."
 (defun ghostel-send-C-backslash ()
   "Send C-\\ (quit) to the terminal."
   (interactive)
-  (ghostel--send-key "\x1c"))
+  (ghostel--send-string "\x1c"))
 
 (defun ghostel-send-C-d ()
   "Send EOF to the terminal."
@@ -1163,7 +1361,7 @@ Clears `quit-flag' which Emacs sets when \\`C-g' is pressed with
 `inhibit-quit' non-nil."
   (interactive)
   (setq quit-flag nil)
-  (ghostel--send-key (string 7)))
+  (ghostel--send-string (string 7)))
 
 
 ;;; Paste / yank
@@ -1179,6 +1377,7 @@ Clears `quit-flag' which Emacs sets when \\`C-g' is pressed with
 (defun ghostel--paste-text (text)
   "Send TEXT to the terminal, using bracketed paste if the terminal wants it."
   (when (and text ghostel--process (process-live-p ghostel--process))
+    (ghostel--snap-to-input)
     (process-send-string ghostel--process
                          (if (ghostel--bracketed-paste-p)
                              (concat "\e[200~" text "\e[201~")
@@ -1239,7 +1438,7 @@ pasted using bracketed paste."
         (let ((type (car arg))
               (objects (cddr arg)))
           (if (eq type 'file)
-              (ghostel--send-key
+              (ghostel--send-string
                (mapconcat #'shell-quote-argument objects " "))
             (ghostel--paste-text
              (mapconcat #'identity objects "\n"))))))))
@@ -1258,6 +1457,16 @@ pasted using bracketed paste."
     (ghostel--write-input ghostel--term "\e[H\e[2J\e[3J")
     (ghostel--scroll-bottom ghostel--term)
     (setq ghostel--force-next-redraw t)
+    ;; Scrollback is gone; any recorded scroll position no longer
+    ;; refers to real content.  Reset so the next redraw anchors
+    ;; fresh to the new (empty) viewport.  No need to set
+    ;; `ghostel--snap-requested' here: nilling
+    ;; `--last-anchor-position' makes `ghostel--window-anchored-p'
+    ;; treat every window as anchored on the next redraw via its
+    ;; bootstrap branch.  (`ghostel-copy-mode-exit' uses the snap
+    ;; flag instead because it preserves `--last-anchor-position'.)
+    (setq ghostel--scroll-positions nil)
+    (setq ghostel--last-anchor-position nil)
     (ghostel--invalidate)
     ;; Send form-feed to the shell so it redraws its prompt.
     (when (and ghostel--process (process-live-p ghostel--process))
@@ -1291,26 +1500,6 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
                             button
                             row col
                             (ghostel--mouse-mods event)))))
-
-
-(defun ghostel-copy-mode-previous-line ()
-  "Move to the previous line in copy mode."
-  (interactive)
-  (let ((col (current-column)))
-    (forward-line -1)
-    (move-to-column col)))
-
-(defun ghostel-copy-mode-next-line ()
-  "Move to the next line in copy mode."
-  (interactive)
-  (let ((col (current-column)))
-    (forward-line 1)
-    (move-to-column col)))
-
-(defun ghostel-copy-mode-beginning-of-buffer ()
-  "Move to the top of the buffer (oldest scrollback) in copy mode."
-  (interactive)
-  (goto-char (point-min)))
 
 (defun ghostel-copy-mode-end-of-buffer ()
   "Move to the bottom of the buffer (current viewport) in copy mode."
@@ -1403,12 +1592,12 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
     (define-key map (kbd "C-g") #'ghostel-copy-mode-exit)
     (define-key map (kbd "M-w") #'ghostel-copy-mode-copy)
     (define-key map (kbd "C-w") #'ghostel-copy-mode-copy)
+    ;; Hyperlink navigation works in copy mode too
+    (define-key map (kbd "C-c C-n") #'ghostel-next-hyperlink)
+    (define-key map (kbd "C-c C-p") #'ghostel-previous-hyperlink)
     ;; Prompt navigation works in copy mode too
-    (define-key map (kbd "C-c C-n") #'ghostel-next-prompt)
-    (define-key map (kbd "C-c C-p") #'ghostel-previous-prompt)
-    (define-key map (kbd "C-n")             #'ghostel-copy-mode-next-line)
-    (define-key map (kbd "C-p")             #'ghostel-copy-mode-previous-line)
-    (define-key map (kbd "M-<")             #'ghostel-copy-mode-beginning-of-buffer)
+    (define-key map (kbd "C-c M-n") #'ghostel-next-prompt)
+    (define-key map (kbd "C-c M-p") #'ghostel-previous-prompt)
     (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
     (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
     (define-key map (kbd "C-l")             #'ghostel-copy-mode-recenter)
@@ -1432,7 +1621,7 @@ Covers both `global-hl-line-mode' and buffer-local `hl-line-mode'.")
   "Enter copy mode for selecting and copying terminal text.
 Live terminal output is paused; standard Emacs navigation, search,
 and marking work across the full scrollback that is already rendered
-in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
+in the buffer."
   (interactive)
   (if ghostel--copy-mode-active
       (ghostel-copy-mode-exit)
@@ -1450,7 +1639,7 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
     (setq buffer-read-only t)
     (setq mode-line-process ":Copy")
     (force-mode-line-update)
-    (message "Copy mode: C-SPC to mark, navigate to select, M-w to copy, q to exit")))
+    (message "Copy mode: Press any key to exit")))
 
 (defun ghostel-copy-mode-exit ()
   "Exit copy mode and return to terminal mode."
@@ -1470,6 +1659,13 @@ in the buffer.  Press \\`q' or \\[ghostel-copy-mode-exit] to exit."
     ;; position point at the terminal cursor (otherwise
     ;; `ghostel--delayed-redraw' would preserve our scrollback marker).
     (goto-char (point-max))
+    ;; Drop stale scroll-state that was frozen while delayed-redraw was
+    ;; short-circuited during copy mode, and let the next redraw snap
+    ;; fresh to the viewport.  `force-next-redraw' is required so the
+    ;; snap fires even when DEC 2026 synchronized output is active.
+    (setq ghostel--scroll-positions nil)
+    (setq ghostel--snap-requested t)
+    (setq ghostel--force-next-redraw t)
     (ghostel--invalidate)
     (message "Copy mode exited")))
 
@@ -1574,6 +1770,60 @@ a line suffix opens at the start of the file or directory."
   "Open the hyperlink at point."
   (interactive)
   (ghostel--open-link (get-text-property (point) 'help-echo)))
+
+(defun ghostel--find-next-link (from)
+  "Return start position of the first hyperlink after FROM, or nil.
+A hyperlink is any region with a non-nil `help-echo' property —
+covers OSC 8 links, auto-detected URLs, and `fileref:' references."
+  (save-excursion
+    (goto-char from)
+    (when-let* ((match (text-property-search-forward
+                        'help-echo nil (lambda (_ v) v) t)))
+      (prop-match-beginning match))))
+
+(defun ghostel--find-previous-link (from)
+  "Return start position of the first hyperlink before FROM, or nil."
+  (save-excursion
+    (goto-char from)
+    (when-let* ((match (text-property-search-backward
+                        'help-echo nil (lambda (_ v) v) t)))
+      (prop-match-beginning match))))
+
+(defun ghostel--goto-hyperlink (direction)
+  "Jump to the next/previous hyperlink.  DIRECTION is `next' or `previous'.
+Wraps around when no link is found in the requested direction.
+Signals `user-error' if the buffer has no hyperlinks at all."
+  (let* ((search (if (eq direction 'next)
+                     #'ghostel--find-next-link
+                   #'ghostel--find-previous-link))
+         (target (funcall search (point))))
+    (unless target
+      (let ((wrap-from (if (eq direction 'next) (point-min) (point-max))))
+        (setq target (funcall search wrap-from))
+        (when target (message "Wrapped"))))
+    (if target
+        (goto-char target)
+      (user-error "No hyperlinks in buffer"))))
+
+(defun ghostel-next-hyperlink (&optional n)
+  "Enter copy mode and move point to the Nth next hyperlink.
+A hyperlink is any OSC 8 link, auto-detected URL, or `file:line'
+reference in the buffer.  Wraps to `point-min' when no link is found
+after point.  Press RET to follow the link at point."
+  (interactive "p")
+  (unless ghostel--copy-mode-active
+    (ghostel-copy-mode))
+  (dotimes (_ (or n 1))
+    (ghostel--goto-hyperlink 'next)))
+
+(defun ghostel-previous-hyperlink (&optional n)
+  "Enter copy mode and move point to the Nth previous hyperlink.
+Wraps to `point-max' when no link is found before point."
+  (interactive "p")
+  (unless ghostel--copy-mode-active
+    (ghostel-copy-mode))
+  (dotimes (_ (or n 1))
+    (ghostel--goto-hyperlink 'previous)))
 
 (defun ghostel--detect-urls (&optional begin end)
   "Scan a buffer region for plain-text URLs and file:line references.
@@ -1825,6 +2075,99 @@ Only acts when `ghostel-enable-osc52' is non-nil."
         (when (fboundp 'gui-set-selection)
           (gui-set-selection 'CLIPBOARD text))))))
 
+(defun ghostel-default-notify (title body)
+  "Default handler for OSC 9 / OSC 777 notifications.
+Uses the `alert' package (https://github.com/jwiegley/alert) when
+available - it picks a sensible backend per platform (osascript on
+macOS, libnotify on Linux, Growl, terminal-notifier, etc.).  Falls
+back to `message' when alert isn't installed.  TITLE is the
+notification summary; when empty (iTerm2-style OSC 9) the buffer
+name is used.  BODY is the notification text.
+
+Runs deferred off the VT-parser callpath by
+`ghostel--handle-notification' with the originating ghostel buffer
+current, so `buffer-name' here gives the terminal buffer's name."
+  (let ((summary (if (or (null title) (string-empty-p title))
+                     (buffer-name)
+                   title)))
+    (if (and (require 'alert nil t) (fboundp 'alert))
+        (alert body :title summary)
+      (message "%s: %s" summary body))))
+
+(defun ghostel-default-progress (state progress)
+  "Default handler for OSC 9;4 ConEmu progress reports.
+Updates `mode-line-process' to show the current STATE and
+PROGRESS (an integer 0-100 or nil).  STATE is one of the symbols
+`remove', `set', `error', `indeterminate', `pause'."
+  (let ((new-val
+         (pcase state
+           ('remove        nil)
+           ('set           (format " [%d%%]" (or progress 0)))
+           ('indeterminate " [...]")
+           ('error         (propertize (if progress
+                                           (format " [err %d%%]" progress)
+                                         " [err]")
+                                       'face 'error))
+           ('pause         (if progress
+                               (format " [paused %d%%]" progress)
+                             " [paused]"))
+           ;; Unknown state: keep the current mode-line value rather
+           ;; than silently clearing it, so a future Zig-side state is
+           ;; visible-but-stale instead of disappearing.
+           (_              mode-line-process))))
+    (unless (equal new-val mode-line-process)
+      (setq mode-line-process new-val)
+      (force-mode-line-update))))
+
+(defun ghostel--handle-notification (title body)
+  "Dispatch TITLE and BODY to `ghostel-notification-function'.
+Called synchronously from the native VT parser; the user handler
+is invoked off the callpath via `run-at-time' so a slow backend
+\(DBus, osascript, etc.) can't stall terminal output.  The
+originating ghostel buffer is made current for the handler, so
+`buffer-name' etc. report the terminal buffer and not whatever was
+current when the timer happened to fire.  Errors in the handler
+are caught and logged — an unhandled error in a timer callback
+does not crash the process filter, but it does produce a backtrace
+in batch runs."
+  (when ghostel-notification-function
+    (let ((buf (current-buffer))
+          (fn ghostel-notification-function))
+      (run-at-time
+       0 nil
+       (lambda ()
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             ;; Only `error' is caught here — `quit' (C-g) is allowed
+             ;; to propagate so a user can interrupt a hung handler.
+             ;; Emacs' timer machinery swallows a propagated quit.
+             (condition-case err
+                 (funcall fn title body)
+               (error
+                (message "ghostel: notification handler error: %s"
+                         (error-message-string err)))))))))))
+
+(defun ghostel--osc-progress (state-str progress)
+  "Dispatch ConEmu OSC 9;4 progress to `ghostel-progress-function'.
+STATE-STR is the state name as a string (sent from the native
+module); it is converted to a known symbol via an explicit allowlist
+to avoid polluting the obarray if a future Zig-side typo sneaks in.
+Unknown state strings are silently dropped.
+PROGRESS is an integer 0-100 or nil."
+  (when ghostel-progress-function
+    (let ((state-sym (pcase state-str
+                       ("remove"        'remove)
+                       ("set"           'set)
+                       ("error"         'error)
+                       ("indeterminate" 'indeterminate)
+                       ("pause"         'pause))))
+      (when state-sym
+        (condition-case err
+            (funcall ghostel-progress-function state-sym progress)
+          (error
+           (message "ghostel: progress handler error: %s"
+                    (error-message-string err))))))))
+
 (defun ghostel--flush-output (data)
   "Write DATA back to the shell process (response from terminal)."
   (when (and ghostel--process (process-live-p ghostel--process))
@@ -1967,17 +2310,41 @@ Call this after changing the Emacs theme so terminals match."
 
 ;;; Focus events
 
-(defun ghostel--focus-change ()
-  "Notify ghostel terminals in the selected frame about focus change.
-Only send the event if the terminal has enabled focus reporting (mode 1004)."
-  (let ((focused (frame-focus-state)))
-    (dolist (buf (buffer-list))
+(defvar-local ghostel--focus-state nil
+  "Last focus state actually reported to the terminal for this buffer.
+Non-nil means a focus-in event was delivered.  Only updated when
+`ghostel--focus-event' actually emits (mode 1004 enabled), so that
+enabling 1004 after a focus change still lets the next event fire.")
+
+(defun ghostel--buffer-focused-p (buf)
+  "Return non-nil if BUF is logically focused.
+BUF is focused when it is displayed in the selected window of a
+frame whose focus state is t (i.e. the frame has keyboard focus
+and the buffer is the active selection within it)."
+  (seq-some (lambda (win)
+              (let ((frame (window-frame win)))
+                (and (eq (frame-focus-state frame) t)
+                     (eq win (frame-selected-window frame)))))
+            (get-buffer-window-list buf nil t)))
+
+(defun ghostel--focus-change (&rest _)
+  "Update focus state for every live ghostel buffer.
+Called from `after-focus-change-function',
+`window-selection-change-functions', and
+`window-buffer-change-functions'.  Sends a focus event only when
+the buffer's logical focus state transitions; `ghostel--focus-event'
+further gates on terminal mode 1004."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
       (with-current-buffer buf
         (when (and (derived-mode-p 'ghostel-mode)
                    ghostel--term
                    ghostel--process
                    (process-live-p ghostel--process))
-          (ghostel--focus-event ghostel--term focused))))))
+          (let ((focused (and (ghostel--buffer-focused-p buf) t)))
+            (unless (eq focused ghostel--focus-state)
+              (when (ghostel--focus-event ghostel--term focused)
+                (setq ghostel--focus-state focused)))))))))
 
 (defvar-local ghostel--pending-output nil
   "Accumulated output chunks waiting to be fed to the terminal.
@@ -2042,7 +2409,6 @@ PROCESS is the shell process, EVENT describes the state change."
         (when ghostel--input-timer
           (cancel-timer ghostel--input-timer)
           (setq ghostel--input-timer nil))
-        (remove-function after-focus-change-function #'ghostel--focus-change)
         (run-hook-with-args 'ghostel-exit-functions buf event)
         (if ghostel-kill-buffer-on-exit
             (kill-buffer buf)
@@ -2153,10 +2519,58 @@ When `default-directory' is a remote TRAMP path, consult
     (buffer-string)))
 
 (defun ghostel--write-remote-file (tramp-path content)
-  "Write CONTENT to TRAMP-PATH on the remote host."
+  "Write CONTENT to TRAMP-PATH on the remote host.
+CONTENT may be a unibyte string (e.g. compiled terminfo bytes) or
+a multibyte string (e.g. shell rc).  The temp buffer is set unibyte
+when CONTENT is unibyte so byte values round-trip without depending
+on an outer `coding-system-for-write' binding."
   (with-temp-buffer
+    (when (not (multibyte-string-p content))
+      (set-buffer-multibyte nil))
     (insert content)
     (write-region (point-min) (point-max) tramp-path nil 'silent)))
+
+(defun ghostel--push-remote-terminfo (remote-prefix)
+  "Push bundled compiled terminfo into a temp dir on the remote host.
+
+REMOTE-PREFIX is the TRAMP prefix (e.g. \"/ssh:host:\").  Writes
+both the Linux (x/) and macOS (78/) layouts so the remote ncurses
+or BSD libcurses finds it regardless of OS.  Returns a plist
+\(:env (...) :temp-dirs (...)) suitable for merging into the
+remote-integration plist, or nil if the local terminfo isn't
+available or the push fails."
+  (let ((local-dir (ghostel--terminfo-directory)))
+    (when local-dir
+      (condition-case err
+          (let* ((temp-dir (make-temp-file
+                            (concat remote-prefix "ghostel-tinfo-") t))
+                 (remote-dir (file-remote-p temp-dir 'localname))
+                 (coding-system-for-write 'binary)
+                 (coding-system-for-read 'binary))
+            (dolist (sub '("x" "g" "78" "67"))
+              (let ((src (expand-file-name
+                          (pcase sub
+                            ((or "x" "78") "xterm-ghostty")
+                            ((or "g" "67") "ghostty"))
+                          (expand-file-name sub local-dir))))
+                (when (file-readable-p src)
+                  (let ((bytes (with-temp-buffer
+                                 (set-buffer-multibyte nil)
+                                 (insert-file-contents-literally src)
+                                 (buffer-string)))
+                        (dest (concat (file-name-as-directory temp-dir)
+                                      sub "/"
+                                      (if (member sub '("x" "78"))
+                                          "xterm-ghostty"
+                                        "ghostty"))))
+                    (make-directory (file-name-directory dest) t)
+                    (ghostel--write-remote-file dest bytes)))))
+            (list :env (list (format "TERMINFO=%s" remote-dir))
+                  :temp-dirs (list temp-dir)))
+        (error
+         (message "ghostel: remote terminfo push failed: %s"
+                  (error-message-string err))
+         nil)))))
 
 (defun ghostel--cleanup-temp-paths (files dirs)
   "Delete temporary FILES and DIRS created for remote shell integration.
@@ -2167,11 +2581,25 @@ such as a per-session `.zshenv', are cleaned up as well."
   (dolist (d dirs)
     (ignore-errors (delete-directory d t))))
 
+(defun ghostel--merge-integration-plists (base extra)
+  "Merge EXTRA into BASE plist, appending list values for shared keys.
+Used to fold the terminfo-push plist into a shell-rc plist so the
+caller sees one combined :env / :temp-dirs / :temp-files."
+  (let ((out (copy-sequence base)))
+    (dolist (key '(:env :temp-files :temp-dirs))
+      (let ((b (plist-get base key))
+            (e (plist-get extra key)))
+        (when (or b e)
+          (setq out (plist-put out key (append b e))))))
+    out))
+
 (defun ghostel--setup-remote-integration (shell-type)
   "Set up shell integration on the remote host for SHELL-TYPE.
 Reads the local integration script, writes it (with any necessary
-preamble) to a temporary file on the remote host, and returns a
-plist (:env :args :stty :temp-files :temp-dirs) for
+preamble) to a temporary file on the remote host.  When the bundled
+terminfo is available locally, also pushes it to a remote temp dir
+over the same TRAMP connection and adds `TERMINFO=...' to the env.
+Returns a plist (:env :args :stty :temp-files :temp-dirs) for
 `ghostel--start-process'.
 Returns nil on failure."
   (condition-case err
@@ -2183,8 +2611,10 @@ Returns nil on failure."
              (ext (symbol-name shell-type))
              (integration (ghostel--read-local-file
                            (expand-file-name
-                            (format "etc/ghostel.%s" ext) ghostel-dir))))
-        (pcase shell-type
+                            (format "etc/ghostel.%s" ext) ghostel-dir)))
+             (tinfo (and (ghostel--ssh-install-enabled-p)
+                         (ghostel--push-remote-terminfo remote-prefix)))
+             (base (pcase shell-type
           ;; Bash: --rcfile replaces normal rc loading, so we source
           ;; startup files explicitly before the integration.
           ('bash
@@ -2247,11 +2677,175 @@ Returns nil on failure."
              (list :env nil
                    :args (list "-C" (format "source %s"
                                             (shell-quote-argument path)))
-                   :stty "erase '^?' iutf8 -ixon" :temp-files (list temp))))))
+                   :stty "erase '^?' iutf8 -ixon" :temp-files (list temp)))))))
+        (if tinfo
+            (ghostel--merge-integration-plists base tinfo)
+          base))
     (error
      (message "ghostel: remote shell integration failed: %s"
               (error-message-string err))
      nil)))
+
+(defvar ghostel--terminfo-warned nil
+  "Non-nil after a warning about missing bundled terminfo has been issued.
+Suppresses repeat warnings on every spawn.")
+
+(defun ghostel--package-directory ()
+  "Return the directory ghostel is loaded from, or nil."
+  (let ((src (or (locate-library "ghostel")
+                 load-file-name buffer-file-name)))
+    (and src (file-name-directory src))))
+
+(defun ghostel--terminfo-directory ()
+  "Return absolute path to bundled `terminfo/' directory if usable.
+Usable means a compiled xterm-ghostty entry exists in either the
+macOS hashed-dir layout (78/xterm-ghostty) or the Linux layout
+\(x/xterm-ghostty).  Returns nil if missing."
+  (let* ((pkg (ghostel--package-directory))
+         (dir (and pkg (expand-file-name "terminfo" pkg))))
+    (and dir
+         (file-directory-p dir)
+         (or (file-readable-p (expand-file-name "78/xterm-ghostty" dir))
+             (file-readable-p (expand-file-name "x/xterm-ghostty" dir)))
+         dir)))
+
+(defun ghostel--ssh-install-enabled-p ()
+  "Return non-nil if remote terminfo install is enabled.
+Honors `ghostel-ssh-install-terminfo'.  Always nil when
+`ghostel-term' isn't \"xterm-ghostty\" — there's no point installing
+ghostty terminfo on remotes when we're not even claiming it locally."
+  (and (equal ghostel-term "xterm-ghostty")
+       (pcase ghostel-ssh-install-terminfo
+         ('auto (and ghostel-tramp-shell-integration t))
+         ('nil  nil)
+         (_     t))))
+
+(defun ghostel-ssh-clear-terminfo-cache ()
+  "Delete the outbound-ssh terminfo install cache file.
+The bundled bash/zsh/fish wrappers cache per-host install outcomes
+in `~/.cache/ghostel/ssh-terminfo-cache' (XDG-aware).  Cache keys
+include a hash of the local terminfo, so libghostty bumps invalidate
+the local entries automatically — but not stale entries from before
+a remote out-of-band update.  Run this command after such an update
+\(or whenever you suspect the cache is wrong) to force re-probe."
+  (interactive)
+  (let* ((dir (or (getenv "XDG_CACHE_HOME")
+                  (expand-file-name ".cache" "~")))
+         (cache (expand-file-name "ghostel/ssh-terminfo-cache" dir)))
+    (if (file-exists-p cache)
+        (progn (delete-file cache)
+               (message "ghostel: cleared %s" cache))
+      (message "ghostel: no cache at %s" cache))))
+
+(defun ghostel--terminal-env ()
+  "Return list of TERM-related env-var strings for ghostel processes.
+Honors `ghostel-term' and `ghostel-ssh-install-terminfo'.  When
+\"xterm-ghostty\" is requested but the bundled terminfo isn't readable,
+falls back to xterm-256color and warns once per session.  The SSH
+install env var is only exported when the resolved TERM is actually
+xterm-ghostty — falling back to xterm-256color must not advertise a
+wrapper that would re-claim ghostty over ssh."
+  (let* ((env (cond
+               ((not (equal ghostel-term "xterm-ghostty"))
+                (list (concat "TERM=" ghostel-term) "COLORTERM=truecolor"))
+               (t
+                (let ((tinfo (ghostel--terminfo-directory)))
+                  (cond
+                   (tinfo
+                    (list "TERM=xterm-ghostty"
+                          (concat "TERMINFO=" tinfo)
+                          "TERM_PROGRAM=ghostty"
+                          "COLORTERM=truecolor"))
+                   (t
+                    (unless ghostel--terminfo-warned
+                      (setq ghostel--terminfo-warned t)
+                      (display-warning
+                       'ghostel
+                       (format
+                        "Bundled terminfo not found in %s; falling back to TERM=xterm-256color.  \
+Apps like Claude Code may exhibit choppy redraws.  Reinstall ghostel \
+to restore the terminfo/ directory, or customize `ghostel-term' to silence."
+                        (or (ghostel--package-directory) "<unknown>"))
+                       :warning))
+                    (list "TERM=xterm-256color" "COLORTERM=truecolor"))))))))
+    (if (and (member "TERM=xterm-ghostty" env)
+             (ghostel--ssh-install-enabled-p))
+        (append env (list "GHOSTEL_SSH_INSTALL_TERMINFO=1"))
+      env)))
+
+(defun ghostel--spawn-pty (program program-args height width stty-flags
+                                   extra-env &optional remote-p)
+  "Spawn PROGRAM with PROGRAM-ARGS as a PTY-backed process in the current buffer.
+
+Wraps PROGRAM in `/bin/sh -c' so that `stty' can configure the PTY
+\(with STTY-FLAGS plus rows=HEIGHT columns=WIDTH) and the screen is
+cleared before PROGRAM is exec'd.  EXTRA-ENV is prepended to
+`process-environment'.  Non-nil REMOTE-P spawns the process via the
+TRAMP file handler (for remote shells).
+
+Installs `ghostel--filter' and `ghostel--sentinel', sets binary I/O,
+matches the PTY window size, and stores the process in
+`ghostel--process'.  Returns the process."
+  ;; Wrap the program in /bin/sh -c so we can configure the PTY
+  ;; before the program reads its terminal attributes:
+  ;;  - erase '^?': Emacs PTYs leave VERASE undefined, but
+  ;;    shells like fish check VERASE at startup to decide
+  ;;    whether \x7f means backspace.
+  ;;  - iutf8: kernel-level UTF-8 awareness so backspace
+  ;;    correctly erases multi-byte characters.
+  ;;  - -ixon: disable XON/XOFF flow control so C-q and C-s
+  ;;    pass through to the application instead of being
+  ;;    swallowed by the PTY line discipline.
+  ;;  - echo (bash-only): readline buffers its own echo, so
+  ;;    we need PTY-level echo early in startup.  Old bash
+  ;;    versions (notably macOS /bin/bash 3.2) may initialize
+  ;;    readline before ENV-sourced integration runs.
+  ;; The clear-screen hides the stty output.  exec replaces
+  ;; the wrapper so only the target program remains.
+  (let* ((shell-command
+          (list "/bin/sh" "-c"
+                (concat "stty " stty-flags
+                        (format " rows %d columns %d" height width)
+                        " 2>/dev/null; "
+                        "printf '\\033[H\\033[2J'; exec "
+                        (shell-quote-argument program)
+                        (and program-args
+                             (concat " "
+                                     (mapconcat #'shell-quote-argument
+                                                program-args " "))))))
+         (process-environment
+          (append
+           (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
+           extra-env
+           process-environment))
+         ;; Large TUI redraws (Claude Code, pi on resize) can emit
+         ;; hundreds of KB in one write.  Before Emacs 31,
+         ;; `process-adaptive-read-buffering' defaults to t and
+         ;; throttles the filter to ~40 KB/s for bursty processes,
+         ;; making resize feel like a slow cascade.
+         ;; Also raise the per-read cap so one filter call can
+         ;; consume a full redraw frame.  Both are captured at
+         ;; `make-process' time, so they must be let-bound here.
+         (process-adaptive-read-buffering nil)
+         (read-process-output-max (max read-process-output-max (* 1024 1024)))
+         (proc (make-process
+                :name "ghostel"
+                :buffer (current-buffer)
+                :command shell-command
+                :connection-type 'pty
+                :file-handler remote-p
+                :filter #'ghostel--filter
+                :sentinel #'ghostel--sentinel)))
+    (setq ghostel--process proc)
+    ;; Raw binary I/O — no encoding/decoding by Emacs
+    (set-process-coding-system proc 'binary 'binary)
+    ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
+    ;; the program's line editor (readline/ZLE) can render properly.
+    (set-process-window-size proc height width)
+    (set-process-query-on-exit-flag proc nil)
+    (process-put proc 'adjust-window-size-function
+                 #'ghostel--window-adjust-process-window-size)
+    proc))
 
 (defun ghostel--start-process ()
   "Start the shell process with a PTY.
@@ -2321,22 +2915,6 @@ on the remote host."
                            (format "XDG_DATA_DIRS=%s:%s" integ-dir xdg)
                            (format "GHOSTEL_SHELL_INTEGRATION_XDG_DIR=%s"
                                    integ-dir))))))))))
-         ;; Wrap the shell in /bin/sh -c so we can configure the PTY
-         ;; before the shell reads its terminal attributes:
-         ;;  - erase '^?': Emacs PTYs leave VERASE undefined, but
-         ;;    shells like fish check VERASE at startup to decide
-         ;;    whether \x7f means backspace.
-         ;;  - iutf8: kernel-level UTF-8 awareness so backspace
-         ;;    correctly erases multi-byte characters.
-         ;;  - -ixon: disable XON/XOFF flow control so C-q and C-s
-         ;;    pass through to the application instead of being
-         ;;    swallowed by the PTY line discipline.
-         ;;  - echo: bash-only — readline buffers its own echo, so
-         ;;    we need PTY-level echo early in startup.  Old bash
-         ;;    versions (notably macOS /bin/bash 3.2) may initialize
-         ;;    readline before ENV-sourced integration runs.
-         ;; The clear-screen hides the stty output.  exec replaces
-         ;; the wrapper so only the shell process remains.
          (shell-args (cond
                       (remote-integration
                        (plist-get remote-integration :args))
@@ -2349,52 +2927,25 @@ on the remote host."
                       ((eq shell-type 'bash)
                        "erase '^?' iutf8 -ixon echo")
                       (t "erase '^?' iutf8 -ixon")))
-         (shell-command
-          (list "/bin/sh" "-c"
-                (concat "stty " stty-flags
-                        (format " rows %d columns %d" height width)
-                        " 2>/dev/null; "
-                        "printf '\\033[H\\033[2J'; exec "
-                        (shell-quote-argument shell)
-                        (and shell-args
-                             (concat " "
-                                     (mapconcat #'shell-quote-argument
-                                                shell-args " "))))))
-         (process-environment
-          (append
-           (list
-            "INSIDE_EMACS=ghostel"
-            "TERM=xterm-256color"
-            "COLORTERM=truecolor")
-           (unless remote-p
-             (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
-           integration-env
-           process-environment))
+         (extra-env (append
+                     (unless remote-p
+                       (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
+                     integration-env))
          (proc (if (eq system-type 'windows-nt)
                    (ghostel--conpty-proxy-make-process width height)
-                 (make-process
-                  :name "ghostel"
-                  :buffer (current-buffer)
-                  :command shell-command
-                  :connection-type 'pty
-                  :file-handler remote-p
-                  :filter #'ghostel--filter
-                  :sentinel #'ghostel--sentinel))))
+                 (ghostel--spawn-pty shell shell-args height width
+                                     stty-flags extra-env remote-p))))
     (when remote-integration
       (ghostel--cleanup-temp-paths
        (plist-get remote-integration :temp-files)
        (plist-get remote-integration :temp-dirs)))
     (setq ghostel--process proc)
-    ;; Raw binary I/O — no encoding/decoding by Emacs
-    (set-process-coding-system proc 'binary 'binary)
-    (unless (eq system-type 'windows-nt)
-      ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
-      ;; the shell's line editor (readline/ZLE) can render properly.
-      ;; On Windows, conpty-proxy sets size via its command line args.
-      (set-process-window-size proc height width))
-    (set-process-query-on-exit-flag proc nil)
-    (process-put proc 'adjust-window-size-function
-                 #'ghostel--window-adjust-process-window-size)
+    (when (eq system-type 'windows-nt)
+      ;; ConPTY process: raw binary I/O, no PTY window-size ioctl
+      (set-process-coding-system proc 'binary 'binary)
+      (set-process-query-on-exit-flag proc nil)
+      (process-put proc 'adjust-window-size-function
+                   #'ghostel--window-adjust-process-window-size))
     proc))
 
 
@@ -2424,6 +2975,54 @@ frame after idle to improve interactive responsiveness."
                             #'ghostel--delayed-redraw
                             (current-buffer))))))
 
+(defconst ghostel--line-context-lines 3
+  "Number of lines (including the target) used as a disambiguation key.
+`ghostel--line-key' captures this many consecutive lines starting at a
+position; `ghostel--find-line-pos' searches for the exact multi-line
+block to locate that position after the buffer has been rewritten.
+Larger values better disambiguate repeated content (blank lines,
+identical prompts) at the cost of wider comparisons.")
+
+(defun ghostel--line-key (pos)
+  "Return a disambiguation key for the line containing POS.
+The key is a list of consecutive line strings starting with the line
+at POS, of length up to `ghostel--line-context-lines'.  Passed to
+`ghostel--find-line-pos' to re-locate POS after the buffer has been
+rewritten.  Multiple scrollback lines may share identical text (blank
+lines, repeated prompts), but a short run of consecutive lines is
+far more likely to be unique."
+  (save-excursion
+    (goto-char pos)
+    (let ((lines nil)
+          (n ghostel--line-context-lines))
+      (while (and (> n 0) (not (eobp)))
+        (push (buffer-substring-no-properties
+               (line-beginning-position) (line-end-position))
+              lines)
+        (forward-line 1)
+        (setq n (1- n)))
+      (nreverse lines))))
+
+(defun ghostel--find-line-pos (key &optional col)
+  "Find the beginning-of-line position matching KEY.
+KEY is a list of consecutive line strings produced by
+`ghostel--line-key'.  Returns the position of the first match of the
+full multi-line block, or nil if no match.  With COL, returns the
+position COL columns into the first matched line."
+  (when (and key (listp key) (stringp (car key)))
+    (let ((pattern
+           (concat "^" (mapconcat #'regexp-quote key "\n") "$")))
+      (save-excursion
+        (goto-char (point-min))
+        (when (re-search-forward pattern nil t)
+          (let ((found (match-beginning 0)))
+            (if col
+                (save-excursion
+                  (goto-char found)
+                  (move-to-column col)
+                  (point))
+              found)))))))
+
 (defun ghostel--flush-pending-output ()
   "Feed any accumulated output to the terminal in a single batch."
   (when ghostel--pending-output
@@ -2437,73 +3036,177 @@ frame after idle to improve interactive responsiveness."
       (save-current-buffer
         (ghostel--write-input ghostel--term combined)))))
 
+(defsubst ghostel--viewport-start ()
+  "Position of the first line of the terminal viewport, or nil if rows<=0."
+  (let ((tr (or ghostel--term-rows 0)))
+    (when (> tr 0)
+      (save-excursion
+        (goto-char (point-max))
+        ;; Partial redraws can leave a trailing \n after the last row.
+        ;; Step past it so `forward-line' counts only content rows, not
+        ;; the phantom empty line that would otherwise push the viewport
+        ;; one line too deep and clip the bottom row.
+        (when (and (> (point) (point-min))
+                   (eq (char-before) ?\n))
+          (forward-char -1))
+        (forward-line (- (1- tr)))
+        (line-beginning-position)))))
+
+(defsubst ghostel--window-anchored-p (win)
+  "Non-nil if WIN is auto-following the viewport.
+A window counts as anchored when `ghostel--snap-requested' is set
+\(the user just typed), when no anchor has been recorded yet (first
+redraw), or when its `window-start' is at or past the prior anchor.
+During a resize-triggered redraw, a window absent from
+`ghostel--scroll-positions' also counts as anchored: the prior redraw
+left it following the viewport, so a drifted `window-start' below the
+anchor is Emacs redisplay (e.g. `keep-point-visible' when the
+minibuffer shrinks the window), not a user scroll."
+  (let ((anchor ghostel--last-anchor-position))
+    (or ghostel--snap-requested
+        (null anchor)
+        (>= (window-start win) anchor)
+        (and ghostel--redraw-resize-active
+             (not (assq win ghostel--scroll-positions))))))
+
+(defun ghostel--capture-window-state (win)
+  "Return (WIN WS-KEY WP-KEY WP-COL) for WIN.
+Used to snapshot a non-anchored window's scroll position so it can
+be restored after the native redraw rewrites the buffer."
+  (let ((wp (window-point win)))
+    (list win
+          (ghostel--line-key (window-start win))
+          (ghostel--line-key wp)
+          (save-excursion (goto-char wp) (current-column)))))
+
+(defun ghostel--position-mangled-p (pos saved-key)
+  "Return non-nil when POS looks like Emacs clamped it to `point-min'.
+The mangling signature is: POS is `point-min' and SAVED-KEY does not
+match the content currently at `point-min' (i.e. the saved content
+lived elsewhere).  Other cases — SAVED-KEY still matches POS (fast
+path), or POS is at some other valid line (legitimate user scroll)
+— return nil; the post-redraw capture records them."
+  (and (= pos (point-min))
+       (not (equal saved-key (ghostel--line-key pos)))))
+
+(defun ghostel--reconcile-saved-position (win entry)
+  "Restore WIN's ws/wp from ENTRY when Emacs has clamped them to point-min.
+ENTRY is an alist entry of the form (WIN . (WS-KEY WP-KEY WP-COL)).
+For ws and wp independently: when the live position looks mangled
+\(see `ghostel--position-mangled-p'), search for the saved content
+and move the window back.  Other position changes are left alone —
+the post-redraw capture rebuilds `ghostel--scroll-positions' from
+each window's live state, so refreshing the saved key here would
+be a dead write."
+  (let ((data (cdr entry)))
+    (when (ghostel--position-mangled-p (window-start win) (nth 0 data))
+      (let ((p (ghostel--find-line-pos (nth 0 data))))
+        (when p (set-window-start win p t))))
+    (when (ghostel--position-mangled-p (window-point win) (nth 1 data))
+      (let ((p (ghostel--find-line-pos (nth 1 data) (nth 2 data))))
+        (when p (set-window-point win p))))))
+
+(defun ghostel--correct-mangled-scroll-positions (buffer)
+  "Apply the mangling heuristic to every saved scroll position on BUFFER.
+Emacs redisplay between our redraws can clamp `window-start' to
+`point-min' (typically after a minibuffer-triggered window resize);
+this pass detects and corrects that before the native redraw runs,
+so the classification below sees the user's real scroll state.
+No-op when `ghostel--snap-requested' (user input overrides)."
+  (unless ghostel--snap-requested
+    (dolist (entry ghostel--scroll-positions)
+      (let ((win (car entry)))
+        (when (and (window-live-p win)
+                   (eq (window-buffer win) buffer))
+          (ghostel--reconcile-saved-position win entry))))))
+
+(defun ghostel--anchor-window (win vs pt)
+  "Pin WIN to viewport-start VS and sync its point to PT.
+Also resets pixel vscroll (pixel-scroll-precision-mode may leave a
+partial offset that would clip the top line after a redraw).
+
+When the TUI cursor is in pending-wrap state on the last visible row,
+PT equals `point-max' (one past the last character).  Emacs redisplay
+then classifies it as off-screen, and `scroll-conservatively' shifts
+`window-start' up by one row to make it visible — which fights the
+viewport pin and makes the block cursor disappear.  Clamp
+`window-point' back by one only in that case so it sits inside the
+viewport; buffer-point is unaffected and subsequent redraws recapture
+the real cursor.  We must NOT clamp for a plain shell prompt where the
+cursor is legitimately at `point-max' after typing — doing so would
+draw the block cursor on the last character instead of after it
+\(issue #146)."
+  (set-window-start win vs t)
+  (set-window-vscroll win 0 t)
+  (set-window-point win (if (and (= pt (point-max))
+                                 (> pt (point-min))
+                                 ghostel--term
+                                 (ghostel--cursor-pending-wrap-p
+                                  ghostel--term))
+                            (1- pt)
+                          pt)))
+
+(defun ghostel--restore-scrollback-window (win state)
+  "Restore WIN to ws/wp recorded in STATE and push STATE to scroll-positions.
+Only searches when the native redraw actually moved ws/wp off the
+captured line (fast path otherwise).  STATE is (WIN WS-KEY WP-KEY
+WP-COL) as produced by `ghostel--capture-window-state', or nil if
+WIN appeared after the pre-redraw capture (e.g. shown in a new
+frame mid-redraw) — in which case this is a no-op."
+  (when state
+    (let ((ws-key (nth 1 state))
+          (wp-key (nth 2 state))
+          (wp-col (nth 3 state)))
+      (unless (equal ws-key (ghostel--line-key (window-start win)))
+        (let ((new (ghostel--find-line-pos ws-key)))
+          (when new (set-window-start win new t))))
+      (unless (equal wp-key (ghostel--line-key (window-point win)))
+        (let ((new (ghostel--find-line-pos wp-key wp-col)))
+          (when new (set-window-point win new))))
+      (push (cons win (list ws-key wp-key wp-col))
+            ghostel--scroll-positions))))
+
 (defun ghostel--delayed-redraw (buffer)
   "Perform the actual redraw in BUFFER.
-If point is currently inside the materialized scrollback (above the
-viewport), save and restore it so scrolling up to read history is not
-interrupted by live output updating the terminal cursor."
+Flushes pending PTY output, corrects any Emacs-side window-start
+mangling, runs the native redraw, then restores scroll state for
+windows that were reading scrollback and anchors windows that were
+following the viewport."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq ghostel--redraw-timer nil)
       (when (and ghostel--term (not ghostel--copy-mode-active))
-        ;; Flush accumulated output before rendering.
         (ghostel--flush-pending-output)
         ;; Skip during synchronized output unless forced by scroll/resize.
         (unless (and (not ghostel--force-next-redraw)
                      (ghostel--mode-enabled ghostel--term 2026))
           (setq ghostel--force-next-redraw nil)
           (setq ghostel--has-wide-chars nil)
-          (let* ((rows (or ghostel--term-rows 0))
-                 ;; Compute the viewport start — first char of the last
-                 ;; `rows` lines — to decide whether point is currently
-                 ;; in the scrollback region above it. Bounded O(rows).
-                 (viewport-start
-                  (when (> rows 0)
-                    (save-excursion
-                      (goto-char (point-max))
-                      (forward-line (- (1- rows)))
-                      (line-beginning-position))))
-                 ;; Preserve point only when reading scrollback.
-                 (saved-marker
-                  (when (and viewport-start (< (point) viewport-start))
-                    (copy-marker (point) t)))
+          (ghostel--correct-mangled-scroll-positions buffer)
+          (let* ((all-windows (get-buffer-window-list buffer nil t))
+                 (anchored (cl-remove-if-not #'ghostel--window-anchored-p
+                                             all-windows))
+                 (non-anchored-states
+                  (mapcar #'ghostel--capture-window-state
+                          (cl-remove-if #'ghostel--window-anchored-p
+                                        all-windows)))
                  (inhibit-read-only t)
                  (inhibit-redisplay t)
                  (inhibit-modification-hooks t))
             (ghostel--redraw ghostel--term ghostel-full-redraw)
-            (when saved-marker
-              (goto-char saved-marker)
-              (set-marker saved-marker nil)))
-          (when ghostel--has-wide-chars
-            (ghostel--compensate-wide-chars))
-          ;; Native redraw updates buffer-point via `goto-char', which
-          ;; only propagates to `window-point' for the selected window.
-          ;; If an OSC 51;E callback moved selection elsewhere (e.g.
-          ;; `find-file-other-window'), the ghostel window's
-          ;; window-point is stale and the terminal cursor will display
-          ;; at the wrong place when the user reselects it.  Sync it.
-          ;;
-          ;; Also anchor window-start to the viewport origin when point
-          ;; is in the viewport.  Without this, a resize (which erases
-          ;; and rebuilds the buffer inside redraw) leaves window-start
-          ;; clamped to 1 and Emacs's auto-scroll produces a visible
-          ;; jump.  Skip the anchor when point is in scrollback so that
-          ;; users reading history are not yanked back to the bottom.
-          (let* ((pt (point))
-                 (tr (or ghostel--term-rows 0))
-                 (vs (when (> tr 0)
-                       (save-excursion
-                         (goto-char (point-max))
-                         (forward-line (- (1- tr)))
-                         (line-beginning-position)))))
-            (dolist (win (get-buffer-window-list buffer nil t))
-              (when (and vs (>= pt vs))
-                (set-window-start win vs t)
-                ;; Reset any pixel vscroll offset left behind by
-                ;; `pixel-scroll-precision-mode'; otherwise the top
-                ;; line stays partially clipped after a redraw.
-                (set-window-vscroll win 0 t))
-              (set-window-point win pt))))))))
+            (when ghostel--has-wide-chars
+              (ghostel--compensate-wide-chars))
+            (let ((pt (point))
+                  (vs (ghostel--viewport-start)))
+              (setq ghostel--scroll-positions nil)
+              (dolist (win all-windows)
+                (if (and vs (memq win anchored))
+                    (ghostel--anchor-window win vs pt)
+                  (ghostel--restore-scrollback-window
+                   win (assq win non-anchored-states))))
+              (when vs
+                (setq ghostel--last-anchor-position vs))))
+          (setq ghostel--snap-requested nil))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
@@ -2544,7 +3247,12 @@ PROCESS is the shell process, WINDOWS is the list of windows."
           (when ghostel--redraw-timer
             (cancel-timer ghostel--redraw-timer)
             (setq ghostel--redraw-timer nil))
-          (ghostel--delayed-redraw buffer))))
+          ;; `ghostel--redraw-resize-active' lets `ghostel--window-anchored-p'
+          ;; treat Emacs-induced `window-start' drift (from `keep-point-visible'
+          ;; when a minibuffer-triggered resize shrinks the body) as drift,
+          ;; not as a user scroll.
+          (let ((ghostel--redraw-resize-active t))
+            (ghostel--delayed-redraw buffer)))))
     ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
     ;; after this function returns, matching eat/vterm timing.
     ;; On Windows, ConPTY resize is handled above instead.
@@ -2557,6 +3265,14 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   "Major mode for Ghostel terminal emulator."
   (buffer-disable-undo)
   (font-lock-mode -1)
+  ;; `font-lock-mode' can still be re-enabled by user configuration that
+  ;; forces `font-lock-defaults' globally (e.g. Doom Emacs).  When active,
+  ;; JIT-lock calls `font-lock-unfontify-region' on every redraw, which
+  ;; strips the per-cell `face' text-properties the native module writes.
+  ;; Neutralise the unfontify pass so face props survive regardless of
+  ;; whether font-lock ends up on.  `ghostel-mode' has no keywords, so
+  ;; skipping unfontify has no other effect.
+  (setq-local font-lock-unfontify-region-function #'ignore)
   (setq buffer-read-only nil)
   (setq-local scroll-margin 0)
   (setq-local auto-hscroll-mode nil)
@@ -2565,6 +3281,8 @@ PROCESS is the shell process, WINDOWS is the list of windows."
   (setq-local scroll-conservatively 101)
   (setq-local line-spacing 0)
   (add-function :after after-focus-change-function #'ghostel--focus-change)
+  (add-hook 'window-selection-change-functions #'ghostel--focus-change)
+  (add-hook 'window-buffer-change-functions #'ghostel--focus-change)
   (ghostel--suppress-interfering-modes)
   (setq ghostel--scroll-intercept-active t)
   ;; Let C-g reach the keymap instead of triggering keyboard-quit.
@@ -2591,6 +3309,25 @@ prevent redraw flicker."
 
 ;;; Entry point
 
+(defun ghostel--init-buffer (buffer)
+  "Initialize BUFFER as a ghostel terminal if it isn't one already.
+Terminal dimensions come from BUFFER's displayed window when one
+exists, otherwise from the selected window.  The terminal resizes
+itself via `window-size-change-functions' once the buffer is
+displayed, so a mismatch at creation time self-corrects."
+  (with-current-buffer buffer
+    (unless (derived-mode-p 'ghostel-mode)
+      (ghostel-mode)
+      (setq ghostel--managed-buffer-name (buffer-name))
+      (let* ((w (or (get-buffer-window buffer t) (selected-window)))
+             (height (if (window-live-p w) (window-body-height w) 24))
+             (width  (if (window-live-p w) (window-max-chars-per-line w) 80)))
+        (setq ghostel--term
+              (ghostel--new height width ghostel-max-scrollback))
+        (setq ghostel--term-rows height)
+        (ghostel--apply-palette ghostel--term))
+      (ghostel--start-process))))
+
 ;;;###autoload
 (defun ghostel (&optional arg)
   "Start a new Ghostel terminal.  If the buffer already exists, switch to it.
@@ -2599,14 +3336,7 @@ With a numeric prefix ARG, switch to the buffer with that number or
 create it if it doesn't exist yet.
 The name of the buffer is determined by the value of `ghostel-buffer-name'."
   (interactive "P")
-  (unless (fboundp 'ghostel--new)
-    (let ((dir (file-name-directory (locate-library "ghostel"))))
-      (ghostel--ensure-module dir)
-      (let ((mod (expand-file-name
-                  (concat "ghostel-module" module-file-suffix) dir)))
-        (if (file-exists-p mod)
-            (module-load mod)
-          (user-error "Ghostel native module not available")))))
+  (ghostel--load-module t)
   (let ((buffer (cond ((numberp arg)
                        (get-buffer-create (format "%s<%d>"
                                                   ghostel-buffer-name
@@ -2617,16 +3347,39 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
                        (get-buffer-create ghostel-buffer-name)))))
     (pop-to-buffer buffer (append display-buffer--same-window-action
                                   '((category . comint))))
-    (unless (derived-mode-p 'ghostel-mode)
-      (ghostel-mode)
+    (ghostel--init-buffer buffer)))
+
+(defun ghostel-exec (buffer program &optional args)
+  "Run PROGRAM with ARGS as a ghostel terminal in BUFFER.
+
+BUFFER is switched into `ghostel-mode' (if not already) and a new
+terminal is created sized to the window displaying BUFFER, falling
+back to the selected window if BUFFER is not displayed.  No shell
+integration is applied — PROGRAM is exec'd directly via
+`ghostel--spawn-pty'.  PROGRAM is shell-quoted before it is passed
+to `/bin/sh -c', so shell metacharacters are not interpreted; pass
+extra tokens via ARGS, a list of strings.  Returns the process.
+
+Signals `user-error' if BUFFER already has a live ghostel process."
+  (ghostel--load-module t)
+  (when (and (buffer-local-value 'ghostel--process buffer)
+             (process-live-p (buffer-local-value 'ghostel--process buffer)))
+    (user-error "Buffer %s already has a running ghostel process"
+                (buffer-name buffer)))
+  (let ((window (or (get-buffer-window buffer t) (selected-window))))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'ghostel-mode)
+        (ghostel-mode))
       (setq ghostel--managed-buffer-name (buffer-name))
-      (let* ((height (window-body-height))
-             (width (window-max-chars-per-line)))
+      (let* ((height (max 1 (window-body-height window)))
+             (width (max 1 (window-max-chars-per-line window)))
+             (remote-p (file-remote-p default-directory)))
         (setq ghostel--term
               (ghostel--new height width ghostel-max-scrollback))
         (setq ghostel--term-rows height)
-        (ghostel--apply-palette ghostel--term))
-      (ghostel--start-process))))
+        (ghostel--apply-palette ghostel--term)
+        (ghostel--spawn-pty program args height width
+                            "erase '^?' iutf8 -ixon echo" nil remote-p)))))
 
 ;;;###autoload
 (defun ghostel-project (&optional arg)
