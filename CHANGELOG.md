@@ -44,6 +44,10 @@ All notable changes to this project will be documented in this file.
   line number. Configurable via `ghostel-file-detection-regex`. Closes
   [#107](https://github.com/dakra/ghostel/issues/107)
   ([ed17efb](https://github.com/dakra/ghostel/commit/ed17efb)).
+- Replaced `ghostel-enable-title-tracking` (boolean) with
+  `ghostel-set-title-function`.  The new option holds the function
+  invoked on OSC 2 title changes; set to nil to disable title tracking,
+  or to a custom function to fully override the rename behaviour.
 
 ### Fixed
 - Top line no longer renders clipped after a terminal redraw when

@@ -494,11 +494,6 @@ local machine happens to have)."
 
 ;;; Buffer management
 
-(defconst ghostel-compile--managed-buffer-sentinel :ghostel-compile
-  "Sentinel value used for `ghostel--managed-buffer-name' in compile buffers.
-When set, `ghostel--set-title' (OSC 2) skips auto-renaming the buffer — we
-don't want a compile command's title sequence to replace our fixed name.")
-
 (defun ghostel-compile--prepare-buffer (name dir)
   "Return the ghostel buffer named NAME, reset for a fresh run from DIR.
 If a buffer with NAME already exists, the run is prepared in place
@@ -564,13 +559,9 @@ so there is no remote-integration round-trip on TRAMP buffers."
       (let ((inhibit-read-only t))
         (erase-buffer))
       (setq ghostel--pending-output nil)
-      ;; Pin the buffer name so a compile command's OSC 2 title sequence
-      ;; can't rename the buffer mid-run.  `ghostel--set-title' only
-      ;; renames when `ghostel--managed-buffer-name' equals the current
-      ;; buffer name (see ghostel.el); a sentinel that can never match
-      ;; disables auto-renaming.
-      (setq ghostel--managed-buffer-name
-            ghostel-compile--managed-buffer-sentinel)
+      ;; Disable OSC 2 title tracking so a compile command's title
+      ;; sequence can't rename the buffer mid-run.
+      (setq-local ghostel-set-title-function nil)
       (setq ghostel--term (ghostel--new height width ghostel-max-scrollback))
       (setq ghostel--term-rows height)
       (ghostel--apply-palette ghostel--term)

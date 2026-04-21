@@ -677,7 +677,7 @@ than the full terminal `cols'."
         (kill-buffer buf)))))
 
 (ert-deftest ghostel-test-title-tracking-disabled ()
-  "Test that title updates are ignored when `ghostel-enable-title-tracking' is nil."
+  "Test that title updates are ignored when `ghostel-set-title-function' is nil."
   (let (buf)
     (unwind-protect
         (cl-letf (((symbol-function 'ghostel--new)
@@ -686,7 +686,7 @@ than the full terminal `cols'."
                    (lambda (&rest _args) nil))
                   ((symbol-function 'ghostel--start-process)
                    (lambda () nil)))
-          (let ((ghostel-enable-title-tracking nil))
+          (let ((ghostel-set-title-function nil))
             (ghostel)
             (setq buf (current-buffer))
             (with-current-buffer buf
