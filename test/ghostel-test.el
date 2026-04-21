@@ -5070,6 +5070,75 @@ hand nil to the native module."
       (should (equal '(4) result)))))
 
 ;; -----------------------------------------------------------------------
+;; Test: ghostel finds renamed buffer by identity (issue #168)
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-reuses-identity-match-after-rename ()
+  "`ghostel' reuses an identity-matched buffer after a title-tracking rename."
+  (let* ((ghostel-buffer-name "*ghostel*")
+         (existing (generate-new-buffer ghostel-buffer-name))
+         (pre-count (length (buffer-list)))
+         popped)
+    (unwind-protect
+        (progn
+          (with-current-buffer existing
+            (setq-local ghostel--buffer-identity "*ghostel*"))
+          (with-current-buffer existing (rename-buffer "*ghostel: zsh*"))
+          (cl-letf (((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (b &rest _) (setq popped b))))
+            (ghostel))
+          (should (buffer-live-p existing))
+          (should (eq popped existing))
+          (should (equal "*ghostel: zsh*" (buffer-name existing)))
+          (should (= pre-count (length (buffer-list)))))
+      (when (buffer-live-p existing) (kill-buffer existing)))))
+
+(ert-deftest ghostel-test-project-reuses-identity-match-after-rename ()
+  "`ghostel-project' reuses a project's buffer after title tracking renames it."
+  (require 'project)
+  (let* ((ghostel-buffer-name "*ghostel*")
+         (project-name "*myproj-ghostel*")
+         (existing (generate-new-buffer project-name))
+         (pre-count (length (buffer-list)))
+         popped)
+    (unwind-protect
+        (progn
+          (with-current-buffer existing
+            (setq-local ghostel--buffer-identity project-name))
+          (with-current-buffer existing (rename-buffer "*ghostel: zsh*"))
+          (cl-letf (((symbol-function 'project-current)
+                     (lambda (&optional _) '(transient . "/tmp/myproj/")))
+                    ((symbol-function 'project-root)
+                     (lambda (proj) (cdr proj)))
+                    ((symbol-function 'project-prefixed-buffer-name)
+                     (lambda (name) (format "*myproj-%s*" name)))
+                    ((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (b &rest _) (setq popped b))))
+            (ghostel-project))
+          (should (buffer-live-p existing))
+          (should (eq popped existing))
+          (should (equal "*ghostel: zsh*" (buffer-name existing)))
+          (should (= pre-count (length (buffer-list)))))
+      (when (buffer-live-p existing) (kill-buffer existing)))))
+
+(ert-deftest ghostel-test-init-buffer-sets-identity ()
+  "`ghostel--init-buffer' records the identity passed to it."
+  (let ((buf (generate-new-buffer " *ghostel-test-identity*")))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'ghostel--new) (lambda (&rest _) 'fake))
+                    ((symbol-function 'ghostel--apply-palette) (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--start-process) (lambda (&rest _) nil)))
+            (ghostel--init-buffer buf "*myproj-ghostel*"))
+          (should (equal "*myproj-ghostel*"
+                         (buffer-local-value 'ghostel--buffer-identity buf))))
+      (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
 ;; Test: ghostel-copy-all copies to kill ring
 ;; -----------------------------------------------------------------------
 
@@ -6831,6 +6900,9 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-copy-mode-hl-line
     ghostel-test-project-buffer-name
     ghostel-test-project-universal-arg
+    ghostel-test-reuses-identity-match-after-rename
+    ghostel-test-project-reuses-identity-match-after-rename
+    ghostel-test-init-buffer-sets-identity
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
     ghostel-test-compile-module-invokes-zig-build

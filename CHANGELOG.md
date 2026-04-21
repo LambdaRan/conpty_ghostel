@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- `ghostel` and `ghostel-project` reuse an existing terminal buffer even
+  after `ghostel--set-title-default` has renamed it.  Buffers now carry
+  a sticky `ghostel--buffer-identity` set at creation time, and lookup
+  matches on identity rather than current buffer name
+  ([#168](https://github.com/dakra/ghostel/issues/168)).
+
 ## [0.17.0] — 2026-04-21
 
 ### Added

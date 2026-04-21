@@ -887,6 +887,13 @@ pixel-based trailing-space compensation is needed.")
 Nil means title tracking has not claimed the buffer yet.  Clearing this
 variable re-enables automatic renaming for the next title update.")
 
+(defvar-local ghostel--buffer-identity nil
+  "Canonical buffer name used to find this buffer on subsequent `ghostel' calls.
+Set at buffer creation to the value of `ghostel-buffer-name' (or its
+numbered variant) before any title-tracking renames.  Used so that
+`ghostel' and `ghostel-project' can reuse an existing buffer even after
+`ghostel--set-title-default' has renamed it.")
+
 (defvar-local ghostel--prompt-positions nil
   "List of prompt positions as (buffer-line . exit-status) pairs.
 Used for prompt navigation and optional re-application after full redraws.")
@@ -3311,16 +3318,19 @@ prevent redraw flicker."
 
 ;;; Entry point
 
-(defun ghostel--init-buffer (buffer)
+(defun ghostel--init-buffer (buffer &optional identity)
   "Initialize BUFFER as a ghostel terminal if it isn't one already.
 Terminal dimensions come from BUFFER's displayed window when one
 exists, otherwise from the selected window.  The terminal resizes
 itself via `window-size-change-functions' once the buffer is
-displayed, so a mismatch at creation time self-corrects."
+displayed, so a mismatch at creation time self-corrects.
+IDENTITY, if given, is stored as `ghostel--buffer-identity' so the
+buffer can be found again after title-tracking renames it."
   (with-current-buffer buffer
     (unless (derived-mode-p 'ghostel-mode)
       (ghostel-mode)
       (setq ghostel--managed-buffer-name (buffer-name))
+      (setq ghostel--buffer-identity (or identity (buffer-name)))
       (let* ((w (or (get-buffer-window buffer t) (selected-window)))
              (height (if (window-live-p w) (window-body-height w) 24))
              (width  (if (window-live-p w) (window-max-chars-per-line w) 80)))
@@ -3331,6 +3341,16 @@ displayed, so a mismatch at creation time self-corrects."
         (ghostel--apply-palette ghostel--term))
       (ghostel--start-process))))
 
+(defun ghostel--find-buffer-by-identity (identity)
+  "Return the live ghostel buffer whose identity equals IDENTITY, or nil.
+Identity is the `ghostel-buffer-name' (or numbered variant) recorded at
+buffer creation time — see `ghostel--buffer-identity'."
+  (seq-find (lambda (b)
+              (and (buffer-live-p b)
+                   (equal (buffer-local-value 'ghostel--buffer-identity b)
+                          identity)))
+            (buffer-list)))
+
 ;;;###autoload
 (defun ghostel (&optional arg)
   "Start a new Ghostel terminal.  If the buffer already exists, switch to it.
@@ -3340,17 +3360,18 @@ create it if it doesn't exist yet.
 The name of the buffer is determined by the value of `ghostel-buffer-name'."
   (interactive "P")
   (ghostel--load-module t)
-  (let ((buffer (cond ((numberp arg)
-                       (get-buffer-create (format "%s<%d>"
-                                                  ghostel-buffer-name
-                                                  arg)))
-                      (arg
-                       (generate-new-buffer ghostel-buffer-name))
-                      (t
-                       (get-buffer-create ghostel-buffer-name)))))
+  (let* ((fresh (and arg (not (numberp arg))))
+         (identity (cond (fresh nil)
+                         ((numberp arg)
+                          (format "%s<%d>" ghostel-buffer-name arg))
+                         (t ghostel-buffer-name)))
+         (buffer (if fresh
+                     (generate-new-buffer ghostel-buffer-name)
+                   (or (ghostel--find-buffer-by-identity identity)
+                       (get-buffer-create identity)))))
     (pop-to-buffer buffer (append display-buffer--same-window-action
                                   '((category . comint))))
-    (ghostel--init-buffer buffer)))
+    (ghostel--init-buffer buffer identity)))
 
 (defun ghostel-exec (buffer program &optional args)
   "Run PROGRAM with ARGS as a ghostel terminal in BUFFER.
