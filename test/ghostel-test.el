@@ -6023,6 +6023,106 @@ but `this-command-keys-vector' retains the ESC prefix."
       (should (equal (car pasted) "alpha")))))
 
 ;; -----------------------------------------------------------------------
+;; Test: ghostel-xterm-paste
+;; -----------------------------------------------------------------------
+
+;; Declared here so tests can let-bind it without byte-compile warnings
+;; when xterm.el hasn't been loaded in the batch environment.
+(defvar xterm-store-paste-on-kill-ring)
+
+(ert-deftest ghostel-test-xterm-paste-forwards-to-paste-text ()
+  "`ghostel-xterm-paste' forwards the event payload via `ghostel--paste-text'."
+  (let ((pasted nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring nil))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted))))
+      (ghostel-xterm-paste '(xterm-paste "hello world"))
+      (should (equal pasted '("hello world"))))))
+
+(ert-deftest ghostel-test-xterm-paste-rejects-wrong-event ()
+  "`ghostel-xterm-paste' signals when the event isn't an xterm-paste."
+  (let ((ghostel--copy-mode-active nil))
+    (should-error (ghostel-xterm-paste '(mouse-1 "oops")))))
+
+(ert-deftest ghostel-test-xterm-paste-no-text-is-noop ()
+  "`ghostel-xterm-paste' with a nil payload does not forward or touch the kill ring."
+  (let ((called nil)
+        (kill-ring '("preexisting"))
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring t))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (_text) (setq called t))))
+      (ghostel-xterm-paste '(xterm-paste nil))
+      (should-not called)
+      (should (equal kill-ring '("preexisting"))))))
+
+(ert-deftest ghostel-test-xterm-paste-stores-on-kill-ring ()
+  "When `xterm-store-paste-on-kill-ring' is non-nil, push the paste onto the kill ring."
+  (let ((pasted nil)
+        (kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring t))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted))))
+      (ghostel-xterm-paste '(xterm-paste "clip"))
+      (should (equal pasted '("clip")))
+      (should (equal (car kill-ring) "clip")))))
+
+(ert-deftest ghostel-test-xterm-paste-skips-kill-ring-when-disabled ()
+  "When `xterm-store-paste-on-kill-ring' is nil, the kill ring is untouched."
+  (let ((pasted nil)
+        (kill-ring '("preexisting"))
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring nil))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted))))
+      (ghostel-xterm-paste '(xterm-paste "clip"))
+      (should (equal pasted '("clip")))
+      (should (equal kill-ring '("preexisting"))))))
+
+(ert-deftest ghostel-test-xterm-paste-exits-copy-mode ()
+  "`ghostel-xterm-paste' exits copy mode before forwarding."
+  (let ((pasted nil)
+        (exit-called nil)
+        (ghostel--copy-mode-active t)
+        (xterm-store-paste-on-kill-ring nil))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted)))
+              ((symbol-function 'ghostel-copy-mode-exit)
+               (lambda () (setq exit-called t))))
+      (ghostel-xterm-paste '(xterm-paste "payload"))
+      (should exit-called)
+      (should (equal pasted '("payload"))))))
+
+(ert-deftest ghostel-test-xterm-paste-bound-in-keymaps ()
+  "`ghostel-xterm-paste' is bound to the [xterm-paste] event in both keymaps."
+  (should (eq (lookup-key ghostel-mode-map [xterm-paste])
+              #'ghostel-xterm-paste))
+  (should (eq (lookup-key ghostel-copy-mode-map [xterm-paste])
+              #'ghostel-xterm-paste)))
+
+(ert-deftest ghostel-test-xterm-paste-copy-mode-and-kill-ring ()
+  "All three side effects (exit copy mode, `kill-ring', forward) fire together."
+  (let ((pasted nil)
+        (exit-called nil)
+        (kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active t)
+        (xterm-store-paste-on-kill-ring t))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted)))
+              ((symbol-function 'ghostel-copy-mode-exit)
+               (lambda () (setq exit-called t))))
+      (ghostel-xterm-paste '(xterm-paste "combo"))
+      (should exit-called)
+      (should (equal pasted '("combo")))
+      (should (equal (car kill-ring) "combo")))))
+
+;; -----------------------------------------------------------------------
 ;; Test: ghostel-copy-mode-recenter
 ;; -----------------------------------------------------------------------
 
@@ -7036,6 +7136,14 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-send-event-tty-esc-prefix
     ghostel-test-yank-pop-after-yank
     ghostel-test-yank-pop-no-preceding-yank
+    ghostel-test-xterm-paste-forwards-to-paste-text
+    ghostel-test-xterm-paste-rejects-wrong-event
+    ghostel-test-xterm-paste-no-text-is-noop
+    ghostel-test-xterm-paste-stores-on-kill-ring
+    ghostel-test-xterm-paste-skips-kill-ring-when-disabled
+    ghostel-test-xterm-paste-exits-copy-mode
+    ghostel-test-xterm-paste-bound-in-keymaps
+    ghostel-test-xterm-paste-copy-mode-and-kill-ring
     ghostel-test-copy-mode-recenter
     ghostel-test-send-next-key-control-x
     ghostel-test-send-next-key-control-h

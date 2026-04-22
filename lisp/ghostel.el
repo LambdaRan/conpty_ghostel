@@ -1053,6 +1053,10 @@ is non-nil.")
     (define-key map (kbd "<XF86Paste>") #'ghostel-yank)
     (define-key map (kbd "<XF86Copy>")  #'kill-ring-save)
     (define-key map (kbd "M-y")       #'ghostel-yank-pop)
+    ;; Bracketed paste from the host terminal (TTY Emacs): forward the
+    ;; paste payload to the subprocess instead of letting the default
+    ;; `xterm-paste' insert it into the (renderer-owned) buffer.
+    (define-key map [xterm-paste]     #'ghostel-xterm-paste)
     ;; Terminal control via C-c prefix (pass through to Emacs, then handled here)
     (define-key map (kbd "C-c C-c")   #'ghostel-send-C-c)
     (define-key map (kbd "C-c C-z")   #'ghostel-send-C-z)
@@ -1445,6 +1449,26 @@ pastes the selected entry into the terminal."
                                        kill-ring nil t)))
       (ghostel--paste-text text))))
 
+(defun ghostel-xterm-paste (event)
+  "Forward an xterm-paste EVENT to the terminal via bracketed paste.
+The default `xterm-paste' command inserts into the current buffer,
+which is wrong for ghostel: the terminal renderer owns the buffer
+and wipes the inserted text on the next redraw, so the shell
+never sees it.  This handler extracts the pasted text from EVENT
+and pushes it to the subprocess through `ghostel--paste-text'
+instead.  When `xterm-store-paste-on-kill-ring' is non-nil (the
+stock default), the text is also pushed onto the kill ring for
+parity with `xterm-paste'."
+  (interactive "e")
+  (unless (eq (car-safe event) 'xterm-paste)
+    (error "This command must be bound to an xterm-paste event"))
+  (when ghostel--copy-mode-active
+    (ghostel-copy-mode-exit))
+  (when-let* ((text (nth 1 event)))
+    (when (bound-and-true-p xterm-store-paste-on-kill-ring)
+      (kill-new text))
+    (ghostel--paste-text text)))
+
 
 ;;; Drag and drop
 
@@ -1622,10 +1646,11 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
     ;; Prompt navigation works in copy mode too
     (define-key map (kbd "C-c M-n") #'ghostel-next-prompt)
     (define-key map (kbd "C-c M-p") #'ghostel-previous-prompt)
-    (define-key map (kbd "M->")             #'ghostel-copy-mode-end-of-buffer)
-    (define-key map (kbd "C-e")             #'ghostel-copy-mode-end-of-line)
-    (define-key map (kbd "C-l")             #'ghostel-copy-mode-recenter)
-    (define-key map (kbd "C-c C-l")         #'ghostel-copy-mode-exit-and-clear)
+    (define-key map (kbd "M->")     #'ghostel-copy-mode-end-of-buffer)
+    (define-key map (kbd "C-e")     #'ghostel-copy-mode-end-of-line)
+    (define-key map (kbd "C-l")     #'ghostel-copy-mode-recenter)
+    (define-key map (kbd "C-c C-l") #'ghostel-copy-mode-exit-and-clear)
+    (define-key map [xterm-paste]   #'ghostel-xterm-paste)
     map)
   "Keymap for `ghostel-copy-mode'.
 Standard Emacs navigation works.

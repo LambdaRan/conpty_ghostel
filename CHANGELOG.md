@@ -31,6 +31,11 @@ All notable changes to this project will be documented in this file.
   a sticky `ghostel--buffer-identity` set at creation time, and lookup
   matches on identity rather than current buffer name
   ([#168](https://github.com/dakra/ghostel/issues/168)).
+- Bind `[xterm-paste]` to a ghostel-aware handler so clipboard pastes
+  delivered by the host terminal (TTY Emacs with bracketed paste) reach
+  the inferior shell instead of being inserted into the renderer-owned
+  buffer and wiped on the next redraw
+  ([#172](https://github.com/dakra/ghostel/issues/172)).
 
 ## [0.17.0] — 2026-04-21
 
