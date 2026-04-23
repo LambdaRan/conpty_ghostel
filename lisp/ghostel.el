@@ -2323,6 +2323,13 @@ file:// URL does not match the local machine, construct a TRAMP path."
 
 ;;; Palette
 
+(defface ghostel-default
+  '((t :inherit default))
+  "Base face used to derive ghostel terminal default fg/bg colors.
+Customize this to give ghostel buffers different default colors than
+the rest of Emacs (e.g. a dark terminal inside a light Emacs)."
+  :group 'ghostel)
+
 (defun ghostel--face-hex-color (face attr)
   "Extract hex color string from FACE's ATTR (:foreground or :background).
 Falls back to \"#000000\" if the color cannot be resolved."
@@ -2343,8 +2350,8 @@ Falls back to \"#000000\" if the color cannot be resolved."
   (when term
     (ghostel--set-default-colors
      term
-     (ghostel--face-hex-color 'default :foreground)
-     (ghostel--face-hex-color 'default :background))
+     (ghostel--face-hex-color 'ghostel-default :foreground)
+     (ghostel--face-hex-color 'ghostel-default :background))
     (when ghostel-color-palette
       (let ((colors
              (mapconcat

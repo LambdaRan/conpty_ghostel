@@ -4934,6 +4934,22 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
       (should-not default-colors-calls)
       (should-not palette-calls))))
 
+(ert-deftest ghostel-test-apply-palette-ghostel-default-face ()
+  "`ghostel--apply-palette' reads default fg/bg from `ghostel-default', not `default'."
+  (let ((looked-up nil))
+    (cl-letf (((symbol-function 'ghostel--set-default-colors) #'ignore)
+              ((symbol-function 'ghostel--set-palette) #'ignore)
+              ((symbol-function 'ghostel--face-hex-color)
+               (lambda (face _attr)
+                 (push face looked-up)
+                 "#000000")))
+      (ghostel--apply-palette 'fake-term)
+      ;; The two default-color lookups must target `ghostel-default',
+      ;; never `default' directly — otherwise buffer-local customization
+      ;; of the terminal's fg/bg is impossible (issue #178).
+      (should (memq 'ghostel-default looked-up))
+      (should-not (memq 'default looked-up)))))
+
 ;; -----------------------------------------------------------------------
 ;; OSC 51 elisp eval
 ;; -----------------------------------------------------------------------
@@ -7201,6 +7217,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-prompt-navigation
     ghostel-test-sync-theme
     ghostel-test-apply-palette-default-colors
+    ghostel-test-apply-palette-ghostel-default-face
     ghostel-test-osc51-eval
     ghostel-test-osc51-eval-unknown
     ghostel-test-osc51-eval-catches-errors

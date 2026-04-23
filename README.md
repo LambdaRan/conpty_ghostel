@@ -556,6 +556,17 @@ ghostel-color-white         ghostel-color-bright-white
 Themes that customize `term-color-*` faces automatically apply. Customize
 individual faces with `M-x customize-face`.
 
+Default foreground/background are read from the `ghostel-default` face,
+which inherits from `default`. Customize it to give ghostel terminals
+different default colors than the rest of Emacs (e.g. a dark terminal
+inside a light Emacs):
+
+```elisp
+(set-face-attribute 'ghostel-default nil
+                    :foreground "#cdd6f4"
+                    :background "#1e1e2e")
+```
+
 ## Configuration
 
 | Variable                         | Default              | Description                                              |
