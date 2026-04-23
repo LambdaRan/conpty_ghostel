@@ -3397,8 +3397,18 @@ prevent redraw flicker."
 
 ;;; Entry point
 
+(defun ghostel--prepare-buffer (buffer &optional identity)
+  "Put BUFFER into `ghostel-mode' and record its terminal identity.
+IDENTITY, if given, is stored as `ghostel--buffer-identity' so the
+buffer can be found again after title-tracking renames it."
+  (with-current-buffer buffer
+    (unless (derived-mode-p 'ghostel-mode)
+      (ghostel-mode)
+      (setq ghostel--managed-buffer-name (buffer-name))
+      (setq ghostel--buffer-identity (or identity (buffer-name))))))
+
 (defun ghostel--init-buffer (buffer &optional identity)
-  "Initialize BUFFER as a ghostel terminal if it isn't one already.
+  "Initialize BUFFER as a ghostel terminal if no terminal handle exists yet.
 Terminal dimensions come from BUFFER's displayed window when one
 exists, otherwise from the selected window.  The terminal resizes
 itself via `window-size-change-functions' once the buffer is
@@ -3406,10 +3416,8 @@ displayed, so a mismatch at creation time self-corrects.
 IDENTITY, if given, is stored as `ghostel--buffer-identity' so the
 buffer can be found again after title-tracking renames it."
   (with-current-buffer buffer
-    (unless (derived-mode-p 'ghostel-mode)
-      (ghostel-mode)
-      (setq ghostel--managed-buffer-name (buffer-name))
-      (setq ghostel--buffer-identity (or identity (buffer-name)))
+    (unless ghostel--term
+      (ghostel--prepare-buffer buffer identity)
       (let* ((w (or (get-buffer-window buffer t) (selected-window)))
              (height (if (window-live-p w) (window-body-height w) 24))
              (width  (if (window-live-p w) (window-max-chars-per-line w) 80)))
@@ -3448,6 +3456,8 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
                      (generate-new-buffer ghostel-buffer-name)
                    (or (ghostel--find-buffer-by-identity identity)
                        (get-buffer-create identity)))))
+    (unless (with-current-buffer buffer (derived-mode-p 'ghostel-mode))
+      (ghostel--prepare-buffer buffer identity))
     (pop-to-buffer buffer (append display-buffer--same-window-action
                                   '((category . comint))))
     (ghostel--init-buffer buffer identity)))
@@ -3471,9 +3481,7 @@ Signals `user-error' if BUFFER already has a live ghostel process."
                 (buffer-name buffer)))
   (let ((window (or (get-buffer-window buffer t) (selected-window))))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'ghostel-mode)
-        (ghostel-mode))
-      (setq ghostel--managed-buffer-name (buffer-name))
+      (ghostel--prepare-buffer buffer nil)
       (let* ((height (max 1 (window-body-height window)))
              (width (max 1 (window-max-chars-per-line window)))
              (remote-p (file-remote-p default-directory)))

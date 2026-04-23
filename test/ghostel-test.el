@@ -5217,6 +5217,40 @@ hand nil to the native module."
                          (buffer-local-value 'ghostel--buffer-identity buf))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-first-creation-respects-display-buffer-alist ()
+  "First `ghostel' creation exposes `ghostel-mode' to display rules."
+  (let ((saved (current-window-configuration))
+        (origin (generate-new-buffer " *ghostel-test-origin*"))
+        (ghostel-buffer-name "*ghostel-test-display*"))
+    (unwind-protect
+        (progn
+          (delete-other-windows)
+          (switch-to-buffer origin)
+          (let ((display-buffer-alist
+                 `((,(lambda (buf _action)
+                       (with-current-buffer buf
+                         (derived-mode-p 'ghostel-mode)))
+                    (display-buffer-pop-up-window)))))
+            (cl-letf (((symbol-function 'ghostel--load-module) #'ignore)
+                      ((symbol-function 'ghostel--new)
+                       (lambda (&rest _) 'fake-term))
+                      ((symbol-function 'ghostel--apply-palette) #'ignore)
+                      ((symbol-function 'ghostel--start-process) #'ignore))
+              (ghostel)))
+          (let ((created (get-buffer ghostel-buffer-name)))
+            (should (buffer-live-p created))
+            (should (with-current-buffer created
+                      (derived-mode-p 'ghostel-mode)))
+            (should (get-buffer-window origin))
+            (should (get-buffer-window created))
+            (should (not (eq (get-buffer-window origin)
+                             (get-buffer-window created))))))
+      (when (get-buffer ghostel-buffer-name)
+        (kill-buffer ghostel-buffer-name))
+      (when (buffer-live-p origin)
+        (kill-buffer origin))
+      (set-window-configuration saved))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-copy-all copies to kill ring
 ;; -----------------------------------------------------------------------
@@ -7239,6 +7273,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-reuses-identity-match-after-rename
     ghostel-test-project-reuses-identity-match-after-rename
     ghostel-test-init-buffer-sets-identity
+    ghostel-test-first-creation-respects-display-buffer-alist
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
     ghostel-test-compile-module-invokes-zig-build
