@@ -1388,6 +1388,18 @@ Signals a `user-error' when called outside a ghostel buffer."
     (user-error "Must be called from a ghostel buffer"))
   (ghostel--send-encoded key-name (or mods "")))
 
+(defun ghostel-paste-string (string)
+  "Send STRING to the terminal using bracketed paste.
+Signals a `user-error' when called outside a ghostel buffer.
+
+Unlike `ghostel-send-string', this wraps STRING in bracketed paste
+markers (ESC [200~ / ESC [201~) when the terminal supports bracketed
+paste mode (mode 2004), so the shell treats the input as an atomic
+paste rather than character-by-character typed keystrokes."
+  (unless (derived-mode-p 'ghostel-mode)
+    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--paste-text string))
+
 
 ;;; Terminal control commands (C-c prefix)
 

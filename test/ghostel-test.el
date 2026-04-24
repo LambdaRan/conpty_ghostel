@@ -6477,6 +6477,21 @@ External packages may still call the old internal name."
         (ghostel--send-key "payload"))
       (should (equal sent "payload")))))
 
+(ert-deftest ghostel-test-paste-string-routes-to-paste-text ()
+  "`ghostel-paste-string' forwards its argument to `ghostel--paste-text'."
+  (with-temp-buffer
+    (ghostel-mode)
+    (let (received)
+      (cl-letf (((symbol-function 'ghostel--paste-text)
+                 (lambda (str) (setq received str))))
+        (ghostel-paste-string "hello world")
+        (should (equal received "hello world"))))))
+
+(ert-deftest ghostel-test-paste-string-errors-outside-ghostel-buffer ()
+  "`ghostel-paste-string' signals `user-error' when not in a ghostel buffer."
+  (with-temp-buffer
+    (should-error (ghostel-paste-string "x") :type 'user-error)))
+
 ;; -----------------------------------------------------------------------
 ;; Test: TRAMP integration
 ;; -----------------------------------------------------------------------
@@ -7518,6 +7533,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-send-key-routes-to-send-encoded
     ghostel-test-send-key-nil-mods-becomes-empty-string
     ghostel-test-send-key-errors-outside-ghostel-buffer
+    ghostel-test-paste-string-routes-to-paste-text
+    ghostel-test-paste-string-errors-outside-ghostel-buffer
     ghostel-test-local-host-p
     ghostel-test-update-directory-remote
     ghostel-test-get-shell-local
