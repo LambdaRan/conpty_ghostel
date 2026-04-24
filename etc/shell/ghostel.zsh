@@ -1,6 +1,6 @@
 # Ghostel shell integration for zsh
 # Source this from your .zshrc:
-#   [[ "$INSIDE_EMACS" = 'ghostel' ]] && source /path/to/ghostel/etc/ghostel.zsh
+#   [[ "$INSIDE_EMACS" = 'ghostel' ]] && source /path/to/ghostel/etc/shell/ghostel.zsh
 
 # Idempotency guard — skip if already loaded (e.g. auto-injected).
 (( $+functions[__ghostel_osc7] )) && return
@@ -41,7 +41,11 @@ preexec_functions=(__ghostel_preexec "${preexec_functions[@]}")
 # Outbound `ssh' wrapper.  See etc/ghostel.bash for the full design
 # notes — this is the zsh port of the same install-and-cache logic.
 if [[ -n "$GHOSTEL_SSH_INSTALL_TERMINFO" ]]; then
-    ssh() {
+    # `function NAME { … }' rather than `NAME() { … }' so a user alias
+    # on `ssh' (aliases expand at parse time in zsh, and bash when the
+    # alias is already active while sourcing this file) can't turn the
+    # definition into a parse error.
+    function ssh {
         if [[ -n "$GHOSTEL_SSH_KEEP_TERM" ]] || \
                ! command -v infocmp >/dev/null 2>&1; then
             command ssh "$@"

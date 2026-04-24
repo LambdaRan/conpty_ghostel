@@ -1,8 +1,11 @@
 zig-out/
 .zig-cache/
+zig-pkg/
 *.dylib
 *.so
 *.elc
+ghostel-autoloads.el
+ghostel-pkg.el
 ghostel-module.*
 !ghostel-module.zig
 .zig-global-cache/

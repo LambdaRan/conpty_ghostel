@@ -1,6 +1,6 @@
 # Ghostel shell integration for bash
 # Source this from your .bashrc:
-#   [[ "$INSIDE_EMACS" = 'ghostel' ]] && source /path/to/ghostel/etc/ghostel.bash
+#   [[ "$INSIDE_EMACS" = 'ghostel' ]] && source /path/to/ghostel/etc/shell/ghostel.bash
 
 # Idempotency guard — skip if already loaded (e.g. auto-injected).
 [[ "$(type -t __ghostel_osc7)" = "function" ]] && return
@@ -78,7 +78,11 @@ trap '__ghostel_preexec' DEBUG
 # Per-call escape hatch: prefix `ssh' with GHOSTEL_SSH_KEEP_TERM=1 to
 # bypass the wrapper entirely.
 if [[ -n "$GHOSTEL_SSH_INSTALL_TERMINFO" ]]; then
-    ssh() {
+    # `function NAME { … }' rather than `NAME() { … }' so a user alias
+    # on `ssh' (aliases expand at parse time in zsh, and bash when the
+    # alias is already active while sourcing this file) can't turn the
+    # definition into a parse error.
+    function ssh {
         # Escape hatch + need infocmp locally to do anything useful.
         if [[ -n "$GHOSTEL_SSH_KEEP_TERM" ]] || \
                ! builtin command -v infocmp >/dev/null 2>&1; then

@@ -1,8 +1,6 @@
 ;;; ghostel-eshell.el --- Eshell integration for ghostel -*- lexical-binding: t; -*-
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
-;; Keywords: processes, tools, convenience
-;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
@@ -87,7 +85,7 @@ eshell."
         (setq-local ghostel-kill-buffer-on-exit
                     (bound-and-true-p eshell-destroy-buffer-when-process-dies))
         (unless ghostel-eshell-track-title
-          (setq-local ghostel-enable-title-tracking nil))
+          (setq-local ghostel-set-title-function nil))
         (add-hook 'ghostel-exit-functions
                   #'ghostel-eshell--visual-exit nil t))
       nil)))

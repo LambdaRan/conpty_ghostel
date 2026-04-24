@@ -425,6 +425,45 @@ fn isRowPrompt(term: *Terminal) bool {
     return semantic != 0;
 }
 
+/// Return true if row `cy` (0-indexed, viewport-relative) renders to an
+/// empty Emacs buffer line — no cell has a grapheme and no cell has
+/// non-default styling.  Matches `buildRowContent`'s trim rules: a row
+/// for which this returns true produces `byte_len == 0`.
+///
+/// Assumes the caller has refreshed the render state (via
+/// `ghostty_render_state_update`).  Drives the row iterator, so callers
+/// must not rely on iterator position after this call.
+pub fn isRowEmptyAt(term: *Terminal, cy: u16) bool {
+    if (gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_ROW_ITERATOR, @ptrCast(&term.row_iterator)) != gt.SUCCESS) return false;
+
+    var ri: u16 = 0;
+    while (ri <= cy) : (ri += 1) {
+        if (!gt.c.ghostty_render_state_row_iterator_next(term.row_iterator)) return false;
+    }
+
+    if (gt.c.ghostty_render_state_row_get(term.row_iterator, gt.RS_ROW_DATA_CELLS, @ptrCast(&term.row_cells)) != gt.SUCCESS) {
+        return false;
+    }
+
+    while (gt.c.ghostty_render_state_row_cells_next(term.row_cells)) {
+        var graphemes_len: u32 = 0;
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&graphemes_len)) == gt.SUCCESS and graphemes_len > 0) {
+            return false;
+        }
+        // Mirror `buildRowContent`: wide-spacer-tail cells are skipped
+        // outright and never contribute to buffer content, even when
+        // they carry non-default styling.
+        var raw_cell: gt.c.GhosttyCell = undefined;
+        if (gt.c.ghostty_render_state_row_cells_get(term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw_cell)) == gt.SUCCESS) {
+            var wide: c_int = gt.c.GHOSTTY_CELL_WIDE_NARROW;
+            _ = gt.c.ghostty_cell_get(raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE, @ptrCast(&wide));
+            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) continue;
+        }
+        if (!readCellStyle(term.row_cells).isDefault()) return false;
+    }
+    return true;
+}
+
 /// Hash the first ~16 cells of libghostty's first scrollback row using
 /// FNV-1a. Returns 0 if there is no scrollback or if anything fails.
 ///
@@ -860,6 +899,27 @@ fn positionCursorByCell(env: emacs.Env, term: *Terminal, cx: u16, cy: u16) bool 
 /// When `force_full` is true, the viewport region is fully re-rendered
 /// instead of using the incremental dirty-row path.
 pub fn redraw(env: emacs.Env, term: *Terminal, force_full_arg: bool) void {
+    // Snapshot the buffer's mark across the destructive ops below.  Both
+    // paths — full (eraseBuffer / deleteRegion over the viewport) and
+    // partial (per-row deleteRegion + insert) — move every marker in the
+    // buffer by standard Emacs marker rules.  Point is owned by the
+    // renderer and is placed at the TUI cursor on exit, but mark is user
+    // state (C-SPC, region commands) and must survive the redraw.  Other
+    // markers (e.g. evil's visual-beginning/end) remain the caller's
+    // responsibility to preserve in elisp.
+    const saved_mark: ?i64 = blk: {
+        const pos = env.markerPosition(env.markMarker());
+        if (!env.isNotNil(pos)) break :blk null;
+        break :blk env.extractInteger(pos);
+    };
+    defer {
+        if (saved_mark) |pos| {
+            const pmax = env.extractInteger(env.pointMax());
+            const clamped: i64 = if (pos > pmax) pmax else pos;
+            _ = env.setMarker(env.markMarker(), env.makeInteger(clamped));
+        }
+    }
+
     var force_full = force_full_arg;
 
     // Lock the libghostty viewport to the bottom. Users navigate history

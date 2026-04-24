@@ -4,52 +4,354 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+- Repository layout reorganized.  Elisp sources now live under `lisp/`
+  (the `ghostel` package) and `extensions/` (independent `evil-ghostel`
+  package); vendored headers moved from `include/` to `vendor/`; the
+  bundled compiled terminfo moved from `terminfo/` to `etc/terminfo/`;
+  shell-integration assets restructured into `etc/shell/ghostel.{bash,
+  fish,zsh}` (user-sourced rc files) and `etc/shell/bootstrap/` (env-
+  hook shims for local auto-injection).
+- Users who source ghostel's shell rc files manually from their own
+  shell configuration must update the path: `etc/ghostel.{bash,zsh,
+  fish}` → `etc/shell/ghostel.{bash,zsh,fish}`.
+- `evil-ghostel` is now published as a separate MELPA package.  Users
+  who relied on installing `ghostel` alone and getting evil integration
+  for free must now install `evil-ghostel` separately.  In return,
+  `package-vc-install ghostel` no longer pulls `evil` in as a
+  transitive dependency of the single-repo scan.
+- Removed the `ghostel-evil` compatibility shim that was deprecated in
+  0.13.0.  Replace any `(require 'ghostel-evil)` with `(require
+  'evil-ghostel)` and any `ghostel-evil-mode` calls with
+  `evil-ghostel-mode`.
+
+### Fixed
+- `ghostel` and `ghostel-project` reuse an existing terminal buffer even
+  after `ghostel--set-title-default` has renamed it.  Buffers now carry
+  a sticky `ghostel--buffer-identity` set at creation time, and lookup
+  matches on identity rather than current buffer name
+  ([#168](https://github.com/dakra/ghostel/issues/168)).
+- Bind `[xterm-paste]` to a ghostel-aware handler so clipboard pastes
+  delivered by the host terminal (TTY Emacs with bracketed paste) reach
+  the inferior shell instead of being inserted into the renderer-owned
+  buffer and wiped on the next redraw
+  ([#172](https://github.com/dakra/ghostel/issues/172)).
+
+## [0.17.0] — 2026-04-21
+
 ### Added
-- Desktop notifications via OSC 9 (iTerm2) and OSC 777 (rxvt `notify`),
-  plus ConEmu OSC 9;4 progress reports.  Notifications route through
-  `ghostel-notification-function` (default uses `notifications-notify`
-  with a `message` fallback); progress routes through
-  `ghostel-progress-function` (default shows `[42%]` / `[...]` /
-  `[err]` / `[paused]` in the mode line).  OSC 9;9 CWD reports are
-  handled the same way as OSC 7.  Closes
-  [#141](https://github.com/dakra/ghostel/issues/141).
-- `ghostel-compile` and `ghostel-recompile`: `M-x compile`-style workflow
-  backed by a real PTY, so commands that need a terminal (colour output,
-  progress bars, curses tools) work normally. Finished buffers support
-  `next-error` navigation and share `compile-command` / `compile-history`
-  with `M-x compile`; `g` recompiles in the original directory
-  ([5280db2](https://github.com/dakra/ghostel/commit/5280db2)).
-- `ghostel-debug-info` command collects environment and terminal state for
-  bug reports; resize and redraw events are now logged when debug mode is
-  on ([b5d7b4d](https://github.com/dakra/ghostel/commit/b5d7b4d)).
-- `ghostel-ignore-cursor-change` option to ignore terminal requests that
-  change cursor shape or visibility
-  ([c901c02](https://github.com/dakra/ghostel/commit/c901c02)).
-- `M-y` with no preceding yank now opens a `completing-read` browser over
-  the kill ring (works with consult/vertico)
-  ([e1e1896](https://github.com/dakra/ghostel/commit/e1e1896)).
-- `C-g` is now sent to the terminal instead of triggering `keyboard-quit`;
-  in copy mode it still exits copy mode
-  ([057fb1f](https://github.com/dakra/ghostel/commit/057fb1f)).
-- Module auto-download now works on systems that report `amd64`/`arm64`
-  in `system-configuration`
-  ([27dcec0](https://github.com/dakra/ghostel/commit/27dcec0)).
-- `evil-ghostel` included in `make checkdoc`
-  ([0a9faa1](https://github.com/dakra/ghostel/commit/0a9faa1)).
+- `evil-ghostel-initial-state` defcustom controls the initial evil state
+  in ghostel buffers (default `insert`). Replaces a hard-coded
+  `evil-set-initial-state` call that fired on every ghostel buffer
+  creation and silently clobbered user overrides. `:set` re-applies the
+  value on change, and the `setq-before-require` path is honoured on
+  load
+  ([5fcbb19](https://github.com/dakra/ghostel/commit/5fcbb19)).
 
 ### Changed
+- Replaced `ghostel-enable-title-tracking` (boolean) with
+  `ghostel-set-title-function`.  The new option holds the function
+  invoked on OSC 2 title changes; set to nil to disable title tracking,
+  or to a custom function to fully override the rename behaviour
+  ([5bd67f1](https://github.com/dakra/ghostel/commit/5bd67f1)).
+
+### Fixed
+- `mark` now survives native redraws. The full-redraw path
+  (`eraseBuffer`) previously snapped every marker to `point-min`, and
+  the partial-redraw path drifted markers asymmetrically by
+  insertion-type — so `C-SPC`-set marks or normal-state region commands
+  lost their anchor on every frame
+  ([4816ece](https://github.com/dakra/ghostel/commit/4816ece)).
+- Evil visual selections no longer stretch to a multi-row phantom
+  region in a buffer that is streaming output. The `around-redraw`
+  advice now saves and restores `evil-visual-beginning` /
+  `evil-visual-end` while in visual state, in addition to `point`
+  ([606ec4d](https://github.com/dakra/ghostel/commit/606ec4d)).
+- Removed the `evil-ghostel` normal-state-entry hook that corrupted
+  point after operator commands — `yy`, `v..y`, and `v..<escape>` could
+  discard the motion and land point on the TUI cursor row. Evil's own
+  operator/visual machinery places point correctly without the extra
+  snap
+  ([b955dbb](https://github.com/dakra/ghostel/commit/b955dbb)).
+
+## [0.16.3] — 2026-04-20
+
+### Fixed
+- Block cursor no longer drifts up a row when a TUI parks it on an
+  empty last row via absolute positioning (CUP). The `window-point`
+  clamp from 0.16.1 is broadened via a new
+  `ghostel--cursor-on-empty-row-p` native predicate so the clamp fires
+  on both pending-wrap and empty-trailing-row conditions. Closes
+  [#157](https://github.com/dakra/ghostel/issues/157)
+  ([d4fdc8e](https://github.com/dakra/ghostel/commit/d4fdc8e)).
+- The bundled `ssh` wrapper in `ghostel.bash` / `ghostel.zsh` no longer
+  fails with a parse error when the user has `alias ssh=…` set before
+  sourcing the integration. Uses `function ssh { … }` form to sidestep
+  alias expansion. Fixes
+  [#155](https://github.com/dakra/ghostel/issues/155)
+  ([44aaf67](https://github.com/dakra/ghostel/commit/44aaf67)).
+
+## [0.16.2] — 2026-04-20
+
+### Added
+- Bundled `xterm-ghostty` terminfo under `terminfo/` (both Linux and
+  macOS hashed-dir layouts). Terminal sessions now set
+  `TERM=xterm-ghostty` + `TERMINFO=<bundled>` + `TERM_PROGRAM=ghostty`
+  so TUI apps that consult terminfo see ghostel's real capabilities —
+  most notably DEC 2026 (`Sync`), which Claude Code needs to avoid
+  cascading unsynchronised redraws on `M-x` with large scrollback.
+  TRAMP pushes terminfo to a remote temp dir over the existing
+  connection; outbound `ssh` from a local buffer is shadowed with a
+  wrapper that installs terminfo on the remote via `tic` on first use
+  (cached per-host under `$XDG_CACHE_HOME/ghostel/`, invalidated on
+  libghostty bumps).  New options: `ghostel-term`,
+  `ghostel-ssh-install-terminfo`, `M-x ghostel-ssh-clear-terminfo-cache`
+  ([2c92f68](https://github.com/dakra/ghostel/commit/2c92f68)).
+
+### Fixed
+- Minibuffer activation (M-x, vertico, consult) no longer repaints the
+  shell prompt or forces full TUI redraws. Shrinks caused by the
+  minibuffer stealing window space are treated as viewport crops
+  instead of real resizes, suppressing the spurious SIGWINCH. Apps on
+  the alternate screen (vim, htop, less, Claude Code) still receive
+  SIGWINCH because they own the full viewport; selecting the ghostel
+  window while the minibuffer is open commits the cropped size
+  ([3e8d9c7](https://github.com/dakra/ghostel/commit/3e8d9c7)).
+- `ghostel-compile` header and early output no longer wrap at the
+  wrong column when the compile buffer lands in a smaller window than
+  the selected one.  The VT is now reconciled to the output window's
+  dimensions before rendering the header and before spawning the
+  process
+  ([dcbbf1d](https://github.com/dakra/ghostel/commit/dcbbf1d)).
+- `M-x kill-compilation` now finds and terminates a live
+  `ghostel-compile` run. `compilation-locs` is declared buffer-locally
+  during the run so `compilation-buffer-internal-p` recognises the
+  buffer
+  ([dcbbf1d](https://github.com/dakra/ghostel/commit/dcbbf1d)).
+
+## [0.16.1] — 2026-04-20
+
+### Fixed
+- Block cursor no longer draws on top of the last character while the
+  user is typing at a shell prompt. The `window-point` clamp introduced
+  in 0.16.0 is narrowed to fire only when libghostty reports the cursor
+  in pending-wrap state, exposed via a new
+  `ghostel--cursor-pending-wrap-p` native function. Fixes
+  [#146](https://github.com/dakra/ghostel/issues/146)
+  ([ad8536e](https://github.com/dakra/ghostel/commit/ad8536e)).
+
+## [0.16.0] — 2026-04-19
+
+### Added
+- Desktop notifications via OSC 9 (iTerm2) and OSC 777 (rxvt `notify`),
+  plus ConEmu OSC 9;4 progress reports. Notifications route through
+  `ghostel-notification-function` (default uses `notifications-notify`
+  with a `message` fallback, dispatched via `run-at-time` so a slow
+  DBus broker can't stall the VT parser); progress routes through
+  `ghostel-progress-function` (default shows `[42%]` / `[...]` /
+  `[err]` / `[paused]` in the mode line). OSC 9;9 CWD reports are
+  handled the same way as OSC 7. Closes
+  [#141](https://github.com/dakra/ghostel/issues/141)
+  ([4f7b1cd](https://github.com/dakra/ghostel/commit/4f7b1cd)).
+- `ghostel-compile-global-mode`: opt-in global minor mode that advises
+  `compilation-start` so every caller (`compile`, `recompile`,
+  `project-compile`, ...) automatically runs in a ghostel buffer.
+  Falls through to the stock implementation for `grep-mode`, comint,
+  and `continue=non-nil`; excluded set is customisable via
+  `ghostel-compile-global-mode-excluded-modes`
+  ([e7164ec](https://github.com/dakra/ghostel/commit/e7164ec)).
+- `ghostel-send-string` and `ghostel-send-key` public API for external
+  packages (agent integrations, custom keymaps) to drive a ghostel
+  buffer without reaching into `ghostel--` internals. The old internal
+  `ghostel--send-key` is kept as an obsolete alias; the raw-byte
+  primitive is now `ghostel--send-string`
+  ([5453c22](https://github.com/dakra/ghostel/commit/5453c22)).
+- `<XF86Paste>` and `<XF86Copy>` media keys are now bound to
+  `ghostel-yank` and `kill-ring-save`. Previously they fell through to
+  the global commands and got overpainted by the next redraw
+  ([65932e6](https://github.com/dakra/ghostel/commit/65932e6)).
+
+### Changed
+- `ghostel-compile` no longer types its command into an interactive
+  shell. Each invocation spawns `shell-file-name -c COMMAND` directly
+  via `make-process` through a PTY owned by the ghostel renderer.
+  Multi-line scripts with embedded newlines now pass through verbatim
+  (the old type-into-shell path interpreted each newline as RET), exit
+  status comes from the process sentinel, and shell integration is no
+  longer required. The banner is written to the VT before spawn so it
+  appears live; interactive programs like `htop`, `less`, and `read`
+  prompts keep working because the buffer stays in `ghostel-mode`
+  during the run
+  ([e7164ec](https://github.com/dakra/ghostel/commit/e7164ec)).
+- `ghostel-recompile` now re-runs into the current buffer when it
+  holds a local `ghostel-compile--command`, so pressing `g` in a
+  `*compilation*` buffer produced by `ghostel-compile-global-mode`
+  reuses the buffer and window instead of opening a second one
+  ([e7164ec](https://github.com/dakra/ghostel/commit/e7164ec)).
+- `ghostel-compile` opens its buffer in a non-selected window, matching
+  `M-x compile` exactly.  Respects `display-buffer-alist`, keeps focus
+  on the caller, and `quit-window` disposes of the window the way users
+  expect. Closes [#122](https://github.com/dakra/ghostel/issues/122)
+  ([9846c64](https://github.com/dakra/ghostel/commit/9846c64)).
+- `evil-ghostel` point now tracks the terminal cursor in
+  `evil-emacs-state`, not just `insert-state` — emacs-state is evil's
+  vanilla-Emacs escape hatch and should behave like a normal terminal
+  ([f05e0db](https://github.com/dakra/ghostel/commit/f05e0db)).
+- Large TUI redraws (Claude Code, post-resize frames) now stream in a
+  single filter call. `process-adaptive-read-buffering` is disabled and
+  `read-process-output-max` raised to at least 1 MB for ghostel PTYs;
+  pre-Emacs 31 this collapses a 570 KB post-resize frame from ~9 filter
+  calls to 1 — a ~15-second cascading repaint becomes instant. Mirrors
+  what vterm does for the same reason. Fixes
+  [#85](https://github.com/dakra/ghostel/issues/85)
+  ([bcf2f0c](https://github.com/dakra/ghostel/commit/bcf2f0c)).
+
+### Fixed
+- Child programs that enable focus reporting (Claude Code, btop, vim)
+  now see focus-out when the user selects a different window inside
+  Emacs, not only when the whole frame blurs. Adds hooks on
+  `window-selection-change-functions` and
+  `window-buffer-change-functions` in addition to frame focus. Closes
+  [#140](https://github.com/dakra/ghostel/issues/140)
+  ([ddaefbc](https://github.com/dakra/ghostel/commit/ddaefbc)).
+- Process sentinel no longer removes the focus-reporting hook
+  globally on exit, which had broken focus reports for every other
+  live ghostel buffer
+  ([ddaefbc](https://github.com/dakra/ghostel/commit/ddaefbc)).
+- TUI cursor no longer disappears on the last viewport row when it
+  lands in pending-wrap state. Clamps `window-point` back by one when
+  `pt` equals `point-max` so Emacs redisplay stops shifting
+  `window-start` up by a row to "make it visible." Closes
+  [#138](https://github.com/dakra/ghostel/issues/138)
+  ([17fc791](https://github.com/dakra/ghostel/commit/17fc791)).
+- Viewport no longer snaps to the prompt when the minibuffer opens
+  (and the ghostel window shrinks) in a scrolled-up TUI. During a
+  resize-triggered redraw, windows that were auto-following before
+  the resize are treated as still anchored rather than as a user
+  scroll. Closes [#127](https://github.com/dakra/ghostel/issues/127)
+  ([aa4912d](https://github.com/dakra/ghostel/commit/aa4912d)).
+- Per-cell face properties (colours from SGR sequences) now survive
+  when `font-lock-mode` is force-enabled in a ghostel buffer — e.g.
+  Doom Emacs sets `font-lock-defaults` globally, which reactivates
+  font-lock after `ghostel-mode`'s `(font-lock-mode -1)`. A
+  buffer-local `font-lock-unfontify-region-function` neutralises the
+  unfontify pass in both `ghostel-mode` and `ghostel-compile-view-mode`
+  ([28f5071](https://github.com/dakra/ghostel/commit/28f5071)).
+- `evil-ghostel`: entering normal state in a buffer with any
+  scrollback no longer snaps point to row N of the scrollback region
+  instead of row N of the visible viewport — the row offset now
+  accounts for scrollback line count
+  ([69d4b0d](https://github.com/dakra/ghostel/commit/69d4b0d)).
+
+## [0.15.0] — 2026-04-17
+
+### Added
+- `ghostel-compile` and `ghostel-recompile`: `M-x compile`-style
+  workflow backed by a real PTY, so commands that need a terminal
+  (colour output, progress bars, curses tools) work normally. Finished
+  buffers support `next-error` navigation and share `compile-command` /
+  `compile-history` with `M-x compile`; `g` recompiles in the original
+  directory, `C-u g` prompts to edit the command
+  ([5280db2](https://github.com/dakra/ghostel/commit/5280db2),
+  [d72751e](https://github.com/dakra/ghostel/commit/d72751e)).
+- `ghostel-eshell-visual-command-mode`: overrides `eshell-exec-visual`
+  so TUI programs invoked from eshell (vim, htop, less, top) run in a
+  dedicated ghostel buffer instead of the default `term-mode`
+  fallback. Adds `ghostel-exec` as the public primitive for running an
+  arbitrary program in a ghostel buffer and an `eshell/ghostel` builtin
+  ([8df9fc7](https://github.com/dakra/ghostel/commit/8df9fc7)).
+- `ghostel-next-hyperlink` / `ghostel-previous-hyperlink` navigate OSC
+  8 hyperlinks, auto-detected URLs, and file:line references via `C-c
+  C-n` / `C-c C-p`; prompt navigation moves to `C-c M-n` / `C-c M-p`
+  ([895e55b](https://github.com/dakra/ghostel/commit/895e55b)).
+- `ghostel-debug-info` command collects Emacs version, system info,
+  native module version (with mismatch warning), terminal state, and
+  settings into `*ghostel-debug*` for pasting into bug reports. Resize
+  and redraw events are now logged when `ghostel-debug-start` is active
+  ([b5d7b4d](https://github.com/dakra/ghostel/commit/b5d7b4d)).
+- `ghostel-ignore-cursor-change` option ignores terminal requests that
+  change cursor shape or visibility; useful when editor-owned cursor
+  behaviour should take precedence
+  ([c901c02](https://github.com/dakra/ghostel/commit/c901c02)).
+- `M-y` with no preceding yank now opens a `completing-read` browser
+  over the kill ring (works with consult/vertico) instead of signalling
+  an error
+  ([e1e1896](https://github.com/dakra/ghostel/commit/e1e1896)).
+
+### Changed
+- `C-g` is now sent to the terminal instead of triggering
+  `keyboard-quit`; in copy mode it still exits copy mode
+  ([057fb1f](https://github.com/dakra/ghostel/commit/057fb1f)).
 - Linkified file paths in terminal output now also match bare relative
   paths (e.g. `src/foo.rs:43:4`), paths wrapped in punctuation (Python
   tracebacks, backticks, brackets), and an optional `:column` after the
   line number. Configurable via `ghostel-file-detection-regex`. Closes
   [#107](https://github.com/dakra/ghostel/issues/107)
   ([ed17efb](https://github.com/dakra/ghostel/commit/ed17efb)).
+- Module auto-download now works on systems that report `amd64`/`arm64`
+  in `system-configuration`
+  ([27dcec0](https://github.com/dakra/ghostel/commit/27dcec0)).
+- OSC dispatch rewritten to scan each PTY write once instead of five
+  times. A single `OscIterator` yields `(code, payload, terminator)`
+  and one `dispatchPostWriteOscs` handles codes 7/51/52/133 in
+  document order. Engine micro-benchmarks improve ~20–28% on bulk
+  input
+  ([819098f](https://github.com/dakra/ghostel/commit/819098f),
+  [1729f24](https://github.com/dakra/ghostel/commit/1729f24)).
+- CRLF normalisation is now zero-allocation and zero-copy. The old
+  path allocated up to 131 KB of scratch (with heap fallback and a
+  silent-truncation failure mode) and walked the input twice; the new
+  path streams raw segments into libghostty's VT parser and emits
+  `\r\n` inline at each bare `\n`. State is persisted across calls so
+  a CRLF pair split between two writes isn't double-normalised
+  ([42092e7](https://github.com/dakra/ghostel/commit/42092e7),
+  [1729f24](https://github.com/dakra/ghostel/commit/1729f24)).
+- Module loader unified into a single helper. Load-time and
+  interactive-command paths no longer diverge in guard checks,
+  directory resolution, or failure mode
+  ([bbe1c41](https://github.com/dakra/ghostel/commit/bbe1c41)).
+- `evil-ghostel` now included in `make checkdoc`
+  ([0a9faa1](https://github.com/dakra/ghostel/commit/0a9faa1)).
 
 ### Fixed
 - Top line no longer renders clipped after a terminal redraw when
   `pixel-scroll-precision-mode` had left a partial pixel offset. Closes
   [#105](https://github.com/dakra/ghostel/issues/105)
   ([bfb6e7c](https://github.com/dakra/ghostel/commit/bfb6e7c)).
+- Scroll position preserved across window resizes (M-x, vertico
+  open/close, window splits). A pre-redraw classifier tags windows as
+  auto-follow vs. user-scrolled via multi-line content keys that
+  survive scrollback eviction, full-redraw erase, and viewport
+  rewrite — so scrolling up to read history and pressing `M-x` no
+  longer yanks the view back to the prompt. Also eliminates a 1-row
+  per-keystroke flicker seen in Claude Code's TUI. Closes
+  [#115](https://github.com/dakra/ghostel/issues/115)
+  ([2efecf2](https://github.com/dakra/ghostel/commit/2efecf2)).
+- Backspace now works in terminal mode (`emacs -nw`). The event
+  arrives as integer 127 and is now normalised to `"backspace"` at
+  the Emacs-event boundary before key-name dispatch. Fixes
+  [#114](https://github.com/dakra/ghostel/issues/114)
+  ([c5b38d5](https://github.com/dakra/ghostel/commit/c5b38d5)).
+- Typing or pasting while point is in scrollback (after mouse wheel,
+  M-v, pixel-scroll) now jumps the viewport to the terminal prompt as
+  intended. Fixes
+  [#113](https://github.com/dakra/ghostel/issues/113)
+  ([31bdc9c](https://github.com/dakra/ghostel/commit/31bdc9c)).
+- Wheel events on an unselected ghostel window no longer hang Emacs.
+  The scroll intercept was running in the selected window's buffer
+  instead of the event window's, so the re-dispatched event hit the
+  intercept again — infinite loop, recoverable only via `C-g`. Fixes
+  [#119](https://github.com/dakra/ghostel/issues/119)
+  ([305eacd](https://github.com/dakra/ghostel/commit/305eacd)).
+- `ghostel-compile` no longer leaves ~24 blank rows between the output
+  and the footer on short commands. Trailing blank grid rows from the
+  VT render are trimmed on finalise. Fixes
+  [#111](https://github.com/dakra/ghostel/issues/111)
+  ([60ab84f](https://github.com/dakra/ghostel/commit/60ab84f)).
+- OSC iterator no longer cannibalises the next OSC's bytes when a
+  preceding OSC is missing its terminator — a new `\e]` introducer
+  now ends the current payload
+  ([1729f24](https://github.com/dakra/ghostel/commit/1729f24)).
 
 ## [0.14.0] — 2026-04-13
 
@@ -377,7 +679,13 @@ Initial tagged release.
 - GPL3 license and expanded commentary section ([1d676df](https://github.com/dakra/ghostel/commit/1d676df)).
 - README with build instructions, features, and configuration ([c43bf6a](https://github.com/dakra/ghostel/commit/c43bf6a)).
 
-[Unreleased]: https://github.com/dakra/ghostel/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/dakra/ghostel/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/dakra/ghostel/compare/v0.16.3...v0.17.0
+[0.16.3]: https://github.com/dakra/ghostel/compare/v0.16.2...v0.16.3
+[0.16.2]: https://github.com/dakra/ghostel/compare/v0.16.1...v0.16.2
+[0.16.1]: https://github.com/dakra/ghostel/compare/v0.16.0...v0.16.1
+[0.16.0]: https://github.com/dakra/ghostel/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/dakra/ghostel/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/dakra/ghostel/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/dakra/ghostel/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/dakra/ghostel/compare/v0.12.1...v0.12.2

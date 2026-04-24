@@ -1,8 +1,6 @@
 ;;; ghostel-compile.el --- Compilation integration for ghostel -*- lexical-binding: t; -*-
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
-;; Keywords: processes, tools, convenience
-;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
@@ -59,6 +57,9 @@
 (require 'compile)
 
 (declare-function ghostel--cursor-position "ghostel-module" (term))
+(declare-function ghostel--new "ghostel-module")
+(declare-function ghostel--set-size "ghostel-module")
+(declare-function ghostel--write-input "ghostel-module")
 
 
 ;;; Customization
@@ -278,7 +279,7 @@ separator line — matching `M-x compile's output format."
   (save-excursion
     (goto-char (point-max))
     (skip-chars-backward " \t\n" start)
-    (when (< (point) (point-max))
+    (when (not (eobp))
       (delete-region (point) (point-max))
       (insert "\n"))))
 
@@ -367,7 +368,7 @@ same as in any compilation buffer."
               ;; separator line between the last output and the footer
               ;; — matches the `\n\nCompilation finished ...' format
               ;; `M-x compile' uses.
-              (unless (or (= (point) (point-min)) (bolp))
+              (unless (or (bobp) (bolp))
                 (insert "\n"))
               (insert "\n" footer))
             (save-excursion
@@ -461,6 +462,7 @@ local machine happens to have)."
                  (shell-quote-argument command))))
          (process-environment
           (append compilation-environment
+                  ghostel-environment
                   (list (format "INSIDE_EMACS=%s,compile" emacs-version))
                   (ghostel--terminal-env)
                   ;; Defeat pagers (git grep, etc.).
@@ -493,11 +495,6 @@ local machine happens to have)."
 
 
 ;;; Buffer management
-
-(defconst ghostel-compile--managed-buffer-sentinel :ghostel-compile
-  "Sentinel value used for `ghostel--managed-buffer-name' in compile buffers.
-When set, `ghostel--set-title' (OSC 2) skips auto-renaming the buffer — we
-don't want a compile command's title sequence to replace our fixed name.")
 
 (defun ghostel-compile--prepare-buffer (name dir)
   "Return the ghostel buffer named NAME, reset for a fresh run from DIR.
@@ -553,6 +550,11 @@ so there is no remote-integration round-trip on TRAMP buffers."
          (height (if (window-live-p win) (window-body-height win) 24))
          (width  (if (window-live-p win) (window-max-chars-per-line win) 80)))
     (with-current-buffer buffer
+      ;; Set `default-directory' before `ghostel-mode' so the mode's
+      ;; `hack-dir-local-variables' call resolves dir-locals against
+      ;; the target directory, not whatever the buffer inherited at
+      ;; `get-buffer-create' time.
+      (setq-local default-directory dir)
       ;; Reset to `ghostel-mode' unconditionally — on a recompile the
       ;; buffer is in `ghostel-compile-view-mode' (derived from
       ;; `compilation-mode', *not* `ghostel-mode'), so the previous
@@ -560,20 +562,26 @@ so there is no remote-integration round-trip on TRAMP buffers."
       ;; also fired, but also made state-reset implicit; make it
       ;; explicit here so this helper doesn't have two code paths.
       (ghostel-mode)
-      (setq-local default-directory dir)
       (let ((inhibit-read-only t))
         (erase-buffer))
       (setq ghostel--pending-output nil)
-      ;; Pin the buffer name so a compile command's OSC 2 title sequence
-      ;; can't rename the buffer mid-run.  `ghostel--set-title' only
-      ;; renames when `ghostel--managed-buffer-name' equals the current
-      ;; buffer name (see ghostel.el); a sentinel that can never match
-      ;; disables auto-renaming.
-      (setq ghostel--managed-buffer-name
-            ghostel-compile--managed-buffer-sentinel)
+      ;; Disable OSC 2 title tracking so a compile command's title
+      ;; sequence can't rename the buffer mid-run.
+      (setq-local ghostel-set-title-function nil)
       (setq ghostel--term (ghostel--new height width ghostel-max-scrollback))
       (setq ghostel--term-rows height)
-      (ghostel--apply-palette ghostel--term))
+      (ghostel--apply-palette ghostel--term)
+      ;; `kill-compilation' locates our buffer via `compilation-find-buffer',
+      ;; which requires `compilation-locs' to be buffer-local (see
+      ;; `compilation-buffer-internal-p').  During the run we stay in
+      ;; `ghostel-mode' so keystrokes reach the process, so `compilation-mode'
+      ;; hasn't installed that variable yet — declare it locally now, with
+      ;; the same hash-table shape `compilation-mode' uses so any code that
+      ;; reads the value (future or third-party) doesn't trip on nil.
+      ;; Finalize switches to `ghostel-compile-view-mode', which derives from
+      ;; `compilation-mode' and will reset `compilation-locs' properly.
+      (setq-local compilation-locs
+                  (make-hash-table :test 'equal :weakness 'value)))
     buffer))
 
 
@@ -609,6 +617,18 @@ honour custom compile-mode subclasses the caller passed to
             ghostel-compile--last-exit nil
             ghostel-compile--finalized nil
             ghostel-compile--view-mode-override finished-mode)
+      ;; `prepare-buffer' sized the VT from the selected window (no
+      ;; display-buffer had happened yet).  `display-buffer' above may
+      ;; have placed the buffer in a smaller window — reconcile the VT
+      ;; to the output window *before* rendering the header, otherwise
+      ;; the header and the command's early output wrap at the wrong
+      ;; column and look garbled until the user's first resize triggers
+      ;; `ghostel--window-adjust-process-window-size'.
+      (when (and outwin ghostel--term)
+        (let ((oh (max 1 (window-body-height outwin)))
+              (ow (max 1 (window-max-chars-per-line outwin))))
+          (ghostel--set-size ghostel--term oh ow)
+          (setq ghostel--term-rows oh)))
       ;; Render the compilation header into the terminal before spawning
       ;; the command, so the user sees the "Compilation started at ..."
       ;; banner *during* the run rather than only when it finishes (the
@@ -633,11 +653,15 @@ honour custom compile-mode subclasses the caller passed to
               (forward-line (cdr (ghostel--cursor-position ghostel--term)))
               (copy-marker (point))))
       (ghostel-compile--set-mode-line-running)
+      ;; Match the VT size computed above (or fall back to the selected
+      ;; window's own dimensions when `display-buffer' didn't surface a
+      ;; window, e.g. `allow-no-window').  Use `window-max-chars-per-line'
+      ;; as the canonical width measure, matching `ghostel--spawn-pty'.
       (let* ((height (max 1 (if outwin
                                 (window-body-height outwin)
                               (window-body-height))))
              (width (max 1 (if outwin
-                               (window-body-width outwin)
+                               (window-max-chars-per-line outwin)
                              (window-max-chars-per-line))))
              (proc (ghostel-compile--spawn command buffer height width)))
         ;; Match stock `compilation-start' ordering: hook fires before

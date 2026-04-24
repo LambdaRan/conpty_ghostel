@@ -161,6 +161,28 @@ succeeds."
 ;; Test: erase sequences
 ;; -----------------------------------------------------------------------
 
+(ert-deftest ghostel-test-redraw-preserves-mark ()
+  "`ghostel--redraw' must keep `mark' stable across the destructive ops.
+Full redraws call `eraseBuffer' and partial redraws `deleteRegion',
+either of which would snap every marker in the buffer to `point-min'."
+  (let ((buf (generate-new-buffer " *ghostel-test-mark*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 1000))
+                 (inhibit-read-only t))
+            (ghostel--write-input term "line one\r\nline two\r\nline three")
+            (ghostel--redraw term t)
+            ;; Anchor mark to "two" so its position sits well past point-min.
+            (goto-char (point-min))
+            (search-forward "two")
+            (let ((target (point)))
+              (set-marker (mark-marker) target)
+              ;; Trigger a full redraw (erase-buffer path).
+              (ghostel--write-input term " more")
+              (ghostel--redraw term t)
+              (should (= target (marker-position (mark-marker)))))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-erase ()
   "Test CSI erase sequences."
   (let ((term (ghostel--new 25 80 1000)))
@@ -655,7 +677,7 @@ than the full terminal `cols'."
         (kill-buffer buf)))))
 
 (ert-deftest ghostel-test-title-tracking-disabled ()
-  "Test that title updates are ignored when `ghostel-enable-title-tracking' is nil."
+  "Test that title updates are ignored when `ghostel-set-title-function' is nil."
   (let (buf)
     (unwind-protect
         (cl-letf (((symbol-function 'ghostel--new)
@@ -664,7 +686,7 @@ than the full terminal `cols'."
                    (lambda (&rest _args) nil))
                   ((symbol-function 'ghostel--start-process)
                    (lambda () nil)))
-          (let ((ghostel-enable-title-tracking nil))
+          (let ((ghostel-set-title-function nil))
             (ghostel)
             (setq buf (current-buffer))
             (with-current-buffer buf
@@ -1007,6 +1029,70 @@ Mirrors the real zsh case where the directory still contains a
 
             (delete-process proc)))
       (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: fish auto-inject shim
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-fish-auto-inject-loads-integration ()
+  "Fish auto-inject shim must chain to etc/shell/ghostel.fish and clean XDG_DATA_DIRS.
+Regression test: the vendor_conf.d shim previously (a) inlined a
+partial copy of the integration and silently dropped the outbound
+\\='ssh' wrapper, and (b) used a temp variable name (\\='xdg_data_dirs')
+that collided with a fish-internal local variable, leaking
+\\='/fish'-suffixed paths back to exported XDG_DATA_DIRS."
+  :tags '(:fish)
+  (skip-unless (executable-find "fish"))
+  (let* ((ghostel-dir (or (ghostel--resource-root)
+                          (file-name-directory
+                           (or (locate-library "ghostel")
+                               load-file-name
+                               buffer-file-name))))
+         (integ-dir (directory-file-name
+                     (expand-file-name "etc/shell/bootstrap" ghostel-dir)))
+         ;; Isolate from the dev's fish config: a user `function ssh' or
+         ;; pre-defined ghostel-like helpers would otherwise satisfy the
+         ;; assertions even if our shim didn't chain to etc/shell/ghostel.fish.
+         ;; Pointing HOME and XDG_CONFIG_HOME at an empty temp dir skips
+         ;; config.fish, conf.d/, and functions/ autoload without
+         ;; disturbing XDG_DATA_DIRS (so vendor_conf.d still loads).
+         (fish-home (make-temp-file "ghostel-test-fish-home-" t)))
+    (unwind-protect
+        (let* ((probe (concat
+                       "functions -q __ghostel_osc7; and echo osc7=yes; or echo osc7=no\n"
+                       "functions -q ghostel_cmd; and echo cmd=yes; or echo cmd=no\n"
+                       "functions -q ssh; and echo ssh=yes; or echo ssh=no\n"
+                       "echo xdg=$XDG_DATA_DIRS\n"))
+               (process-environment
+                (append (list (format "HOME=%s" fish-home)
+                              (format "XDG_CONFIG_HOME=%s" fish-home)
+                              (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)
+                              "GHOSTEL_SSH_INSTALL_TERMINFO=1"
+                              (format "XDG_DATA_DIRS=%s:/usr/local/share:/usr/share"
+                                      integ-dir)
+                              (format "GHOSTEL_SHELL_INTEGRATION_XDG_DIR=%s"
+                                      integ-dir))
+                        process-environment))
+               ;; `call-process' inherits `default-directory' as the cwd.
+               ;; Avoid a path with tildes — `~' would expand against the
+               ;; overridden HOME above and point at a missing subdir.
+               (default-directory fish-home)
+               (output (with-temp-buffer
+                         (call-process "fish" nil (current-buffer) nil
+                                       "-i" "-c" probe)
+                         (buffer-string))))
+          ;; Shim must chain to etc/shell/ghostel.fish so the integration loads.
+          (should (string-match-p "^osc7=yes$" output))
+          (should (string-match-p "^cmd=yes$" output))
+          ;; GHOSTEL_SSH_INSTALL_TERMINFO=1 must reach etc/shell/ghostel.fish so
+          ;; the ssh install-and-cache wrapper is defined.
+          (should (string-match-p "^ssh=yes$" output))
+          ;; XDG cleanup must strip the injected integration dir without
+          ;; leaking fish's internal `/fish'-suffixed form.
+          (should (string-match "^xdg=\\(.*\\)$" output))
+          (should-not (string-match-p (regexp-quote integ-dir)
+                                      (match-string 1 output))))
+      (delete-directory fish-home t))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: update-directory
@@ -1947,8 +2033,7 @@ first real focus event."
     (should (equal "https://example.com/path"              ; url strips trailing dot
                    (get-text-property 5 'help-echo))))
   ;; File:line detection with absolute path
-  (let ((test-file (expand-file-name "ghostel.el"
-                                     (file-name-directory (or load-file-name default-directory)))))
+  (let ((test-file (locate-library "ghostel")))
     (with-temp-buffer
       (insert (format "Error at %s:42 bad" test-file))
       (let ((ghostel-enable-url-detection t))
@@ -3141,6 +3226,178 @@ normally."
         (let ((kill-buffer-query-functions nil))
           (kill-buffer buf-name))))))
 
+(ert-deftest ghostel-test-compile-reconciles-vt-size-to-outwin ()
+  "`ghostel-compile--start' must resize the VT to the output window.
+
+`prepare-buffer' sizes the VT from the selected window (the only
+dimensions available before `display-buffer').  If the compile
+buffer ends up in a smaller window, the PTY's `set-process-window-size'
+agrees with the output window but the VT still thinks it has the
+width of the selected window, so early output wraps at the wrong column.
+`--start' must call `ghostel--set-size' with the output-window
+dimensions *before* rendering the header, and `--spawn' must receive
+the same dimensions so PTY and VT always agree."
+  (let* ((buf-name "*ghostel-test-compile-size*")
+         (set-size-calls nil)
+         (spawn-calls nil)
+         (call-order nil)
+         (inhibit-message t)
+         (save-some-buffers-default-predicate (lambda () nil))
+         (ghostel-compile-finished-major-mode nil))
+    (when (get-buffer buf-name)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf-name)))
+    (unwind-protect
+        (cl-letf* (((symbol-function 'ghostel--load-module) #'ignore)
+                   ((symbol-function 'ghostel--new)
+                    (lambda (&rest _) 'fake-term))
+                   ((symbol-function 'ghostel--apply-palette) #'ignore)
+                   ((symbol-function 'ghostel--set-size)
+                    (lambda (_term rows cols)
+                      (push 'set-size call-order)
+                      (push (list rows cols) set-size-calls)))
+                   ((symbol-function 'ghostel-compile--render-header-live)
+                    (lambda (&rest _) (push 'render-header call-order)))
+                   ((symbol-function 'ghostel--cursor-position)
+                    (lambda (_term) (cons 0 0)))
+                   ((symbol-function 'ghostel-compile--spawn)
+                    (lambda (_cmd buf h w)
+                      (push 'spawn call-order)
+                      (push (list h w) spawn-calls)
+                      (let ((p (start-process "ghostel-test-size-fake"
+                                              buf "sleep" "100")))
+                        (set-process-sentinel p #'ignore)
+                        (set-process-query-on-exit-flag p nil)
+                        (with-current-buffer buf
+                          (setq ghostel--process p))
+                        p))))
+          (let ((buf (ghostel-compile--start "true" buf-name
+                                             default-directory)))
+            (with-current-buffer buf
+              ;; The reconcile call happened.
+              (should set-size-calls)
+              ;; Reconcile must precede the header render *and* the spawn —
+              ;; otherwise the header / early command output wraps at the
+              ;; pre-reconcile column.  `call-order' is LIFO, so chronological
+              ;; order is the reverse.
+              (let ((chronological (reverse call-order)))
+                (should (equal chronological
+                               '(set-size render-header spawn))))
+              ;; Final VT size equals what was handed to the process.
+              (let ((vt-size (car set-size-calls))
+                    (pty-size (car spawn-calls)))
+                (should (equal vt-size pty-size)))
+              ;; `ghostel--term-rows' tracks the final reconciled height.
+              (should (= (car (car set-size-calls)) ghostel--term-rows))
+              ;; Clean up the fake process.
+              (let ((p ghostel--process))
+                (when (process-live-p p)
+                  (setq compilation-in-progress
+                        (delq p compilation-in-progress))
+                  (delete-process p))))))
+      (when (get-buffer buf-name)
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buf-name))))))
+
+(ert-deftest ghostel-test-compile-reconciles-skips-when-no-outwin ()
+  "If `display-buffer' returns nil, reconcile is skipped safely.
+`allow-no-window' permits `display-buffer' to choose not to show the
+buffer at all.  The `(when (and outwin ...))' guard in `--start' must
+gate the `ghostel--set-size' call so we don't crash or pass bogus
+dimensions when no output window exists."
+  (let* ((buf-name "*ghostel-test-compile-no-outwin*")
+         (set-size-called nil)
+         (inhibit-message t)
+         (save-some-buffers-default-predicate (lambda () nil))
+         (ghostel-compile-finished-major-mode nil))
+    (when (get-buffer buf-name)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf-name)))
+    (unwind-protect
+        (cl-letf* (((symbol-function 'ghostel--load-module) #'ignore)
+                   ((symbol-function 'ghostel--new)
+                    (lambda (&rest _) 'fake-term))
+                   ((symbol-function 'ghostel--apply-palette) #'ignore)
+                   ((symbol-function 'display-buffer) (lambda (&rest _) nil))
+                   ((symbol-function 'ghostel--set-size)
+                    (lambda (&rest _) (setq set-size-called t)))
+                   ((symbol-function 'ghostel-compile--render-header-live)
+                    #'ignore)
+                   ((symbol-function 'ghostel--cursor-position)
+                    (lambda (_term) (cons 0 0)))
+                   ((symbol-function 'ghostel-compile--spawn)
+                    (lambda (_cmd buf _h _w)
+                      (let ((p (start-process "ghostel-test-nowin-fake"
+                                              buf "sleep" "100")))
+                        (set-process-sentinel p #'ignore)
+                        (set-process-query-on-exit-flag p nil)
+                        (with-current-buffer buf
+                          (setq ghostel--process p))
+                        p))))
+          (let ((buf (ghostel-compile--start "true" buf-name
+                                             default-directory)))
+            (should (buffer-live-p buf))
+            (should-not set-size-called)
+            (with-current-buffer buf
+              (let ((p ghostel--process))
+                (when (process-live-p p)
+                  (setq compilation-in-progress
+                        (delq p compilation-in-progress))
+                  (delete-process p))))))
+      (when (get-buffer buf-name)
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buf-name))))))
+
+(ert-deftest ghostel-test-compile-kill-compilation-finds-live-buffer ()
+  "`kill-compilation' must locate a live ghostel-compile buffer.
+
+During the run the buffer stays in `ghostel-mode' so keystrokes reach
+the process, which means `compilation-mode' never runs.  `kill-compilation'
+calls `compilation-find-buffer' -> `compilation-buffer-internal-p',
+which is `(local-variable-p 'compilation-locs)'.  `prepare-buffer' must
+declare that variable buffer-locally so the live buffer qualifies."
+  (skip-unless (file-executable-p "/bin/sh"))
+  (let* ((buf-name "*ghostel-test-kill-compilation*")
+         (inhibit-message t)
+         (save-some-buffers-default-predicate (lambda () nil))
+         (ghostel-compile-finished-major-mode nil))
+    (when (get-buffer buf-name)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf-name)))
+    (unwind-protect
+        (let ((buf (ghostel-compile--start "cat" buf-name
+                                           default-directory)))
+          (with-current-buffer buf
+            (ghostel-test--wait-for
+             ghostel--process
+             (lambda () (eq 'run (process-status ghostel--process))))
+            ;; The live buffer passes `compilation-buffer-p' — which is
+            ;; the gate `kill-compilation' uses.
+            (should (compilation-buffer-p buf))
+            ;; From inside the buffer, `compilation-find-buffer' returns it.
+            (should (eq (compilation-find-buffer) buf))
+            ;; Also findable from an arbitrary buffer, via `next-error-find-
+            ;; buffer' — that's how `kill-compilation' reaches us when the
+            ;; user invokes it from elsewhere.
+            (should (with-temp-buffer (eq (compilation-find-buffer) buf)))
+            ;; And the buffer has a live process `kill-compilation' would
+            ;; deliver SIGINT to.
+            (should (process-live-p (get-buffer-process buf)))
+            ;; End-to-end: invoke `kill-compilation' from inside the buffer
+            ;; and wait for the process to die via SIGINT.  `cat' exits on
+            ;; SIGINT, the sentinel finalizes, and `--last-exit' reflects
+            ;; a non-zero status (signal-based termination).
+            (kill-compilation)
+            (ghostel-test--wait-for
+             ghostel--process
+             (lambda () ghostel-compile--finalized) 10)
+            (should ghostel-compile--finalized)
+            (should (numberp ghostel-compile--last-exit))
+            (should-not (zerop ghostel-compile--last-exit))))
+      (when (get-buffer buf-name)
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buf-name))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: prompt navigation
 ;; -----------------------------------------------------------------------
@@ -3849,6 +4106,88 @@ skip the clamp entirely regardless of where PT sits."
     ;; Fill the row exactly (10 columns): pending wrap is set.
     (ghostel--write-input term "XYZXY")
     (should (ghostel--cursor-pending-wrap-p term))))
+
+(ert-deftest ghostel-test-cursor-on-empty-row-p ()
+  "`ghostel--cursor-on-empty-row-p' tracks whether the cursor row is blank."
+  (let ((term (ghostel--new 3 10 100)))
+    ;; Fresh terminal: all rows empty, cursor at (0,0).
+    (should (ghostel--cursor-on-empty-row-p term))
+    ;; Write a character: cursor row 0 now has a grapheme.
+    (ghostel--write-input term "x")
+    (should-not (ghostel--cursor-on-empty-row-p term))
+    ;; CRLF twice: cursor now at (0,2) on an empty row.
+    (ghostel--write-input term "\r\n\r\n")
+    (should (ghostel--cursor-on-empty-row-p term))
+    ;; CUP back to row 0 (1-indexed: row 1).
+    (ghostel--write-input term "\e[1;1H")
+    (should-not (ghostel--cursor-on-empty-row-p term))))
+
+(ert-deftest ghostel-test-anchor-window-clamps-on-empty-row ()
+  "`ghostel--anchor-window' clamps when cursor is CUP-parked on an empty row.
+Regression test for #157: after `ad8536e' narrowed the clamp to
+pending-wrap only, TUIs that move the cursor via CUP to a trailing
+empty row (e.g. Claude Code on focus loss) again produced the #138
+symptom — PT at `point-max', pending-wrap nil, Emacs redisplay shifts
+`window-start' by one row.  The clamp must also fire on an empty
+cursor row, not just on pending-wrap."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-empty-row*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 3 10 100))
+                 (ghostel--term term)
+                 (ghostel--term-rows 3)
+                 (inhibit-read-only t))
+            (set-window-buffer (selected-window) buf)
+            ;; Fill rows 0 and 1, then CR/LF to land on empty row 2.
+            (ghostel--write-input term "foo\r\nbar\r\n")
+            (should-not (ghostel--cursor-pending-wrap-p term))
+            (should (ghostel--cursor-on-empty-row-p term))
+            (ghostel--redraw term t)
+            (let ((win (selected-window))
+                  (pmax (point-max)))
+              ;; Precondition: PT really does land at point-max on the
+              ;; empty last row.
+              (should (= pmax (point)))
+              (ghostel--anchor-window win (point-min) pmax)
+              ;; Clamp fires: window-point pulled back by one.
+              (should (= (1- pmax) (window-point win))))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-anchor-window-no-clamp-on-populated-last-row ()
+  "`ghostel--anchor-window' must NOT clamp when the cursor row has content.
+Complements the #157 regression: when the cursor sits at `point-max' on
+the last visible row but that row has a written grapheme (e.g. a shell
+prompt after typing), neither predicate fires and the block cursor must
+stay at PT so it renders after the last character (#146 contract)."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-populated-last*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 3 10 100))
+                 (ghostel--term term)
+                 (ghostel--term-rows 3)
+                 (inhibit-read-only t))
+            (set-window-buffer (selected-window) buf)
+            ;; Walk to the last row and type a short prompt — cursor ends
+            ;; mid-row on content, well short of pending-wrap.
+            (ghostel--write-input term "\r\n\r\n$ ls")
+            (should-not (ghostel--cursor-pending-wrap-p term))
+            (should-not (ghostel--cursor-on-empty-row-p term))
+            (ghostel--redraw term t)
+            (let ((win (selected-window))
+                  (pmax (point-max)))
+              (should (= pmax (point)))
+              (ghostel--anchor-window win (point-min) pmax)
+              ;; No clamp: window-point stays at PT.
+              (should (= pmax (window-point win))))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
 
 (ert-deftest ghostel-test-anchor-window-clamps-on-pending-wrap ()
   "`ghostel--anchor-window' clamps `window-point' only in pending-wrap state.
@@ -4595,6 +4934,22 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
       (should-not default-colors-calls)
       (should-not palette-calls))))
 
+(ert-deftest ghostel-test-apply-palette-ghostel-default-face ()
+  "`ghostel--apply-palette' reads default fg/bg from `ghostel-default', not `default'."
+  (let ((looked-up nil))
+    (cl-letf (((symbol-function 'ghostel--set-default-colors) #'ignore)
+              ((symbol-function 'ghostel--set-palette) #'ignore)
+              ((symbol-function 'ghostel--face-hex-color)
+               (lambda (face _attr)
+                 (push face looked-up)
+                 "#000000")))
+      (ghostel--apply-palette 'fake-term)
+      ;; The two default-color lookups must target `ghostel-default',
+      ;; never `default' directly — otherwise buffer-local customization
+      ;; of the terminal's fg/bg is impossible (issue #178).
+      (should (memq 'ghostel-default looked-up))
+      (should-not (memq 'default looked-up)))))
+
 ;; -----------------------------------------------------------------------
 ;; OSC 51 elisp eval
 ;; -----------------------------------------------------------------------
@@ -4792,6 +5147,109 @@ hand nil to the native module."
                  (setq result arg))))
       (ghostel-project '(4))
       (should (equal '(4) result)))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel finds renamed buffer by identity (issue #168)
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-reuses-identity-match-after-rename ()
+  "`ghostel' reuses an identity-matched buffer after a title-tracking rename."
+  (let* ((ghostel-buffer-name "*ghostel*")
+         (existing (generate-new-buffer ghostel-buffer-name))
+         (pre-count (length (buffer-list)))
+         popped)
+    (unwind-protect
+        (progn
+          (with-current-buffer existing
+            (setq-local ghostel--buffer-identity "*ghostel*"))
+          (with-current-buffer existing (rename-buffer "*ghostel: zsh*"))
+          (cl-letf (((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (b &rest _) (setq popped b))))
+            (ghostel))
+          (should (buffer-live-p existing))
+          (should (eq popped existing))
+          (should (equal "*ghostel: zsh*" (buffer-name existing)))
+          (should (= pre-count (length (buffer-list)))))
+      (when (buffer-live-p existing) (kill-buffer existing)))))
+
+(ert-deftest ghostel-test-project-reuses-identity-match-after-rename ()
+  "`ghostel-project' reuses a project's buffer after title tracking renames it."
+  (require 'project)
+  (let* ((ghostel-buffer-name "*ghostel*")
+         (project-name "*myproj-ghostel*")
+         (existing (generate-new-buffer project-name))
+         (pre-count (length (buffer-list)))
+         popped)
+    (unwind-protect
+        (progn
+          (with-current-buffer existing
+            (setq-local ghostel--buffer-identity project-name))
+          (with-current-buffer existing (rename-buffer "*ghostel: zsh*"))
+          (cl-letf (((symbol-function 'project-current)
+                     (lambda (&optional _) '(transient . "/tmp/myproj/")))
+                    ((symbol-function 'project-root)
+                     (lambda (proj) (cdr proj)))
+                    ((symbol-function 'project-prefixed-buffer-name)
+                     (lambda (name) (format "*myproj-%s*" name)))
+                    ((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (b &rest _) (setq popped b))))
+            (ghostel-project))
+          (should (buffer-live-p existing))
+          (should (eq popped existing))
+          (should (equal "*ghostel: zsh*" (buffer-name existing)))
+          (should (= pre-count (length (buffer-list)))))
+      (when (buffer-live-p existing) (kill-buffer existing)))))
+
+(ert-deftest ghostel-test-init-buffer-sets-identity ()
+  "`ghostel--init-buffer' records the identity passed to it."
+  (let ((buf (generate-new-buffer " *ghostel-test-identity*")))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'ghostel--new) (lambda (&rest _) 'fake))
+                    ((symbol-function 'ghostel--apply-palette) (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--start-process) (lambda (&rest _) nil)))
+            (ghostel--init-buffer buf "*myproj-ghostel*"))
+          (should (equal "*myproj-ghostel*"
+                         (buffer-local-value 'ghostel--buffer-identity buf))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-first-creation-respects-display-buffer-alist ()
+  "First `ghostel' creation exposes `ghostel-mode' to display rules."
+  (let ((saved (current-window-configuration))
+        (origin (generate-new-buffer " *ghostel-test-origin*"))
+        (ghostel-buffer-name "*ghostel-test-display*"))
+    (unwind-protect
+        (progn
+          (delete-other-windows)
+          (switch-to-buffer origin)
+          (let ((display-buffer-alist
+                 `((,(lambda (buf _action)
+                       (with-current-buffer buf
+                         (derived-mode-p 'ghostel-mode)))
+                    (display-buffer-pop-up-window)))))
+            (cl-letf (((symbol-function 'ghostel--load-module) #'ignore)
+                      ((symbol-function 'ghostel--new)
+                       (lambda (&rest _) 'fake-term))
+                      ((symbol-function 'ghostel--apply-palette) #'ignore)
+                      ((symbol-function 'ghostel--start-process) #'ignore))
+              (ghostel)))
+          (let ((created (get-buffer ghostel-buffer-name)))
+            (should (buffer-live-p created))
+            (should (with-current-buffer created
+                      (derived-mode-p 'ghostel-mode)))
+            (should (get-buffer-window origin))
+            (should (get-buffer-window created))
+            (should (not (eq (get-buffer-window origin)
+                             (get-buffer-window created))))))
+      (when (get-buffer ghostel-buffer-name)
+        (kill-buffer ghostel-buffer-name))
+      (when (buffer-live-p origin)
+        (kill-buffer origin))
+      (set-window-configuration saved))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-copy-all copies to kill ring
@@ -5547,7 +6005,36 @@ rather than the selected window's buffer."
             (should-not (eq binding #'ghostel--send-event))
           (should (eq binding #'ghostel--send-event))))))
   ;; M-y should be bound to ghostel-yank-pop, not send-event
-  (should (eq (lookup-key ghostel-mode-map (kbd "M-y")) #'ghostel-yank-pop)))
+  (should (eq (lookup-key ghostel-mode-map (kbd "M-y")) #'ghostel-yank-pop))
+  ;; M-DEL must be bound so TTY Alt-Backspace ([27 127]) routes through
+  ;; ghostel--send-event instead of global backward-kill-word.
+  (should (eq (lookup-key ghostel-mode-map (kbd "M-DEL")) #'ghostel--send-event)))
+
+(ert-deftest ghostel-test-send-event-tty-esc-prefix ()
+  "Re-inject meta when the key arrives via ESC prefix (TTY Emacs).
+In TTY Emacs, M-<key> is delivered as two events ([27 KEY]) via
+`esc-map'.  `last-command-event' is just KEY with no meta modifier,
+but `this-command-keys-vector' retains the ESC prefix."
+  (let (captured-key captured-mods)
+    (cl-letf (((symbol-function 'ghostel--send-encoded)
+               (lambda (key mods &optional _utf8)
+                 (setq captured-key key captured-mods mods))))
+      (cl-flet ((sim-tty (keys-vec event expected-key expected-mods)
+                  (setq captured-key nil captured-mods nil)
+                  (cl-letf (((symbol-function 'this-command-keys-vector)
+                             (lambda () keys-vec)))
+                    (let ((last-command-event event))
+                      (ghostel--send-event)))
+                  (should (equal expected-key captured-key))
+                  (should (equal expected-mods captured-mods))))
+        ;; M-b in TTY: ESC then b → re-inject meta
+        (sim-tty (vector 27 ?b)   ?b  "b" "meta")
+        (sim-tty (vector 27 ?f)   ?f  "f" "meta")
+        (sim-tty (vector 27 ?d)   ?d  "d" "meta")
+        ;; M-DEL in TTY: ESC then 127 → backspace + meta
+        (sim-tty (vector 27 127)  127 "backspace" "meta")
+        ;; Already-meta event (shouldn't double-add meta)
+        (sim-tty (vector 27 ?b)   (aref (kbd "M-b") 0) "b" "meta")))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-yank-pop DWIM
@@ -5584,6 +6071,106 @@ rather than the selected window's buffer."
                (lambda (_prompt coll &rest _) (car coll))))
       (ghostel-yank-pop)
       (should (equal (car pasted) "alpha")))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel-xterm-paste
+;; -----------------------------------------------------------------------
+
+;; Declared here so tests can let-bind it without byte-compile warnings
+;; when xterm.el hasn't been loaded in the batch environment.
+(defvar xterm-store-paste-on-kill-ring)
+
+(ert-deftest ghostel-test-xterm-paste-forwards-to-paste-text ()
+  "`ghostel-xterm-paste' forwards the event payload via `ghostel--paste-text'."
+  (let ((pasted nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring nil))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted))))
+      (ghostel-xterm-paste '(xterm-paste "hello world"))
+      (should (equal pasted '("hello world"))))))
+
+(ert-deftest ghostel-test-xterm-paste-rejects-wrong-event ()
+  "`ghostel-xterm-paste' signals when the event isn't an xterm-paste."
+  (let ((ghostel--copy-mode-active nil))
+    (should-error (ghostel-xterm-paste '(mouse-1 "oops")))))
+
+(ert-deftest ghostel-test-xterm-paste-no-text-is-noop ()
+  "`ghostel-xterm-paste' with a nil payload does not forward or touch the kill ring."
+  (let ((called nil)
+        (kill-ring '("preexisting"))
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring t))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (_text) (setq called t))))
+      (ghostel-xterm-paste '(xterm-paste nil))
+      (should-not called)
+      (should (equal kill-ring '("preexisting"))))))
+
+(ert-deftest ghostel-test-xterm-paste-stores-on-kill-ring ()
+  "When `xterm-store-paste-on-kill-ring' is non-nil, push the paste onto the kill ring."
+  (let ((pasted nil)
+        (kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring t))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted))))
+      (ghostel-xterm-paste '(xterm-paste "clip"))
+      (should (equal pasted '("clip")))
+      (should (equal (car kill-ring) "clip")))))
+
+(ert-deftest ghostel-test-xterm-paste-skips-kill-ring-when-disabled ()
+  "When `xterm-store-paste-on-kill-ring' is nil, the kill ring is untouched."
+  (let ((pasted nil)
+        (kill-ring '("preexisting"))
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active nil)
+        (xterm-store-paste-on-kill-ring nil))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted))))
+      (ghostel-xterm-paste '(xterm-paste "clip"))
+      (should (equal pasted '("clip")))
+      (should (equal kill-ring '("preexisting"))))))
+
+(ert-deftest ghostel-test-xterm-paste-exits-copy-mode ()
+  "`ghostel-xterm-paste' exits copy mode before forwarding."
+  (let ((pasted nil)
+        (exit-called nil)
+        (ghostel--copy-mode-active t)
+        (xterm-store-paste-on-kill-ring nil))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted)))
+              ((symbol-function 'ghostel-copy-mode-exit)
+               (lambda () (setq exit-called t))))
+      (ghostel-xterm-paste '(xterm-paste "payload"))
+      (should exit-called)
+      (should (equal pasted '("payload"))))))
+
+(ert-deftest ghostel-test-xterm-paste-bound-in-keymaps ()
+  "`ghostel-xterm-paste' is bound to the [xterm-paste] event in both keymaps."
+  (should (eq (lookup-key ghostel-mode-map [xterm-paste])
+              #'ghostel-xterm-paste))
+  (should (eq (lookup-key ghostel-copy-mode-map [xterm-paste])
+              #'ghostel-xterm-paste)))
+
+(ert-deftest ghostel-test-xterm-paste-copy-mode-and-kill-ring ()
+  "All three side effects (exit copy mode, `kill-ring', forward) fire together."
+  (let ((pasted nil)
+        (exit-called nil)
+        (kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (ghostel--copy-mode-active t)
+        (xterm-store-paste-on-kill-ring t))
+    (cl-letf (((symbol-function 'ghostel--paste-text)
+               (lambda (text) (push text pasted)))
+              ((symbol-function 'ghostel-copy-mode-exit)
+               (lambda () (setq exit-called t))))
+      (ghostel-xterm-paste '(xterm-paste "combo"))
+      (should exit-called)
+      (should (equal pasted '("combo")))
+      (should (equal (car kill-ring) "combo")))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: ghostel-copy-mode-recenter
@@ -5926,6 +6513,133 @@ setting it to nil forces off."
                                         captured-env)))
                 (when (process-live-p proc) (delete-process proc))))))))))
 
+(ert-deftest ghostel-test-environment-precedes-internal-env ()
+  "`ghostel-environment' entries must come before ghostel's own env vars.
+When a user sets TERM via `ghostel-environment', it must win over the
+internal `TERM=xterm-ghostty' so a `process-environment' lookup (which
+returns the first match) resolves to the user's value."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'window-body-height)
+               (lambda (&optional _w) 25))
+              ((symbol-function #'window-max-chars-per-line)
+               (lambda (&optional _w) 80))
+              ((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-shell "/bin/sh")
+               (ghostel-shell-integration nil)
+               (ghostel-environment '("TERM=dumb" "MY_VAR=42"))
+               (default-directory "/tmp/")
+               (proc (ghostel--start-process)))
+          (unwind-protect
+              (let ((term-idx (seq-position captured-env "TERM=dumb"))
+                    (default-term-idx
+                     (seq-position captured-env "TERM=xterm-ghostty")))
+                (should (member "MY_VAR=42" captured-env))
+                (should term-idx)
+                (should default-term-idx)
+                (should (< term-idx default-term-idx)))
+            (when (process-live-p proc) (delete-process proc))))))))
+
+(ert-deftest ghostel-test-environment-applies-to-compile ()
+  "`ghostel-compile--spawn' must prepend `ghostel-environment'.
+The splice lives in the compile spawn (separate from `ghostel--spawn-pty'),
+so this path needs its own coverage — without it, users setting
+`CC=clang' would see it take effect in shells but silently miss for
+compile jobs.  Also pins the position: `compilation-environment'
+entries must precede `ghostel-environment', and both must precede
+ghostel's own `INSIDE_EMACS=...,compile' marker."
+  (let ((captured-env nil)
+        (orig-make-process (symbol-function #'make-process)))
+    (cl-letf (((symbol-function #'make-process)
+               (lambda (&rest plist)
+                 (setq captured-env process-environment)
+                 (apply orig-make-process plist))))
+      (with-temp-buffer
+        (let* ((default-directory "/tmp/")
+               (compilation-environment '("COMPENV=first"))
+               (ghostel-environment '("CC=clang"))
+               (proc (ghostel-compile--spawn "true" (current-buffer) 24 80)))
+          (unwind-protect
+              (let ((compenv-idx (seq-position captured-env "COMPENV=first"))
+                    (cc-idx      (seq-position captured-env "CC=clang"))
+                    (inside-idx  (cl-position-if
+                                  (lambda (s)
+                                    (string-prefix-p "INSIDE_EMACS=" s))
+                                  captured-env)))
+                (should compenv-idx)
+                (should cc-idx)
+                (should inside-idx)
+                (should (< compenv-idx cc-idx))
+                (should (< cc-idx inside-idx)))
+            (when (process-live-p proc) (delete-process proc))))))))
+
+(ert-deftest ghostel-test-compile-prepare-buffer-sets-dir-before-mode ()
+  "`default-directory' must be set before `ghostel-mode' in prepare-buffer.
+The mode's `hack-dir-local-variables' call must resolve dir-locals
+against the target directory.  If the order flips, per-project
+`ghostel-environment' overrides silently miss for compile.  Also
+pins that `default-directory' survives the mode switch — if somebody
+drops the `permanent-local' property upstream this test catches it."
+  (let ((captured-default-directory nil)
+        (target "/tmp/"))
+    (cl-letf (((symbol-function 'hack-dir-local-variables)
+               (lambda ()
+                 (setq captured-default-directory default-directory)))
+              ((symbol-function 'ghostel--load-module) #'ignore)
+              ((symbol-function 'ghostel--new) (lambda (&rest _) 'fake-term))
+              ((symbol-function 'ghostel--apply-palette) #'ignore))
+      (let ((buf (ghostel-compile--prepare-buffer
+                  " *ghostel-prepare-test*" target)))
+        (unwind-protect
+            (progn
+              (should (equal captured-default-directory target))
+              (with-current-buffer buf
+                (should (equal default-directory target))))
+          (kill-buffer buf))))))
+
+(ert-deftest ghostel-test-environment-honors-dir-locals ()
+  "End-to-end: a real `.dir-locals.el' populates `ghostel-environment'.
+Covers the whole pipeline (`hack-dir-local-variables' reading the
+file, the safety gate, and buffer-local assignment) — not just the
+final `setq-local'."
+  (let* ((dir (file-name-as-directory (make-temp-file "ghostel-dl-" t)))
+         (dl  (expand-file-name ".dir-locals.el" dir))
+         (buf (generate-new-buffer " *ghostel-dl-test*")))
+    (unwind-protect
+        (progn
+          (with-temp-file dl
+            (insert
+             "((ghostel-mode . ((ghostel-environment . (\"FOO=1\" \"BAR=2\")))))"))
+          (with-current-buffer buf
+            (setq-local default-directory dir)
+            (ghostel-mode)
+            (should (local-variable-p 'ghostel-environment))
+            (should (equal ghostel-environment '("FOO=1" "BAR=2")))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (when (file-exists-p dir)
+        (delete-directory dir t)))))
+
+(ert-deftest ghostel-test-environment-rejects-unsafe-dir-locals ()
+  "An unsafe `ghostel-environment' value in dir-locals must be rejected.
+Guards against a malicious `.dir-locals.el' that tries to smuggle a
+non-list/non-string value past the usual `safe-local-variable-p'
+machinery."
+  (let ((buf (generate-new-buffer " *ghostel-unsafe-test*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (cl-letf (((symbol-function 'hack-dir-local-variables)
+                     (lambda ()
+                       (setq-local dir-local-variables-alist
+                                   '((ghostel-environment . "not-a-list"))))))
+            (ghostel-mode))
+          (should-not (local-variable-p 'ghostel-environment)))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-terminfo-directory-finds-bundled ()
   "`ghostel--terminfo-directory' must locate the bundled compiled entries.
 The package ships compiled terminfo for both macOS (78/) and Linux (x/)
@@ -6053,6 +6767,197 @@ It must also raise `read-process-output-max'.  Same reason as
                        'fake-proc nil)))
           (should (null result))
           (should-not set-size-called))))))
+
+(ert-deftest ghostel-test-resize-noop-same-dims ()
+  "Resize to identical dims returns nil and skips set-size."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term _h _w) (setq set-size-called t)))
+                  ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(120 . 40))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc '(fake-win))))
+            (should (null result))
+            (should-not set-size-called)))))))
+
+(ert-deftest ghostel-test-resize-minibuffer-crop ()
+  "Minibuffer-induced height shrink on primary screen is cropped (nil)."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term _h _w) (setq set-size-called t)))
+                  ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                  ((symbol-function 'ghostel--alt-screen-p) (lambda (_t) nil))
+                  ((symbol-function 'minibuffer-depth) (lambda () 1))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(120 . 25))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc '(fake-win))))
+            (should (null result))
+            (should-not set-size-called)))))))
+
+(ert-deftest ghostel-test-resize-minibuffer-alt-screen-commits ()
+  "Alt-screen apps (htop/vim) skip the crop path and resize normally."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-args nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term h w) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                  ((symbol-function 'ghostel--alt-screen-p) (lambda (_t) t))
+                  ((symbol-function 'minibuffer-depth) (lambda () 1))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(120 . 25))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc '(fake-win))))
+            (should (equal '(120 . 25) result))
+            (should (equal '(25 120) set-size-args))
+            (should (eql ghostel--term-rows 25))))))))
+
+(ert-deftest ghostel-test-resize-minibuffer-width-only-shrink-commits ()
+  "Width-only shrink with minibuffer open skips the crop and resizes."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-args nil))
+      (let ((cur-buf (current-buffer)))
+        (cl-letf (((symbol-function 'ghostel--set-size)
+                   (lambda (_term h w) (setq set-size-args (list h w))))
+                  ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                  ((symbol-function 'ghostel--alt-screen-p) (lambda (_t) nil))
+                  ((symbol-function 'minibuffer-depth) (lambda () 1))
+                  ((symbol-function 'process-buffer)
+                   (lambda (_proc) cur-buf))
+                  ;; width 100 < 120, height unchanged.
+                  ((default-value 'window-adjust-process-window-size-function)
+                   (lambda (_proc _wins) '(100 . 40))))
+          (let ((result (ghostel--window-adjust-process-window-size
+                         'fake-proc '(fake-win))))
+            (should (equal '(100 . 40) result))
+            (should (equal '(40 100) set-size-args))))))))
+
+(ert-deftest ghostel-test-commit-cropped-size-on-focus ()
+  "Focus return to a cropped ghostel window commits size and SIGWINCH."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (ghostel--force-next-redraw nil)
+          (set-size-args nil)
+          (swsize-args nil)
+          (redraw-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term h w) (setq set-size-args (list h w))))
+                ((symbol-function 'ghostel--delayed-redraw)
+                 (lambda (_buf) (setq redraw-called t)))
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'set-process-window-size)
+                 (lambda (_p h w) (setq swsize-args (list h w))))
+                ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-frame) (lambda (_w) 'test-frame))
+                ((symbol-function 'frame-selected-window)
+                 (lambda (_f) 'test-win))
+                ((symbol-function 'window-body-height) (lambda (&rest _) 25))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should (equal '(25 120) set-size-args))
+        (should (equal '(25 120) swsize-args))
+        (should (eql ghostel--term-rows 25))
+        (should (eql ghostel--term-cols 120))
+        (should ghostel--force-next-redraw)
+        (should redraw-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-outside-minibuffer ()
+  "Focus change outside the minibuffer does not resize."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w) (setq set-size-called t)))
+                ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                ((symbol-function 'set-process-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'minibuffer-depth) (lambda () 0)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should-not set-size-called)
+        (should-not swsize-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-on-deselect ()
+  "Hook firing on WINDOW deselection does not resize."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w) (setq set-size-called t)))
+                ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'set-process-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-frame) (lambda (_w) 'test-frame))
+                ;; Selected window is *not* our window — we're being deselected.
+                ((symbol-function 'frame-selected-window)
+                 (lambda (_f) 'other-win))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should-not set-size-called)
+        (should-not swsize-called)))))
+
+(ert-deftest ghostel-test-commit-cropped-size-noop-when-matched ()
+  "If the window already matches the committed size, do nothing."
+  (with-temp-buffer
+    (let ((ghostel--term 'fake)
+          (ghostel--process 'fake-proc)
+          (ghostel--term-rows 40)
+          (ghostel--term-cols 120)
+          (set-size-called nil)
+          (swsize-called nil))
+      (cl-letf (((symbol-function 'ghostel--set-size)
+                 (lambda (_term _h _w) (setq set-size-called t)))
+                ((symbol-function 'ghostel--delayed-redraw) #'ignore)
+                ((symbol-function 'process-live-p) (lambda (_p) t))
+                ((symbol-function 'set-process-window-size)
+                 (lambda (_p _h _w) (setq swsize-called t)))
+                ((symbol-function 'window-live-p) (lambda (_w) t))
+                ((symbol-function 'window-frame) (lambda (_w) 'test-frame))
+                ((symbol-function 'frame-selected-window)
+                 (lambda (_f) 'test-win))
+                ((symbol-function 'window-body-height) (lambda (&rest _) 40))
+                ((symbol-function 'window-max-chars-per-line) (lambda (&rest _) 120))
+                ((symbol-function 'minibuffer-depth) (lambda () 1)))
+        (ghostel--commit-cropped-size 'test-win)
+        (should-not set-size-called)
+        (should-not swsize-called)))))
 
 ;;; SIGWINCH delivery tests — verify the PTY actually sends the signal
 
@@ -6346,6 +7251,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-prompt-navigation
     ghostel-test-sync-theme
     ghostel-test-apply-palette-default-colors
+    ghostel-test-apply-palette-ghostel-default-face
     ghostel-test-osc51-eval
     ghostel-test-osc51-eval-unknown
     ghostel-test-osc51-eval-catches-errors
@@ -6364,6 +7270,10 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-copy-mode-hl-line
     ghostel-test-project-buffer-name
     ghostel-test-project-universal-arg
+    ghostel-test-reuses-identity-match-after-rename
+    ghostel-test-project-reuses-identity-match-after-rename
+    ghostel-test-init-buffer-sets-identity
+    ghostel-test-first-creation-respects-display-buffer-alist
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
     ghostel-test-compile-module-invokes-zig-build
@@ -6402,8 +7312,17 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-c-g-exits-copy-mode
     ghostel-test-inhibit-quit
     ghostel-test-meta-key-bindings
+    ghostel-test-send-event-tty-esc-prefix
     ghostel-test-yank-pop-after-yank
     ghostel-test-yank-pop-no-preceding-yank
+    ghostel-test-xterm-paste-forwards-to-paste-text
+    ghostel-test-xterm-paste-rejects-wrong-event
+    ghostel-test-xterm-paste-no-text-is-noop
+    ghostel-test-xterm-paste-stores-on-kill-ring
+    ghostel-test-xterm-paste-skips-kill-ring-when-disabled
+    ghostel-test-xterm-paste-exits-copy-mode
+    ghostel-test-xterm-paste-bound-in-keymaps
+    ghostel-test-xterm-paste-copy-mode-and-kill-ring
     ghostel-test-copy-mode-recenter
     ghostel-test-send-next-key-control-x
     ghostel-test-send-next-key-control-h
@@ -6419,8 +7338,17 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-local-host-p
     ghostel-test-update-directory-remote
     ghostel-test-get-shell-local
+    ghostel-test-fish-auto-inject-loads-integration
     ghostel-test-resize-window-adjust
     ghostel-test-resize-nil-size
+    ghostel-test-resize-noop-same-dims
+    ghostel-test-resize-minibuffer-crop
+    ghostel-test-resize-minibuffer-alt-screen-commits
+    ghostel-test-resize-minibuffer-width-only-shrink-commits
+    ghostel-test-commit-cropped-size-on-focus
+    ghostel-test-commit-cropped-size-noop-outside-minibuffer
+    ghostel-test-commit-cropped-size-noop-on-deselect
+    ghostel-test-commit-cropped-size-noop-when-matched
     ghostel-test-sigwinch-reaches-shell-basic
     ghostel-test-sigwinch-reaches-shell-ghostel-style
     ghostel-test-sigwinch-reaches-child-process
@@ -6465,11 +7393,18 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-compile-global-mode-falls-through-on-continue
     ghostel-test-compile-global-mode-falls-through-on-comint
     ghostel-test-compile-global-mode-excluded-custom-mode
+    ghostel-test-compile-reconciles-vt-size-to-outwin
+    ghostel-test-compile-reconciles-skips-when-no-outwin
     ghostel-test-viewport-start-skips-trailing-newline
     ghostel-test-anchor-window-no-clamp-without-pending-wrap
     ghostel-test-exec-errors-on-live-process
     ghostel-test-exec-calls-spawn-pty-with-expected-args
     ghostel-test-exec-threads-remote-p-from-tramp-dir
+    ghostel-test-environment-precedes-internal-env
+    ghostel-test-environment-applies-to-compile
+    ghostel-test-environment-honors-dir-locals
+    ghostel-test-environment-rejects-unsafe-dir-locals
+    ghostel-test-compile-prepare-buffer-sets-dir-before-mode
     ghostel-test-eshell-visual-command-mode-toggles-advice
     ghostel-test-eshell/ghostel-dispatches-to-exec-visual
     ghostel-test-terminfo-directory-finds-bundled)

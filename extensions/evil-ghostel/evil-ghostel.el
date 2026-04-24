@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.16.1
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1") (evil "1.0") (ghostel "0.8.0"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -26,6 +26,35 @@
 
 (require 'evil)
 (require 'ghostel)
+
+;; ---------------------------------------------------------------------------
+;; Customization
+;; ---------------------------------------------------------------------------
+
+(defgroup evil-ghostel nil
+  "Evil-mode integration for ghostel."
+  :group 'ghostel
+  :prefix "evil-ghostel-")
+
+(defcustom evil-ghostel-initial-state 'insert
+  "Initial evil state for new `ghostel-mode' buffers.
+Setting this option via `customize-set-variable', `setopt', or the
+Customize UI calls `evil-set-initial-state' so the change takes effect
+immediately.  Users who prefer the raw API can call
+`evil-set-initial-state' directly from their config — the registry is
+last-writer-wins."
+  :type '(choice (const :tag "Emacs" emacs)
+                 (const :tag "Insert" insert)
+                 (const :tag "Normal" normal)
+                 (symbol :tag "Other state"))
+  :set (lambda (sym val)
+         (set-default-toplevel-value sym val)
+         (evil-set-initial-state 'ghostel-mode val)))
+
+;; Apply the current value at load.  Covers the case where the user set
+;; the variable with plain `setq' before loading the package — in that
+;; path `defcustom' preserves the value without invoking `:set'.
+(evil-set-initial-state 'ghostel-mode evil-ghostel-initial-state)
 
 ;; ---------------------------------------------------------------------------
 ;; Guard predicate
@@ -73,24 +102,42 @@ placement math the native module performs in `src/render.zig'."
             ((< dx 0) (dotimes (_ (abs dx)) (ghostel--send-encoded "left" "")))))))
 
 ;; ---------------------------------------------------------------------------
-;; Redraw: preserve point in normal state
+;; Redraw: preserve point and evil visual markers across the native call
 ;; ---------------------------------------------------------------------------
 
 (defun evil-ghostel--around-redraw (orig-fn term &optional full)
-  "Preserve Emacs point during redraws in evil normal state.
+  "Preserve point and evil visual markers across the native redraw call.
+Native `ghostel--redraw' in `src/render.zig' rewrites the viewport
+region, moving every marker in the buffer.  `point' (non-terminal
+states) and the evil-specific visual range markers are restored here;
+`mark' is preserved by the native module itself and needs no handling
+at this layer.
+
+  - `point' in non-terminal states.  In `insert' and `emacs' point
+    intentionally follows the TUI cursor.
+  - `evil-visual-beginning' and `evil-visual-end' in `visual' state.
+
 ORIG-FN is the advised `ghostel--redraw' called with TERM and FULL.
-Without this, the ~30fps redraw timer would snap point back to
-the terminal cursor, undoing any evil `normal-mode' navigation.
-`emacs-state' is evil's vanilla-Emacs escape hatch; point should
-follow the terminal cursor there just like it does in insert-state,
-otherwise the cursor gets stuck wherever it was on state entry while
-the TUI keeps redrawing elsewhere."
+Skipped when the terminal is in alt-screen mode (1049); apps there
+own the screen and drive their own redraw cycle."
   (if (and evil-ghostel-mode
-           (not (memq evil-state '(insert emacs)))
            (not (ghostel--mode-enabled term 1049)))
-      (let ((saved-point (point)))
+      (let* ((preserve-point (not (memq evil-state '(insert emacs))))
+             (visual-p (eq evil-state 'visual))
+             (saved-point (and preserve-point (point)))
+             (saved-vb (and visual-p (bound-and-true-p evil-visual-beginning)
+                            (marker-position evil-visual-beginning)))
+             (saved-ve (and visual-p (bound-and-true-p evil-visual-end)
+                            (marker-position evil-visual-end))))
         (funcall orig-fn term full)
-        (goto-char (min saved-point (point-max))))
+        (when preserve-point
+          (goto-char (min saved-point (point-max))))
+        (when visual-p
+          (let ((pmax (point-max)))
+            (when saved-vb
+              (set-marker evil-visual-beginning (min saved-vb pmax)))
+            (when saved-ve
+              (set-marker evil-visual-end (min saved-ve pmax))))))
     (funcall orig-fn term full)))
 
 ;; ---------------------------------------------------------------------------
@@ -114,11 +161,6 @@ In alt-screen mode, defer to the terminal's cursor style."
 (defvar evil-ghostel--sync-inhibit nil
   "When non-nil, skip arrow-key sync in the insert-state-entry hook.
 Set by the `I'/`A' advice which send Home/End directly.")
-
-(defun evil-ghostel--normal-state-entry ()
-  "Snap Emacs point to the terminal cursor when entering normal state."
-  (when (and (derived-mode-p 'ghostel-mode) (evil-ghostel--active-p))
-    (evil-ghostel--reset-cursor-point)))
 
 (defun evil-ghostel--insert-state-entry ()
   "Sync terminal cursor to Emacs point when entering `emacs-state'.
@@ -334,10 +376,7 @@ state transitions."
   :keymap evil-ghostel-mode-map
   (if evil-ghostel-mode
       (progn
-        (evil-set-initial-state 'ghostel-mode 'insert)
         (evil-ghostel--escape-stay)
-        (add-hook 'evil-normal-state-entry-hook
-                  #'evil-ghostel--normal-state-entry nil t)
         (add-hook 'evil-insert-state-entry-hook
                   #'evil-ghostel--insert-state-entry nil t)
         ;; Reuse the insert-state sync when entering emacs-state — both
@@ -357,8 +396,6 @@ state transitions."
         (advice-add 'ghostel--set-cursor-style :around
                     #'evil-ghostel--override-cursor-style)
         (evil-refresh-cursor))
-    (remove-hook 'evil-normal-state-entry-hook
-                 #'evil-ghostel--normal-state-entry t)
     (remove-hook 'evil-insert-state-entry-hook
                  #'evil-ghostel--insert-state-entry t)
     (remove-hook 'evil-emacs-state-entry-hook

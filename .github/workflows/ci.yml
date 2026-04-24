@@ -23,10 +23,11 @@ jobs:
 
       - name: Byte-compile
         run: |
-          emacs --batch -Q -L . \
+          emacs --batch -Q -L lisp \
             --eval "(setq byte-compile-error-on-warn t)" \
             -f batch-byte-compile \
-            ghostel.el ghostel-debug.el
+            lisp/ghostel.el lisp/ghostel-compile.el \
+            lisp/ghostel-debug.el lisp/ghostel-eshell.el
 
   test:
     runs-on: ubuntu-latest
@@ -43,9 +44,12 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
+      - name: Install fish
+        run: sudo apt-get install -y fish
+
       - name: Run pure Elisp tests
         run: |
-          emacs --batch -Q -L . \
+          emacs --batch -Q -L lisp \
             -l ert \
             -l test/ghostel-test.el \
             -f ghostel-test-run-elisp
@@ -70,7 +74,7 @@ jobs:
 
       - name: Run evil-ghostel tests
         run: |
-          emacs --batch -Q -L /tmp/evil -L . \
+          emacs --batch -Q -L /tmp/evil -L lisp -L extensions/evil-ghostel \
             -l ert \
             -l test/evil-ghostel-test.el \
             -f evil-ghostel-test-run-elisp
@@ -146,9 +150,9 @@ jobs:
         with:
           version: ${{ matrix.emacs_version }}
 
-      - name: Install zsh
+      - name: Install zsh and fish
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y zsh
+        run: sudo apt-get install -y zsh fish
 
       - name: Download native module
         uses: actions/download-artifact@v4
@@ -157,7 +161,7 @@ jobs:
 
       - name: Run native module tests
         run: |
-          emacs --batch -Q -L . \
+          emacs --batch -Q -L lisp \
             -l ert \
             -l test/ghostel-test.el \
             -f ghostel-test-run-native
