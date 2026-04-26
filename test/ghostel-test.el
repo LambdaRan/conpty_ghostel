@@ -6920,6 +6920,21 @@ setting it to nil forces off."
                                         captured-env)))
                 (when (process-live-p proc) (delete-process proc))))))))))
 
+(ert-deftest ghostel-test-tramp-inside-emacs-preserves-ghostel-prefix ()
+  "TRAMP rewrites INSIDE_EMACS but must preserve the user-set prefix.
+The README's manual remote-integration gate
+  [[ \"${INSIDE_EMACS%%,*}\" = \\='ghostel\\=' ]]
+relies on `tramp-inside-emacs' appending `,tramp:VER' to the
+existing `INSIDE_EMACS' value rather than wholly overwriting it.
+If TRAMP ever changes that contract, the gate silently stops
+matching on TRAMP-launched ghostel remotes — this canary catches it."
+  (require 'tramp)
+  (let ((process-environment
+         (cons "INSIDE_EMACS=ghostel" process-environment)))
+    (let ((rewritten (tramp-inside-emacs)))
+      (should (string-prefix-p "ghostel," rewritten))
+      (should (string-match-p ",tramp:" rewritten)))))
+
 (ert-deftest ghostel-test-environment-precedes-internal-env ()
   "`ghostel-environment' entries must come before ghostel's own env vars.
 When a user sets TERM via `ghostel-environment', it must win over the
@@ -7752,6 +7767,7 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-update-directory-remote
     ghostel-test-get-shell-local
     ghostel-test-fish-auto-inject-loads-integration
+    ghostel-test-tramp-inside-emacs-preserves-ghostel-prefix
     ghostel-test-resize-window-adjust
     ghostel-test-resize-nil-size
     ghostel-test-resize-noop-same-dims

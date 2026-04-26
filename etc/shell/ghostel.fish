@@ -1,6 +1,15 @@
 # Ghostel shell integration for fish
-# Source this from your config.fish:
-#   test "$INSIDE_EMACS" = 'ghostel'; and source /path/to/ghostel/etc/shell/ghostel.fish
+# Source this from your config.fish.
+#
+# Local `config.fish' (anchored regex — TRAMP appends `,tramp:VER'):
+#   string match -qr '^ghostel(,|$)' -- "$INSIDE_EMACS"; and source /path/to/ghostel/etc/shell/ghostel.fish
+#
+# Remote `config.fish' (also gates on TERM, since ssh propagates it
+# natively and INSIDE_EMACS does not without server-side AcceptEnv):
+#   if string match -qr '^ghostel(,|$)' -- "$INSIDE_EMACS"; or test "$TERM" = 'xterm-ghostty'
+#       source ~/.local/share/ghostel/ghostel.fish
+#   end
+# See the README "Manual setup" section for the full rationale.
 
 # Idempotency guard — skip if already loaded (e.g. auto-injected).
 functions -q __ghostel_osc7; and return

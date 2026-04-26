@@ -140,10 +140,14 @@ Also honored via `dir-locals.el' for per-project overrides.
 
 TRAMP caveats:
 - Entries with `=' are propagated to the remote shell.
-- `TERM' and `INSIDE_EMACS' are *always* reset by TRAMP to
-  `tramp-terminal-type' and TRAMP's own marker respectively (see
+- `TERM' is always reset by TRAMP to `tramp-terminal-type' (see
   `tramp-handle-make-process'); overrides in `ghostel-environment'
   do not win remotely.
+- `INSIDE_EMACS' is rewritten by TRAMP via `tramp-inside-emacs',
+  which appends `,tramp:VER' to whatever value is in scope.  For
+  ghostel that means the remote shell sees `ghostel,tramp:VER'
+  rather than the bare `ghostel' set locally — the leading
+  `ghostel' segment is preserved.
 - Bare \"KEY\" unset works for TRAMP-sh methods (`ssh', `sudo', ...)
   which emit `unset KEY' in the remote wrapper, but is dropped by
   the generic handler used by `adb' and `sshfs'.

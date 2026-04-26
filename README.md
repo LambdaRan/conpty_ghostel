@@ -149,17 +149,17 @@ This is controlled by `ghostel-shell-integration` (default `t`).  Set it to
 
 **bash** — add to `~/.bashrc`:
 ```bash
-[[ "$INSIDE_EMACS" = 'ghostel' ]] && source "$EMACS_GHOSTEL_PATH/etc/shell/ghostel.bash"
+[[ "${INSIDE_EMACS%%,*}" = 'ghostel' ]] && source "$EMACS_GHOSTEL_PATH/etc/shell/ghostel.bash"
 ```
 
 **zsh** — add to `~/.zshrc`:
 ```zsh
-[[ "$INSIDE_EMACS" = 'ghostel' ]] && source "$EMACS_GHOSTEL_PATH/etc/shell/ghostel.zsh"
+[[ "${${INSIDE_EMACS-}%%,*}" = 'ghostel' ]] && source "$EMACS_GHOSTEL_PATH/etc/shell/ghostel.zsh"
 ```
 
 **fish** — add to `~/.config/fish/config.fish`:
 ```fish
-test "$INSIDE_EMACS" = 'ghostel'; and source "$EMACS_GHOSTEL_PATH/etc/shell/ghostel.fish"
+string match -qr '^ghostel(,|$)' -- "$INSIDE_EMACS"; and source "$EMACS_GHOSTEL_PATH/etc/shell/ghostel.fish"
 ```
 </details>
 
@@ -305,22 +305,69 @@ the terminal exits).  You can also enable it for specific shells only:
 
 Copy the integration scripts from ghostel's `etc/shell/` directory to
 each remote host (e.g. `~/.local/share/ghostel/`) and source them from
-your shell configuration:
+your shell configuration.  From a local shell:
+
+```bash
+ssh REMOTE 'mkdir -p ~/.local/share/ghostel'
+scp "$EMACS_GHOSTEL_PATH"/etc/shell/ghostel.{bash,zsh,fish} REMOTE:.local/share/ghostel/
+```
+
+(`$EMACS_GHOSTEL_PATH` is set inside ghostel buffers; outside, substitute
+the install path of the ghostel package.)
+
+Then add the appropriate gate to the remote shell config:
 
 **bash** — add to `~/.bashrc` on the remote host:
 ```bash
-[[ "$INSIDE_EMACS" = 'ghostel' ]] && source ~/.local/share/ghostel/ghostel.bash
+if [[ "${INSIDE_EMACS%%,*}" = 'ghostel' || "$TERM" = 'xterm-ghostty' ]]; then
+    source ~/.local/share/ghostel/ghostel.bash
+fi
 ```
 
 **zsh** — add to `~/.zshrc` on the remote host:
 ```zsh
-[[ "$INSIDE_EMACS" = 'ghostel' ]] && source ~/.local/share/ghostel/ghostel.zsh
+if [[ "${${INSIDE_EMACS-}%%,*}" = 'ghostel' || "$TERM" = 'xterm-ghostty' ]]; then
+    source ~/.local/share/ghostel/ghostel.zsh
+fi
 ```
 
 **fish** — add to `~/.config/fish/config.fish` on the remote host:
 ```fish
-test "$INSIDE_EMACS" = 'ghostel'; and source ~/.local/share/ghostel/ghostel.fish
+if string match -qr '^ghostel(,|$)' -- "$INSIDE_EMACS"; or test "$TERM" = 'xterm-ghostty'
+    source ~/.local/share/ghostel/ghostel.fish
+end
 ```
+
+The two-clause gate covers both ways a remote ghostel shell can be
+reached:
+- **TRAMP-launched ghostel** (`M-x ghostel` from a `/ssh:host:` path)
+  rewrites `INSIDE_EMACS` to `ghostel,tramp:VER` on the remote.  The
+  `${INSIDE_EMACS%%,*}` prefix match catches it.
+- **Plain `ssh REMOTE` from a local ghostel buffer** can't propagate
+  `INSIDE_EMACS` over ssh — `SetEnv` requires server-side `AcceptEnv`
+  to take effect.  Instead, the gate falls back on `TERM`, which the
+  SSH protocol *does* propagate natively.  Ghostel sets
+  `TERM=xterm-ghostty` in the local PTY shell environment (controlled
+  by `ghostel-term`, default `xterm-ghostty`), so any `ssh` spawned
+  from inside the buffer inherits and forwards that value.
+
+False positives — situations where the second clause matches but the
+session isn't actually ghostel — include any `ssh` from a non-ghostel
+ghostty terminal, nested ssh hops carrying the same `TERM` through,
+and anyone who manually exports `TERM=xterm-ghostty`.  Sourcing the
+integration in those cases is harmless (`OSC 7` / `OSC 133` work in
+plain ghostty too; `ghostel_cmd` becomes a no-op without ghostel on
+the other end).
+
+If you customize `ghostel-term` to something other than
+`xterm-ghostty`, the second clause won't match.  Drop it and rely on
+TRAMP-launched ghostel for remote integration, or replace it with a
+match against your customized `TERM`.  The wrapper-driven downgrade
+to `xterm-256color` (when `ghostel-ssh-install-terminfo`'s cache
+marks a host as skip, or `tic` install fails) also breaks the
+fallback for that host — a rare edge case, manageable by clearing
+the cache via `M-x ghostel-ssh-clear-terminfo-cache` once you've
+fixed the underlying terminfo install.
 
 The integration scripts provide directory tracking (OSC 7), prompt
 navigation (OSC 133), and `ghostel_cmd` for calling Elisp from the shell.
@@ -469,7 +516,7 @@ Add your own with:
 Example shell aliases (add to your `.bashrc` / `.zshrc`):
 
 ```sh
-if [[ "$INSIDE_EMACS" = 'ghostel' ]]; then
+if [[ "${INSIDE_EMACS%%,*}" = 'ghostel' ]]; then
     # Open a file in Emacs from the terminal
     e()   { ghostel_cmd find-file-other-window "$@"; }
 
