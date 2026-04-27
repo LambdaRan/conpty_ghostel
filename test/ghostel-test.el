@@ -6056,6 +6056,48 @@ hand nil to the native module."
         (should (equal sent '("abc")))
         (should-not ghostel--input-buffer)))))
 
+(ert-deftest ghostel-test-flush-output-drains-coalesced-first ()
+  "`ghostel--flush-output' drains the coalesce buffer before its own write.
+This is the chokepoint for every direct PTY write from the Zig side
+(key/mouse encoders, OSC query responses, focus events, VT write-back),
+so flushing here covers them all in one place."
+  (with-temp-buffer
+    (let ((ghostel--process 'fake)
+          (ghostel--input-buffer '("s" "l"))
+          (ghostel--input-timer nil)
+          (sent nil))
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'process-send-string)
+                 (lambda (_proc str) (push str sent))))
+        (ghostel--flush-output "\r")
+        ;; Buffered "ls" must reach the PTY *before* the encoder's "\r".
+        (should (equal (nreverse sent) '("ls" "\r")))
+        (should-not ghostel--input-buffer)))))
+
+(ert-deftest ghostel-test-send-encoded-preserves-input-order ()
+  "End-to-end: RET via the encoder cannot overtake buffered self-insert bytes.
+The encode-key stub mimics Zig by calling `ghostel--flush-output', which is
+where the ordering invariant lives."
+  (with-temp-buffer
+    (let* ((ghostel--term 'fake)
+           (ghostel--process 'fake)
+           (ghostel--input-buffer '("s" "l"))
+           (ghostel--input-timer nil)
+           (ghostel--last-send-time nil)
+           (sent nil))
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'process-send-string)
+                 (lambda (_proc str) (push str sent)))
+                ;; Mimic Zig: the real encoder calls ghostel--flush-output
+                ;; with the encoded bytes; let the production wrapper run.
+                ((symbol-function 'ghostel--encode-key)
+                 (lambda (_term _key _mods &optional _utf8)
+                   (ghostel--flush-output "\r")
+                   t)))
+        (ghostel--send-encoded "return" "")
+        (should (equal (nreverse sent) '("ls" "\r")))
+        (should-not ghostel--input-buffer)))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: send-encoded sets last-send-time on encoder success
 ;; -----------------------------------------------------------------------

@@ -1219,10 +1219,14 @@ coalesces rapid keystrokes when `ghostel-input-coalesce-delay' > 0."
   #'ghostel--send-string "0.16.0")
 
 (defun ghostel--flush-input (buffer)
-  "Flush coalesced input in BUFFER to the PTY."
+  "Flush coalesced input in BUFFER to the PTY.
+Safe to call synchronously as well as from the coalesce timer:
+cancelling an already-fired timer is a no-op."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (setq ghostel--input-timer nil)
+      (when ghostel--input-timer
+        (cancel-timer ghostel--input-timer)
+        (setq ghostel--input-timer nil))
       (when (and ghostel--input-buffer ghostel--process
                  (process-live-p ghostel--process))
         (process-send-string ghostel--process
@@ -2315,8 +2319,13 @@ PROGRESS is an integer 0-100 or nil."
                     (error-message-string err))))))))
 
 (defun ghostel--flush-output (data)
-  "Write DATA back to the shell process (response from terminal)."
+  "Write DATA to the PTY, draining any pending coalesced input first.
+This is the single ordering boundary for every direct PTY write from the
+Zig side (key/mouse encoders, OSC query responses, focus events, VT
+write-back).  Flushing the coalesce buffer here keeps encoded bytes from
+overtaking preceding single-byte self-insert input."
   (when (and ghostel--process (process-live-p ghostel--process))
+    (ghostel--flush-input (current-buffer))
     (process-send-string ghostel--process data)))
 
 (defvar-local ghostel--face-cookie nil
