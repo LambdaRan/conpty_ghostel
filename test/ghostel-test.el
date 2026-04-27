@@ -13,6 +13,7 @@
 (require 'ert)
 (require 'ghostel)
 (require 'ghostel-compile)
+(require 'ghostel-debug)
 (require 'ghostel-eshell)
 
 (declare-function ghostel--cleanup-temp-paths "ghostel")
@@ -6059,7 +6060,7 @@ hand nil to the native module."
 (ert-deftest ghostel-test-flush-output-drains-coalesced-first ()
   "`ghostel--flush-output' drains the coalesce buffer before its own write.
 This is the chokepoint for every direct PTY write from the Zig side
-(key/mouse encoders, OSC query responses, focus events, VT write-back),
+\(key/mouse encoders, OSC query responses, focus events, VT write-back),
 so flushing here covers them all in one place."
   (with-temp-buffer
     (let ((ghostel--process 'fake)
@@ -7855,6 +7856,41 @@ while :; do sleep 0.1; done'\n")
       (eshell/ghostel "vim" "file.txt")
       (should (equal captured '("vim" "file.txt"))))))
 
+;; -----------------------------------------------------------------------
+;; Test: ghostel-debug-keypress rendering
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-debug-keypress-renders-capture ()
+  "`ghostel--debug-kp-show' writes a paste-friendly report.
+Drives the renderer with a synthetic state plist that mimics a captured
+RET keystroke.  Asserts the report includes the event, every recorded
+send, and the coalesce-buffer state."
+  (let* ((target (generate-new-buffer " *ghostel-test-debug-kp*"))
+         (state (list :buffer target
+                      :event ?\C-m
+                      :keys [13]
+                      :command 'ghostel--send-event
+                      :binding 'ghostel--send-event
+                      :calls (list (cons :flush-output "\r")
+                                   (cons :send-string "ls")))))
+    (unwind-protect
+        (progn
+          (ghostel--debug-kp-show state)
+          (with-current-buffer "*ghostel-debug-keypress*"
+            (let ((content (buffer-string)))
+              (should (string-match-p "^=== ghostel-debug-keypress ===" content))
+              (should (string-match-p "last-input-event:" content))
+              (should (string-match-p "Sends during this command" content))
+              ;; Calls were collected newest-first; renderer reverses them.
+              (should (string-match-p "1\\. send-string: \"ls\"" content))
+              (should (string-match-p "hex: 6c 73" content))
+              (should (string-match-p "2\\. flush-output:" content))
+              (should (string-match-p "hex: 0d" content))
+              (should (string-match-p "Coalesce buffer" content)))))
+      (kill-buffer target)
+      (when (get-buffer "*ghostel-debug-keypress*")
+        (kill-buffer "*ghostel-debug-keypress*")))))
+
 
 (defconst ghostel-test--elisp-tests
   '(ghostel-test-focus-window-selection
@@ -8045,7 +8081,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-compile-prepare-buffer-sets-dir-before-mode
     ghostel-test-eshell-visual-command-mode-toggles-advice
     ghostel-test-eshell/ghostel-dispatches-to-exec-visual
-    ghostel-test-terminfo-directory-finds-bundled)
+    ghostel-test-terminfo-directory-finds-bundled
+    ghostel-test-debug-keypress-renders-capture)
   "Tests that require only Elisp (no native module).")
 
 (defun ghostel-test-run-elisp ()
