@@ -2602,14 +2602,16 @@ PROCESS is the shell process, EVENT describes the state change."
 
 (defun ghostel--conpty-proxy-path ()
   "Find conpty_proxy.exe.
-Search order: `ghostel-conpty-proxy-path', PATH, ghostel package directory."
+Search order: `ghostel-conpty-proxy-path', PATH, ghostel resource root."
   (or ghostel-conpty-proxy-path
       (executable-find "conpty_proxy.exe")
-      (expand-file-name "conpty_proxy.exe"
-                        (file-name-directory
-                         (or (locate-library "ghostel")
-                             load-file-name
-                             buffer-file-name)))))
+      (when-let* ((root (or (ghostel--resource-root)
+                            (file-name-directory
+                             (or (locate-library "ghostel")
+                                 load-file-name
+                                 buffer-file-name))))
+                  (candidate (expand-file-name "conpty_proxy.exe" root)))
+        (and (file-executable-p candidate) candidate))))
 
 (defun ghostel--conpty-proxy-make-process (width height &optional extra-env)
   "Start a shell process via conpty-proxy for Windows.

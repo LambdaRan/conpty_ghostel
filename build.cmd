@@ -97,5 +97,5 @@ echo === Build complete! ===
 echo ghostel-module.dll is ready.
 echo.
 echo To use in Emacs:
-echo   (add-to-list 'load-path "%cd:\=/%")
+echo   (add-to-list 'load-path "%cd:\=/%/lisp")
 echo   (require 'ghostel)
