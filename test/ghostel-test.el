@@ -310,22 +310,29 @@ are retained — only unwritten padding cells are trimmed."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-scrollback-preserves-url-properties ()
-  "Verify URL text properties survive scrollback promotion.
+  "Verify delayed plain-link properties survive scrollback promotion.
 When libghostty pushes a row into scrollback, the redraw promotes the
 existing buffer text instead of fetching a fresh copy from libghostty,
-so any text properties the row earned while it was the viewport (URL
-detection, ghostel-prompt) stay attached."
+so any text properties the row earned while it was the viewport stay
+attached."
   (let ((buf (generate-new-buffer " *ghostel-test-sb-url*")))
     (unwind-protect
         (with-current-buffer buf
+          (ghostel-mode)
           (let* ((term (ghostel--new 5 80 1000))
+                 (ghostel--term term)
+                 (ghostel--term-rows 5)
+                 (ghostel-plain-link-detection-delay 0)
                  (inhibit-read-only t)
                  (ghostel-enable-url-detection t)
                  (ghostel-enable-file-detection nil))
             ;; Write a row with a URL while it's in the viewport.
             (ghostel--write-input term "see https://example.com here\r\n")
-            (ghostel--redraw term t)
-            ;; Sanity: detect-urls applied a help-echo while the row is visible.
+            ;; Run the supported redraw path; zero delay keeps the deferred
+            ;; post-processing deterministic while still exercising it.
+            (ghostel--delayed-redraw buf)
+            ;; Sanity: delayed plain-link detection applied a help-echo while
+            ;; the row is visible.
             (goto-char (point-min))
             (let ((url-pos (search-forward "https://example.com" nil t)))
               (should url-pos)
@@ -333,7 +340,7 @@ detection, ghostel-prompt) stay attached."
                              (get-text-property (- url-pos 19) 'help-echo))))
             ;; Now scroll the URL row off the active screen.
             (dotimes (_ 6) (ghostel--write-input term "filler\r\n"))
-            (ghostel--redraw term t)
+            (ghostel--delayed-redraw buf)
             ;; The URL row now lives in the scrollback region of the buffer.
             (goto-char (point-min))
             (let ((url-pos (search-forward "https://example.com" nil t)))
@@ -499,6 +506,58 @@ scrolling libghostty's viewport."
             ;; Screen and scrollback should be empty
             (let ((content (buffer-substring-no-properties (point-min) (point-max))))
               (should-not (string-match-p "line [0-9]" content)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-scrollback-csi3j-then-refill ()
+  "CSI 3 J must not leave stale pre-clear rows in the buffer.
+
+Scenario (5-row terminal, 10 before-* rows, CSI 3J, 5 after-* rows,
+single redraw):
+  - After the first redraw: before-00..before-05 are in scrollback (6
+    rows scrolled off), before-06..before-09 fill the viewport.
+  - CSI 3J clears libghostty's scrollback; the viewport is unchanged.
+  - Five new after-* rows scroll before-06..before-09 and after-00 into
+    libghostty's freshly-cleared scrollback (5 rows); after-01..after-04
+    are left in the viewport.
+  - At the next redraw, libghostty_sb (5) < scrollback_in_buffer (6),
+    so count-based detection triggers a full rebuild.  The rebuild_pending
+    flag (set by the CSI 3J scanner in vtWrite) also fires, ensuring the
+    erase happens even in scenarios where counts happen to match."
+  (let ((buf (generate-new-buffer " *ghostel-test-csi3j-refill*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 1000))
+                 (inhibit-read-only t))
+            ;; Phase 1: fill scrollback with 10 "before" rows and redraw.
+            (dotimes (i 10)
+              (ghostel--write-input term (format "before-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            ;; Confirm before-00..before-05 are now in the buffer's scrollback
+            ;; and before-06..before-09 are in the viewport.
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "before-00" content))
+              (should (string-match-p "before-05" content))
+              (should (string-match-p "before-09" content)))
+            ;; Phase 2: CSI 3 J (erase scrollback only) then immediately
+            ;; write 5 "after" rows — no redraw in between.  before-06..before-09
+            ;; scroll off into libghostty's freshly-cleared scrollback as the
+            ;; after-* rows push through the viewport.
+            (ghostel--write-input term "\e[3J")
+            (dotimes (i 5)
+              (ghostel--write-input term (format "after-%02d\r\n" i)))
+            ;; Phase 3: single redraw — must rebuild from libghostty.
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Rows that were in scrollback when CSI 3J fired are gone.
+              (should-not (string-match-p "before-00" content))
+              (should-not (string-match-p "before-05" content))
+              ;; Rows that were in the viewport during CSI 3J are now in
+              ;; libghostty's new scrollback and must be present.
+              (should (string-match-p "before-06" content))
+              (should (string-match-p "before-09" content))
+              ;; after-00 scrolled into scrollback; after-01..after-04 in viewport.
+              (should (string-match-p "after-00" content))
+              (should (string-match-p "after-04" content)))))
       (kill-buffer buf))))
 
 ;; -----------------------------------------------------------------------
@@ -1109,15 +1168,38 @@ that collided with a fish-internal local variable, leaking
                                "/"
                              "")
                            url-path))
-         (default-directory default-directory))
+         (default-directory default-directory)
+         list-buffers-directory)
     (ghostel--update-directory dir)
     (should (equal dir default-directory))                 ; plain path
+    (should (equal dir list-buffers-directory))            ; mirrored
     (ghostel--update-directory file-url)
     (should (equal dir default-directory))                 ; file URL
+    (should (equal dir list-buffers-directory))            ; mirrored
     ;; Dedup: same path shouldn't re-trigger
     (let ((old ghostel--last-directory))
       (ghostel--update-directory file-url)
       (should (equal old ghostel--last-directory)))))       ; dedup
+
+;; -----------------------------------------------------------------------
+;; Test: cwd exposed via list-buffers-directory
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-list-buffers-directory ()
+  "Test that `ghostel-mode' exposes cwd via `list-buffers-directory'."
+  (let ((default-directory (file-name-as-directory
+                            (expand-file-name temporary-file-directory))))
+    (with-temp-buffer
+      (ghostel-mode)
+      (should (equal list-buffers-directory default-directory)))))
+
+(ert-deftest ghostel-test-compile-view-list-buffers-directory ()
+  "Test that `ghostel-compile-view-mode' exposes cwd via `list-buffers-directory'."
+  (let ((default-directory (file-name-as-directory
+                            (expand-file-name temporary-file-directory))))
+    (with-temp-buffer
+      (ghostel-compile-view-mode)
+      (should (equal list-buffers-directory default-directory)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: OSC 7 end-to-end through libghostty
@@ -2172,6 +2254,177 @@ first real focus event."
           (ghostel--open-link (format "fileref:%s" test-file)))
         (should (equal test-file opened))
         (should (null moved))))))                    ; no line → no forward-line
+
+(ert-deftest ghostel-test-delayed-redraw-defers-plain-link-detection ()
+  "Redraw-triggered plain-text link detection should run after redraw."
+  (let ((buf (generate-new-buffer " *ghostel-test-delayed-link*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term t)
+                (ghostel-enable-url-detection t)
+                (ghostel-enable-file-detection nil)
+                (scheduled-count 0)
+                timer-delay timer-repeat timer-fn timer-args)
+            (cl-letf (((symbol-function 'run-with-timer)
+                       (lambda (delay repeat fn &rest args)
+                         (setq scheduled-count (1+ scheduled-count)
+                               timer-delay delay
+                               timer-repeat repeat
+                               timer-fn fn
+                               timer-args args)
+                         'ghostel-test-link-timer))
+                      ((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                      ((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'ghostel--correct-mangled-scroll-positions)
+                       #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--viewport-start)
+                       (lambda () nil))
+                      ((symbol-function 'get-buffer-window-list)
+                       (lambda (&rest _) nil)))
+              (let ((inhibit-read-only t))
+                (insert "see https://example.com here\n"))
+              (ghostel--delayed-redraw buf)
+              (goto-char (point-min))
+              (let* ((url "https://example.com")
+                     (url-end (search-forward url nil t))
+                     (url-beg (- url-end (length url))))
+                (should url-end)
+                (should (null (get-text-property url-beg 'help-echo)))
+                (should (= scheduled-count 1))
+                (should (numberp timer-delay))
+                (should (> timer-delay 0))
+                (should (null timer-repeat))
+                (should timer-fn)
+                (apply timer-fn timer-args)
+                (should (equal url
+                               (get-text-property url-beg 'help-echo)))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-delayed-redraw-coalesces-plain-link-detection ()
+  "Multiple redraws before the timer fires should share one detection pass."
+  (let ((buf (generate-new-buffer " *ghostel-test-coalesced-link*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term t)
+                (ghostel-enable-url-detection t)
+                (ghostel-enable-file-detection nil)
+                (scheduled-count 0)
+                timer-fn timer-args)
+            (cl-letf (((symbol-function 'run-with-timer)
+                       (lambda (_delay repeat fn &rest args)
+                         (setq scheduled-count (1+ scheduled-count)
+                               timer-fn fn
+                               timer-args args)
+                         (should (null repeat))
+                         'ghostel-test-link-timer))
+                      ((symbol-function 'ghostel--flush-pending-output) #'ignore)
+                      ((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'ghostel--correct-mangled-scroll-positions)
+                       #'ignore)
+                      ((symbol-function 'ghostel--redraw) #'ignore)
+                      ((symbol-function 'ghostel--viewport-start)
+                       (lambda () nil))
+                      ((symbol-function 'get-buffer-window-list)
+                       (lambda (&rest _) nil)))
+              (let ((inhibit-read-only t))
+                (insert "first https://first.example\n"))
+              (ghostel--delayed-redraw buf)
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert "second https://second.example\n"))
+              (ghostel--delayed-redraw buf)
+              (goto-char (point-min))
+              (let* ((first-url "https://first.example")
+                     (first-end (search-forward first-url nil t))
+                     (first-beg (- first-end (length first-url)))
+                     (second-url "https://second.example")
+                     (second-end (search-forward second-url nil t))
+                     (second-beg (- second-end (length second-url))))
+                (should first-end)
+                (should second-end)
+                (should (null (get-text-property first-beg 'help-echo)))
+                (should (null (get-text-property second-beg 'help-echo)))
+                (should (= scheduled-count 1))
+                (should timer-fn)
+                (apply timer-fn timer-args)
+                (should (equal first-url
+                               (get-text-property first-beg 'help-echo)))
+                (should (equal second-url
+                               (get-text-property second-beg 'help-echo)))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-detect-urls-allows-read-only-buffers ()
+  "Plain-text link detection should still work in read-only buffers."
+  (let* ((root (ghostel--resource-root))
+         (test-file (file-relative-name
+                     (expand-file-name "lisp/ghostel.el" root)
+                     root)))
+    (with-temp-buffer
+      (let ((default-directory root))
+        (insert (format "see %s:1 for details" test-file))
+        (setq buffer-read-only t)
+        (let ((ghostel-enable-url-detection nil)
+              (ghostel-enable-file-detection t))
+          (should (eq 'ok
+                      (ignore-errors
+                        (ghostel--detect-urls)
+                        'ok)))
+          (should (string-prefix-p
+                   "fileref:"
+                   (get-text-property 5 'help-echo))))))))
+
+(ert-deftest ghostel-test-zero-delay-runs-plain-link-detection-synchronously ()
+  "With delay set to 0, plain-link detection runs without scheduling a timer."
+  (let ((buf (generate-new-buffer " *ghostel-test-zero-delay-link*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((ghostel-enable-url-detection t)
+                (ghostel-enable-file-detection nil)
+                (ghostel-plain-link-detection-delay 0)
+                (timer-scheduled nil)
+                (inhibit-read-only t))
+            (cl-letf (((symbol-function 'run-with-timer)
+                       (lambda (&rest _)
+                         (setq timer-scheduled t)
+                         'ghostel-test-zero-delay-timer)))
+              (insert "see https://example.com here\n")
+              (ghostel--queue-plain-link-detection (point-min) (point-max))
+              (should-not timer-scheduled)
+              (should-not ghostel--plain-link-detection-timer)
+              (goto-char (point-min))
+              (let* ((url "https://example.com")
+                     (url-end (search-forward url nil t))
+                     (url-beg (- url-end (length url))))
+                (should url-end)
+                (should (equal url
+                               (get-text-property url-beg 'help-echo)))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-sentinel-cancels-plain-link-detection-timer ()
+  "Process exit should cancel queued plain-text link detection timers."
+  (let ((buf (generate-new-buffer " *ghostel-test-sentinel-links*")))
+    (unwind-protect
+        (let ((proc (make-pipe-process :name "ghostel-test-sentinel-links"
+                                       :buffer buf
+                                       :noquery t)))
+          (with-current-buffer buf
+            (setq ghostel-kill-buffer-on-exit nil
+                  ghostel--plain-link-detection-timer
+                  (run-with-timer 60 nil #'ignore))
+            (ghostel--sentinel proc "finished\n")
+            (should-not ghostel--plain-link-detection-timer))
+          (when (process-live-p proc)
+            (delete-process proc)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when ghostel--plain-link-detection-timer
+            (cancel-timer ghostel--plain-link-detection-timer)))
+        (kill-buffer buf)))))
 
 (ert-deftest ghostel-test-hyperlink-navigation ()
   "Test `ghostel-next-hyperlink' / `ghostel-previous-hyperlink' search."
@@ -3818,6 +4071,98 @@ it through mangling."
         (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-hidden-buffer-snaps-on-reshow ()
+  "Buffer re-shown after output-while-hidden snaps to the viewport (issue #177).
+Dispatches through `window-buffer-change-functions' so the hook
+wiring — not just `ghostel--reshow-snap' in isolation — is exercised."
+  (let ((buf (generate-new-buffer " *ghostel-test-177-snap*"))
+        (other (get-buffer-create "*ghostel-test-177-other*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t)
+                 (win (selected-window)))
+            (dotimes (i 30)
+              (ghostel--write-input term (format "pre-%02d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel--redraw term t)
+            (set-window-buffer win buf)
+            (goto-char (point-max))
+            (set-window-point win (point-max))
+            (set-window-start win (ghostel--viewport-start) t)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            (let ((pre-hide-ws (window-start win)))
+              ;; Hide; output arrives while hidden so the anchor advances.
+              (set-window-buffer win other)
+              (dotimes (i 30)
+                (ghostel--write-input term (format "hidden-%02d\r\n" i)))
+              (setq ghostel--force-next-redraw t)
+              (ghostel--delayed-redraw buf)
+              ;; Re-show with the stale pre-hide `window-start', then
+              ;; dispatch the hook the way redisplay would.
+              (set-window-buffer win buf)
+              (set-window-start win pre-hide-ws t)
+              (run-hook-with-args 'window-buffer-change-functions win)
+              (setq ghostel--force-next-redraw t)
+              (ghostel--delayed-redraw buf)
+              (should (= (window-start win) (ghostel--viewport-start)))
+              ;; The snap entry was consumed and cleared.
+              (should-not ghostel--windows-needing-snap))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf)
+      (when (buffer-live-p other) (kill-buffer other)))))
+
+(ert-deftest ghostel-test-second-window-does-not-disturb-scrollback ()
+  "Opening a second window on a ghostel buffer does not yank peer windows.
+Issue #177 regression guard for the multi-window case: a window
+already scrolled back for reading history must stay put when a new
+window opens on the same buffer."
+  (let ((buf (generate-new-buffer " *ghostel-test-177-multi*"))
+        (orig-config (current-window-configuration))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let* ((term (ghostel--new 10 40 200))
+                 (ghostel--term term)
+                 (ghostel--term-rows 10)
+                 (inhibit-read-only t)
+                 (win-a (selected-window)))
+            (dotimes (i 30)
+              (ghostel--write-input term (format "pre-%02d\r\n" i)))
+            (ghostel--write-input term "prompt> ")
+            (ghostel--redraw term t)
+            (set-window-buffer win-a buf)
+            (set-window-start win-a (ghostel--viewport-start) t)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            ;; Scroll win-a into the scrollback.
+            (set-window-start win-a (point-min) t)
+            (setq ghostel--force-next-redraw t)
+            (ghostel--delayed-redraw buf)
+            (let ((scrollback-ws (window-start win-a))
+                  (win-b (split-window win-a)))
+              (set-window-buffer win-b buf)
+              (set-window-start win-b (point-min) t)
+              ;; Simulate the callback redisplay fires for the new window.
+              (run-hook-with-args 'window-buffer-change-functions win-b)
+              (setq ghostel--force-next-redraw t)
+              (ghostel--delayed-redraw buf)
+              ;; win-b snapped; win-a's scrollback is untouched.
+              (should (= (window-start win-b) (ghostel--viewport-start)))
+              (should (= (window-start win-a) scrollback-ws))
+              (should-not ghostel--windows-needing-snap))))
+      (set-window-configuration orig-config)
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-redraw-preserves-scroll-during-live-output ()
   "Scrollback view is preserved when live PTY output triggers a redraw.
 Before the fix, any redraw timer firing while the user was reading
@@ -4873,34 +5218,44 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
 ;; -----------------------------------------------------------------------
 
 (ert-deftest ghostel-test-sync-theme ()
-  "Test that ghostel-sync-theme applies palette and redraws ghostel buffers."
+  "Test that ghostel-sync-theme reapplies palette and redraw post-processing."
   (let ((palette-calls nil)
-        (redraw-calls nil))
+        (redraw-calls nil)
+        (post-process-calls 0))
     (cl-letf (((symbol-function 'ghostel--apply-palette)
                (lambda (term) (push term palette-calls)))
               ((symbol-function 'ghostel--redraw)
-               (lambda (term) (push term redraw-calls))))
+               (lambda (term) (push term redraw-calls)))
+              ((symbol-function 'ghostel--schedule-link-detection)
+               (lambda (&rest _args)
+                 (setq post-process-calls (1+ post-process-calls)))))
       (let ((buf (generate-new-buffer " *ghostel-test-theme*"))
             (other (generate-new-buffer " *ghostel-test-other*")))
         (unwind-protect
-            (progn
-              ;; Set up a ghostel-mode buffer with a fake terminal
+            (cl-letf (((symbol-function 'buffer-list)
+                       (lambda () (list buf other))))
+              ;; Set up a ghostel-mode buffer with a fake terminal.
               (with-current-buffer buf
                 (ghostel-mode)
                 (setq ghostel--term 'fake-term)
-                (setq ghostel--copy-mode-active nil))
-              ;; other buffer is not ghostel-mode
+                (setq ghostel--copy-mode-active nil)
+                (setq ghostel-enable-url-detection t))
+              ;; `other' is not a ghostel buffer and should be ignored.
               (ghostel-sync-theme)
-              (should (memq 'fake-term palette-calls))    ; palette applied to ghostel buffer
-              (should (memq 'fake-term redraw-calls))     ; redraw called for ghostel buffer
+              (should (memq 'fake-term palette-calls))
+              (should (memq 'fake-term redraw-calls))
+              (should (= post-process-calls 1))
 
-              ;; Verify copy-mode skips redraw
-              (setq palette-calls nil redraw-calls nil)
+              ;; Verify copy-mode skips redraw.
+              (setq palette-calls nil
+                    redraw-calls nil
+                    post-process-calls 0)
               (with-current-buffer buf
                 (setq ghostel--copy-mode-active t))
               (ghostel-sync-theme)
-              (should (memq 'fake-term palette-calls))    ; palette still applied in copy mode
-              (should-not (memq 'fake-term redraw-calls))) ; redraw skipped in copy mode
+              (should (memq 'fake-term palette-calls))
+              (should-not (memq 'fake-term redraw-calls))
+              (should (= post-process-calls 0)))
           (kill-buffer buf)
           (kill-buffer other))))))
 
@@ -5216,6 +5571,43 @@ hand nil to the native module."
           (should (equal "*myproj-ghostel*"
                          (buffer-local-value 'ghostel--buffer-identity buf))))
       (kill-buffer buf))))
+
+;; -----------------------------------------------------------------------
+;; Test: ghostel and ghostel-project return the buffer
+;; -----------------------------------------------------------------------
+
+(ert-deftest ghostel-test-returns-buffer ()
+  "`ghostel' returns the (live) Ghostel buffer."
+  (let* ((ghostel-buffer-name "*ghostel-return-test*")
+         result)
+    (cl-letf (((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+              ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+              ((symbol-function 'pop-to-buffer) (lambda (&rest _) nil)))
+      (setq result (ghostel)))
+    (should (bufferp result))
+    (should (buffer-live-p result))
+    (should (string-match-p "ghostel-return-test" (buffer-name result)))
+    (kill-buffer result)))
+
+(ert-deftest ghostel-test-project-returns-buffer ()
+  "`ghostel-project' returns the (live) Ghostel buffer."
+  (require 'project)
+  (let* ((ghostel-buffer-name "*ghostel*")
+         result)
+    (cl-letf (((symbol-function 'project-current)
+               (lambda (&optional _) '(transient . "/tmp/retproj/")))
+              ((symbol-function 'project-root)
+               (lambda (proj) (cdr proj)))
+              ((symbol-function 'project-prefixed-buffer-name)
+               (lambda (name) (format "*retproj-%s*" name)))
+              ((symbol-function 'ghostel--load-module) (lambda (&rest _) nil))
+              ((symbol-function 'ghostel--init-buffer) (lambda (&rest _) nil))
+              ((symbol-function 'pop-to-buffer) (lambda (&rest _) nil)))
+      (setq result (ghostel-project)))
+    (should (bufferp result))
+    (should (buffer-live-p result))
+    (should (string-match-p "retproj" (buffer-name result)))
+    (kill-buffer result)))
 
 (ert-deftest ghostel-test-first-creation-respects-display-buffer-alist ()
   "First `ghostel' creation exposes `ghostel-mode' to display rules."
@@ -6296,6 +6688,21 @@ External packages may still call the old internal name."
         (ghostel--send-key "payload"))
       (should (equal sent "payload")))))
 
+(ert-deftest ghostel-test-paste-string-routes-to-paste-text ()
+  "`ghostel-paste-string' forwards its argument to `ghostel--paste-text'."
+  (with-temp-buffer
+    (ghostel-mode)
+    (let (received)
+      (cl-letf (((symbol-function 'ghostel--paste-text)
+                 (lambda (str) (setq received str))))
+        (ghostel-paste-string "hello world")
+        (should (equal received "hello world"))))))
+
+(ert-deftest ghostel-test-paste-string-errors-outside-ghostel-buffer ()
+  "`ghostel-paste-string' signals `user-error' when not in a ghostel buffer."
+  (with-temp-buffer
+    (should-error (ghostel-paste-string "x") :type 'user-error)))
+
 ;; -----------------------------------------------------------------------
 ;; Test: TRAMP integration
 ;; -----------------------------------------------------------------------
@@ -7247,6 +7654,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-send-event
     ghostel-test-raw-key-modified-specials
     ghostel-test-update-directory
+    ghostel-test-list-buffers-directory
+    ghostel-test-compile-view-list-buffers-directory
     ghostel-test-filter-soft-wraps
     ghostel-test-prompt-navigation
     ghostel-test-sync-theme
@@ -7274,6 +7683,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-project-reuses-identity-match-after-rename
     ghostel-test-init-buffer-sets-identity
     ghostel-test-first-creation-respects-display-buffer-alist
+    ghostel-test-returns-buffer
+    ghostel-test-project-returns-buffer
     ghostel-test-copy-all
     ghostel-test-copy-mode-buffer-navigation
     ghostel-test-compile-module-invokes-zig-build
@@ -7335,6 +7746,8 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-send-key-routes-to-send-encoded
     ghostel-test-send-key-nil-mods-becomes-empty-string
     ghostel-test-send-key-errors-outside-ghostel-buffer
+    ghostel-test-paste-string-routes-to-paste-text
+    ghostel-test-paste-string-errors-outside-ghostel-buffer
     ghostel-test-local-host-p
     ghostel-test-update-directory-remote
     ghostel-test-get-shell-local
@@ -7404,6 +7817,11 @@ while :; do sleep 0.1; done'\n")
     ghostel-test-environment-applies-to-compile
     ghostel-test-environment-honors-dir-locals
     ghostel-test-environment-rejects-unsafe-dir-locals
+    ghostel-test-delayed-redraw-defers-plain-link-detection
+    ghostel-test-delayed-redraw-coalesces-plain-link-detection
+    ghostel-test-detect-urls-allows-read-only-buffers
+    ghostel-test-zero-delay-runs-plain-link-detection-synchronously
+    ghostel-test-sentinel-cancels-plain-link-detection-timer
     ghostel-test-compile-prepare-buffer-sets-dir-before-mode
     ghostel-test-eshell-visual-command-mode-toggles-advice
     ghostel-test-eshell/ghostel-dispatches-to-exec-visual

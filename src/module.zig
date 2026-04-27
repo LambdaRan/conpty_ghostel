@@ -14,7 +14,7 @@ const input = @import("input.zig");
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.17.0";
+const version = "0.18.1";
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -188,6 +188,23 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
             term.vtWrite(raw[seg_start..]);
         }
         term.last_input_was_cr = prev_was_cr;
+    }
+
+    // Detect CSI 3 J (erase scrollback). libghostty processes it and clears
+    // its scrollback, but provides no notification. Set rebuild_pending so the
+    // next redraw erases the Emacs buffer and re-fetches from libghostty.
+    // The flag is necessary because CSI 3 J followed by enough new output to
+    // restore the same scrollback depth is undetectable by count or hash alone.
+    //
+    // This is a stateless substring scan over a single write, so it misses:
+    // (1) sequences split across two writes (ESC in one, "[3J" in the next);
+    // (2) non-canonical forms — parameter padding like `\x1B[03J`, or the
+    //     8-bit C1 form `\x9B3J`.
+    // libghostty's stateful VT parser still clears its scrollback in those
+    // cases, so the `libghostty_sb < scrollback_in_buffer` shrink check in
+    // redraw() is the fallback that catches them.
+    if (std.mem.indexOf(u8, raw, "\x1B[3J") != null) {
+        term.rebuild_pending = true;
     }
 
     // Scan for OSC sequences that libghostty-vt discards (7, 51, 52, 133).
@@ -631,7 +648,7 @@ fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*any
         return env.nil();
     };
     // Reflow invalidates the materialized scrollback — terminal.resize()
-    // sets resize_pending so the next redraw() erases and rebuilds under
+    // sets rebuild_pending so the next redraw() erases and rebuilds under
     // inhibit-redisplay, avoiding a visible blank frame.
 
     return env.nil();

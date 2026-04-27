@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.17.0
+;; Version: 0.18.1
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -368,6 +368,14 @@ candidate would require a remote `file-exists-p' round-trip per
 redraw."
   :type 'boolean)
 
+(defcustom ghostel-plain-link-detection-delay 0.1
+  "Delay in seconds before redraw-triggered plain-text link detection runs.
+Redraws queue URL/file detection through
+`ghostel--schedule-link-detection' so multiple updates can be
+coalesced into a single scan.  Set to 0 to scan immediately after each
+redraw.  Native OSC-8 hyperlinks remain applied during redraw."
+  :type 'number)
+
 (defcustom ghostel-file-detection-path-regex
   "[[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']+"
   "Regex matching the PATH portion of a file:line[:col] reference.
@@ -557,7 +565,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.17.0"
+(defconst ghostel--minimum-module-version "0.18.1"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -863,6 +871,15 @@ Updated whenever the terminal is created or resized.")
 (defvar-local ghostel--redraw-timer nil
   "Timer for delayed redraw.")
 
+(defvar-local ghostel--plain-link-detection-timer nil
+  "Timer for delayed redraw-triggered plain-text link detection.")
+
+(defvar-local ghostel--plain-link-detection-begin nil
+  "Queued start bound for redraw-triggered plain-text link detection.")
+
+(defvar-local ghostel--plain-link-detection-end nil
+  "Queued end bound for redraw-triggered plain-text link detection.")
+
 (defvar-local ghostel--force-next-redraw nil
   "When non-nil, redraw regardless of synchronized output mode.")
 
@@ -883,6 +900,14 @@ yank, drop) and cleared by `ghostel--delayed-redraw' after the anchor
 runs.  When nil, a redraw preserves the existing `window-start' if the
 user has scrolled into the scrollback, so live output and Emacs commands
 do not yank the view back to the prompt.")
+
+(defvar-local ghostel--windows-needing-snap nil
+  "List of windows that must anchor to the viewport on the next redraw.
+Populated by `ghostel--reshow-snap' when a window starts displaying
+this buffer, and cleared by `ghostel--delayed-redraw' after the anchor
+runs.  Per-window (rather than buffer-local like `ghostel--snap-requested')
+so opening a second window on a ghostel buffer does not yank peers the
+user has scrolled back for reading history (issue #177).")
 
 (defvar-local ghostel--last-anchor-position nil
   "Buffer position where the anchor last set `window-start'.
@@ -1404,6 +1429,18 @@ Signals a `user-error' when called outside a ghostel buffer."
     (user-error "Must be called from a ghostel buffer"))
   (ghostel--send-encoded key-name (or mods "")))
 
+(defun ghostel-paste-string (string)
+  "Send STRING to the terminal using bracketed paste.
+Signals a `user-error' when called outside a ghostel buffer.
+
+Unlike `ghostel-send-string', this wraps STRING in bracketed paste
+markers (ESC [200~ / ESC [201~) when the terminal supports bracketed
+paste mode (mode 2004), so the shell treats the input as an atomic
+paste rather than character-by-character typed keystrokes."
+  (unless (derived-mode-p 'ghostel-mode)
+    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--paste-text string))
+
 
 ;;; Terminal control commands (C-c prefix)
 
@@ -1923,9 +1960,12 @@ Wraps to `point-max' when no link is found before point."
 BEGIN and END default to `point-min' and `point-max' respectively.
 Skips regions that already have a `help-echo' property (e.g. from OSC 8).
 Bounding the scan keeps streaming output from re-scanning the entire
-materialized scrollback on every redraw."
+materialized scrollback on every redraw.
+Binds `inhibit-read-only' so the scan can attach text properties even
+when called from the deferred-detection timer outside the redraw scope."
   (let ((begin (or begin (point-min)))
-        (end (or end (point-max))))
+        (end (or end (point-max)))
+        (inhibit-read-only t))
     (save-excursion
       ;; Pass 1: http(s) URLs
       (when ghostel-enable-url-detection
@@ -1976,6 +2016,37 @@ materialized scrollback on every redraw."
                                          (concat "fileref:" abs-path)))
                     (put-text-property beg mend 'mouse-face 'highlight)
                     (put-text-property beg mend 'keymap ghostel-link-map)))))))))))
+
+(defun ghostel--run-queued-plain-link-detection (buffer)
+  "Run any queued redraw-triggered plain-text link detection for BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((begin ghostel--plain-link-detection-begin)
+            (end ghostel--plain-link-detection-end))
+        (setq ghostel--plain-link-detection-timer nil
+              ghostel--plain-link-detection-begin nil
+              ghostel--plain-link-detection-end nil)
+        (when (and begin end (<= begin end))
+          (ghostel--detect-urls begin end))))))
+
+(defun ghostel--queue-plain-link-detection (begin end)
+  "Coalesce redraw-triggered plain-text link detection for BEGIN..END."
+  (when (and begin end (<= begin end))
+    (setq ghostel--plain-link-detection-begin
+          (if ghostel--plain-link-detection-begin
+              (min ghostel--plain-link-detection-begin begin)
+            begin)
+          ghostel--plain-link-detection-end
+          (if ghostel--plain-link-detection-end
+              (max ghostel--plain-link-detection-end end)
+            end))
+    (unless ghostel--plain-link-detection-timer
+      (if (<= ghostel-plain-link-detection-delay 0)
+          (ghostel--run-queued-plain-link-detection (current-buffer))
+        (setq ghostel--plain-link-detection-timer
+              (run-with-timer ghostel-plain-link-detection-delay nil
+                              #'ghostel--run-queued-plain-link-detection
+                              (current-buffer)))))))
 
 
 (defun ghostel--compensate-wide-chars ()
@@ -2340,9 +2411,11 @@ file:// URL does not match the local machine, construct a TRAMP path."
         (if (file-remote-p path)
             ;; Trust the shell's report; skip file-directory-p to avoid
             ;; synchronous TRAMP connections on every cd.
-            (setq default-directory (file-name-as-directory path))
+            (setq default-directory (file-name-as-directory path)
+                  list-buffers-directory default-directory)
           (when (file-directory-p path)
-            (setq default-directory (file-name-as-directory path))))))))
+            (setq default-directory (file-name-as-directory path)
+                  list-buffers-directory default-directory)))))))
 
 
 ;;; Palette
@@ -2398,7 +2471,8 @@ Call this after changing the Emacs theme so terminals match."
         (ghostel--apply-palette ghostel--term)
         (when (not ghostel--copy-mode-active)
           (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term)))))))
+            (ghostel--redraw ghostel--term)
+            (ghostel--schedule-link-detection)))))))
 
 (defun ghostel--on-theme-change (&rest _args)
   "Hook function to sync terminal colors after theme change."
@@ -2512,6 +2586,11 @@ PROCESS is the shell process, EVENT describes the state change."
         (when ghostel--input-timer
           (cancel-timer ghostel--input-timer)
           (setq ghostel--input-timer nil))
+        (when ghostel--plain-link-detection-timer
+          (cancel-timer ghostel--plain-link-detection-timer)
+          (setq ghostel--plain-link-detection-timer nil
+                ghostel--plain-link-detection-begin nil
+                ghostel--plain-link-detection-end nil))
         (run-hook-with-args 'ghostel-exit-functions buf event)
         (if ghostel-kill-buffer-on-exit
             (kill-buffer buf)
@@ -3153,18 +3232,31 @@ position COL columns into the first matched line."
         (forward-line (- (1- tr)))
         (line-beginning-position)))))
 
+(defun ghostel--schedule-link-detection (&optional begin end)
+  "Schedule deferred plain-text link detection over BEGIN..END.
+BEGIN defaults to the current viewport start (or `point-min' if the
+buffer has no viewport yet).  END defaults to `point-max'.  Covers
+plain-text URL and file:line detection; native OSC-8 hyperlink spans
+remain handled inside the renderer."
+  (when (or ghostel-enable-url-detection ghostel-enable-file-detection)
+    (ghostel--queue-plain-link-detection
+     (or begin (ghostel--viewport-start) (point-min))
+     (or end (point-max)))))
+
 (defsubst ghostel--window-anchored-p (win)
   "Non-nil if WIN is auto-following the viewport.
 A window counts as anchored when `ghostel--snap-requested' is set
-\(the user just typed), when no anchor has been recorded yet (first
-redraw), or when its `window-start' is at or past the prior anchor.
-During a resize-triggered redraw, a window absent from
+\(the user just typed), when WIN is in `ghostel--windows-needing-snap'
+\(WIN just gained this buffer), when no anchor has been recorded yet
+\(first redraw), or when its `window-start' is at or past the prior
+anchor.  During a resize-triggered redraw, a window absent from
 `ghostel--scroll-positions' also counts as anchored: the prior redraw
 left it following the viewport, so a drifted `window-start' below the
 anchor is Emacs redisplay (e.g. `keep-point-visible' when the
 minibuffer shrinks the window), not a user scroll."
   (let ((anchor ghostel--last-anchor-position))
     (or ghostel--snap-requested
+        (memq win ghostel--windows-needing-snap)
         (null anchor)
         (>= (window-start win) anchor)
         (and ghostel--redraw-resize-active
@@ -3316,8 +3408,10 @@ following the viewport."
                   (ghostel--restore-scrollback-window
                    win (assq win non-anchored-states))))
               (when vs
-                (setq ghostel--last-anchor-position vs))))
-          (setq ghostel--snap-requested nil))))))
+                (setq ghostel--last-anchor-position vs))
+              (ghostel--schedule-link-detection vs (point-max))))
+          (setq ghostel--snap-requested nil)
+          (setq ghostel--windows-needing-snap nil))))))
 
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
@@ -3327,7 +3421,8 @@ following the viewport."
     (let ((inhibit-read-only t))
       (ghostel--redraw ghostel--term ghostel-full-redraw))
     (when ghostel--has-wide-chars
-      (ghostel--compensate-wide-chars))))
+      (ghostel--compensate-wide-chars))
+    (ghostel--schedule-link-detection)))
 
 
 ;;; Window resize
@@ -3388,6 +3483,26 @@ PROCESS is the shell process, WINDOWS is the list of windows."
     ;; after this function returns.  nil suppresses the call.
     ;; On Windows, ConPTY resize is handled above instead.
     size))
+
+(defun ghostel--reshow-snap (window)
+  "Mark WINDOW for viewport-snap on the next redraw.
+Intended for buffer-local `window-buffer-change-functions'.  Fires
+whenever this buffer becomes WINDOW's buffer: both on the classic
+hide-then-show transition and when an additional window opens on
+the same buffer (`split-window', `display-buffer', etc.).  While
+the buffer is hidden `ghostel--last-anchor-position' keeps advancing
+with each redraw, so the pre-show `window-start' that Emacs restores
+falls behind the anchor and is misclassified as scrollback (issue
+#177).  Recording WINDOW (rather than setting a buffer-level flag)
+forces the next redraw to anchor only that window, leaving peer
+windows the user may have scrolled back undisturbed.
+`ghostel--invalidate' schedules the redraw even when no new PTY
+output is arriving."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             ghostel--term)
+    (cl-pushnew window ghostel--windows-needing-snap)
+    (ghostel--invalidate)))
 
 (defun ghostel--commit-cropped-size (window)
   "Commit WINDOW's size if the user focused into a cropped ghostel window.
@@ -3456,6 +3571,7 @@ window (not when it has just been deselected)."
   (setq-local truncate-lines t)
   (setq-local scroll-conservatively 101)
   (setq-local line-spacing 0)
+  (setq-local list-buffers-directory (expand-file-name default-directory)) ; expose cwd to buffer-menu/ibuffer
   (add-function :after after-focus-change-function #'ghostel--focus-change)
   (add-hook 'window-selection-change-functions #'ghostel--focus-change)
   (add-hook 'window-buffer-change-functions #'ghostel--focus-change)
@@ -3463,6 +3579,8 @@ window (not when it has just been deselected)."
   ;; receives WINDOW directly (rather than FRAME as the default binding).
   (add-hook 'window-selection-change-functions
             #'ghostel--commit-cropped-size nil t)
+  (add-hook 'window-buffer-change-functions
+            #'ghostel--reshow-snap nil t)
   (ghostel--suppress-interfering-modes)
   (setq ghostel--scroll-intercept-active t)
   ;; Let C-g reach the keymap instead of triggering keyboard-quit.
@@ -3536,7 +3654,8 @@ buffer creation time — see `ghostel--buffer-identity'."
 With a non-numeric prefix arg, create a new buffer.
 With a numeric prefix ARG, switch to the buffer with that number or
 create it if it doesn't exist yet.
-The name of the buffer is determined by the value of `ghostel-buffer-name'."
+The name of the buffer is determined by the value of `ghostel-buffer-name'.
+Returns the buffer."
   (interactive "P")
   (ghostel--load-module t)
   (let* ((fresh (and arg (not (numberp arg))))
@@ -3552,7 +3671,8 @@ The name of the buffer is determined by the value of `ghostel-buffer-name'."
       (ghostel--prepare-buffer buffer identity))
     (pop-to-buffer buffer (append display-buffer--same-window-action
                                   '((category . comint))))
-    (ghostel--init-buffer buffer identity)))
+    (ghostel--init-buffer buffer identity)
+    buffer))
 
 (defun ghostel-exec (buffer program &optional args)
   "Run PROGRAM with ARGS as a ghostel terminal in BUFFER.
@@ -3593,7 +3713,8 @@ If a buffer already exists for this project, switch to it.
 Otherwise create a new Ghostel buffer.  ARG is passed through to
 `ghostel' and accepts the same universal argument conventions.
 To add this to `project-switch-commands':
-  (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)"
+  (add-to-list \\='project-switch-commands \\='(ghostel-project \"Ghostel\") t)
+Returns the buffer."
   (interactive "P")
   (let ((default-directory (project-root (project-current t)))
         (ghostel-buffer-name (project-prefixed-buffer-name
