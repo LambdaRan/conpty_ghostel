@@ -587,9 +587,13 @@ ghostel settings into *ghostel-debug* for pasting into bug reports."
                                        (window-screen-lines)))
                        (body-rows (window-body-height win))
                        (frame-ch (frame-char-height))
+                       (default-fh (with-selected-window win
+                                     (default-font-height)))
                        (default-lh (with-selected-window win
                                      (default-line-height)))
                        (target-rows (floor screen-lines))
+                       (rendered-px (* term-rows default-lh))
+                       (gap-px (- cur-body-px rendered-px))
                        (rows-match (eql target-rows term-rows))
                        (px-match (eql cur-body-px old-body-px)))
                   (insert (format "screen-lines:        %.3f → target %d (term=%s) %s\n"
@@ -597,15 +601,20 @@ ghostel settings into *ghostel-debug* for pasting into bug reports."
                                   (if rows-match "[in sync]" "[MISMATCH]")))
                   (insert (format "Body rows (frame):   %d (window-body-height — frame chars)\n"
                                   body-rows))
-                  (insert (format "Line height:         frame=%d px  default-face=%d px%s\n"
-                                  frame-ch default-lh
-                                  (if (eql frame-ch default-lh) ""
-                                    " [face-remap or theme bumps height]")))
+                  (insert (format "Line height:         frame=%d px  default-font=%d px  default-line=%d px%s\n"
+                                  frame-ch default-fh default-lh
+                                  (cond ((not (eql frame-ch default-fh))
+                                         " [font ≠ frame: face-remap or :height]")
+                                        ((not (eql default-fh default-lh))
+                                         " [extra from line-spacing]")
+                                        (t ""))))
                   (insert (format "Body pixels:         cur=%d  recorded=%d %s\n"
                                   cur-body-px old-body-px
                                   (if px-match "" "[redisplay pending]")))
                   (insert (format "Window pixels:       cur=%d  recorded=%d\n"
                                   cur-total-px old-total-px))
+                  (insert (format "Bottom gap:          %d px (%d rendered − %d body)\n"
+                                  gap-px rendered-px cur-body-px))
                   (cond
                    (rows-match
                     (insert "Diagnosis:           in sync\n"))
@@ -614,7 +623,48 @@ ghostel settings into *ghostel-debug* for pasting into bug reports."
                     (insert "                     ghostel didn't reconcile (#192)\n"))
                    (t
                     (insert "Diagnosis:           pending redisplay; hooks will fire\n")
-                    (insert "                     on next paint\n"))))))))
+                    (insert "                     on next paint\n"))))
+                ;; Rendering — font / line-spacing / face-remap.
+                ;; Most #192-class follow-ups so far have been about
+                ;; line-spacing or face-remap silently changing the row
+                ;; metric.  Surface the live values so a report tells
+                ;; us in one capture which knob is responsible.
+                (insert "\n--- Rendering ---\n")
+                (let* ((face-family
+                        (with-current-buffer ghostel-buf
+                          (face-attribute 'default :family nil 'default)))
+                       (face-height
+                        (with-current-buffer ghostel-buf
+                          (face-attribute 'default :height nil 'default)))
+                       (face-weight
+                        (with-current-buffer ghostel-buf
+                          (face-attribute 'default :weight nil 'default)))
+                       (resolved-font
+                        (with-selected-window win (face-font 'default)))
+                       (frame-font (frame-parameter nil 'font))
+                       (lsp-buf (with-current-buffer ghostel-buf
+                                  (and (local-variable-p 'line-spacing)
+                                       line-spacing)))
+                       (lsp-default (default-value 'line-spacing))
+                       (lsp-frame (frame-parameter nil 'line-spacing))
+                       (remap (with-current-buffer ghostel-buf
+                                face-remapping-alist)))
+                  (insert (format "Default face:        %s %S %s\n"
+                                  face-family face-height face-weight))
+                  (insert (format "Resolved font:       %s\n" resolved-font))
+                  (insert (format "Frame font:          %s%s\n"
+                                  frame-font
+                                  (if (and (stringp resolved-font)
+                                           (stringp frame-font)
+                                           (not (string= resolved-font frame-font)))
+                                      " [resolved differs — fallback or remap]"
+                                    "")))
+                  (insert (format "line-spacing:        buf=%S  default-value=%S  frame=%S\n"
+                                  lsp-buf lsp-default lsp-frame))
+                  (insert (format "face-remapping:      %s\n"
+                                  (if remap
+                                      (format "%S" remap)
+                                    "(none)"))))))))
         ;; Non-default ghostel settings
         (insert "\n--- Non-default ghostel settings ---\n")
         (let (changed)
