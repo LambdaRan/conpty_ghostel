@@ -3166,6 +3166,69 @@ position COL columns into the first matched line."
         (forward-line (- (1- tr)))
         (line-beginning-position)))))
 
+(defun ghostel--active-preedit-overlay ()
+  "Return the active GUI preedit overlay in the current buffer, if any.
+GTK/PGTK input methods display uncommitted text with `x-preedit-overlay'
+or `pgtk-preedit-overlay'.  Those overlays are anchored at point, so a
+terminal redraw that moves point can make the candidate window jump."
+  (cl-loop for sym in '(x-preedit-overlay pgtk-preedit-overlay)
+           for ov = (and (boundp sym) (symbol-value sym))
+           for text = (and (overlayp ov) (overlay-get ov 'before-string))
+           when (and text
+                     (eq (overlay-buffer ov) (current-buffer))
+                     (stringp text)
+                     (> (length text) 0))
+           return ov))
+
+(defun ghostel--preedit-window (overlay)
+  "Return the window associated with preedit OVERLAY, if it is usable."
+  (let ((win (overlay-get overlay 'window)))
+    (cond
+     ((and (window-live-p win)
+           (eq (window-buffer win) (current-buffer)))
+      win)
+     ((eq (window-buffer (selected-window)) (current-buffer))
+      (selected-window)))))
+
+(defun ghostel--capture-preedit-state ()
+  "Capture active GUI preedit position before a redraw rewrites the buffer."
+  (when-let* ((overlay (ghostel--active-preedit-overlay)))
+    (let* ((pos (overlay-start overlay))
+           (viewport-start (ghostel--viewport-start))
+           (line (and viewport-start
+                      (>= pos viewport-start)
+                      (- (line-number-at-pos pos)
+                         (line-number-at-pos viewport-start))))
+           (column (save-excursion
+                     (goto-char pos)
+                     (current-column))))
+      (list :overlay overlay
+            :window (ghostel--preedit-window overlay)
+            :position pos
+            :viewport-line line
+            :column column))))
+
+(defun ghostel--restore-preedit-state (state viewport-start)
+  "Restore preedit overlay STATE after redraw.
+VIEWPORT-START is the post-redraw viewport-start position.
+Returns the buffer position that should be used as the composing
+window's point, or nil when the saved overlay is no longer live."
+  (let ((overlay (plist-get state :overlay)))
+    (when (and (overlayp overlay)
+               (eq (overlay-buffer overlay) (current-buffer)))
+      (let* ((line (plist-get state :viewport-line))
+             (column (plist-get state :column))
+             (pos (if (and viewport-start line)
+                      (save-excursion
+                        (goto-char viewport-start)
+                        (forward-line
+                         (min line (max 0 (1- (or ghostel--term-rows 1)))))
+                        (move-to-column column)
+                        (point))
+                    (min (plist-get state :position) (point-max)))))
+        (move-overlay overlay pos pos (current-buffer))
+        pos))))
+
 (defun ghostel--schedule-link-detection (&optional begin end)
   "Schedule deferred plain-text link detection over BEGIN..END.
 BEGIN defaults to the current viewport start (or `point-min' if the
@@ -3247,7 +3310,7 @@ No-op when `ghostel--snap-requested' (user input overrides)."
                    (eq (window-buffer win) buffer))
           (ghostel--reconcile-saved-position win entry))))))
 
-(defun ghostel--anchor-window (win vs pt)
+(defun ghostel--anchor-window (win vs pt &optional exact-point)
   "Pin WIN to viewport-start VS and sync its point to PT.
 Also resets pixel vscroll (pixel-scroll-precision-mode may leave a
 partial offset that would clip the top line after a redraw).
@@ -3270,10 +3333,16 @@ viewport; buffer-point is unaffected and subsequent redraws recapture
 the real cursor.  We must NOT clamp for a plain shell prompt where the
 cursor is legitimately at `point-max' after typing — doing so would
 draw the block cursor on the last character instead of after it
-\(issue #146)."
+\(issue #146).
+
+When EXACT-POINT is non-nil, set `window-point' to PT exactly.  This is
+used while a GUI input method is displaying preedit text: the candidate
+window is anchored to point, and moving it by one character is visible
+as a jump."
   (set-window-start win vs t)
   (set-window-vscroll win 0 t)
-  (set-window-point win (if (and (= pt (point-max))
+  (set-window-point win (if (and (not exact-point)
+                                 (= pt (point-max))
                                  (> pt (point-min))
                                  ghostel--term
                                  (or (ghostel--cursor-pending-wrap-p
@@ -3308,7 +3377,11 @@ frame mid-redraw) — in which case this is a no-op."
 Flushes pending PTY output, corrects any Emacs-side window-start
 mangling, runs the native redraw, then restores scroll state for
 windows that were reading scrollback and anchors windows that were
-following the viewport."
+following the viewport.
+
+When a GUI input method is composing preedit text in BUFFER, leaves
+buffer point on the preedit anchor instead of the terminal cursor so
+the candidate window does not jump while text is streaming in."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq ghostel--redraw-timer nil)
@@ -3320,7 +3393,9 @@ following the viewport."
           (setq ghostel--force-next-redraw nil)
           (setq ghostel--has-wide-chars nil)
           (ghostel--correct-mangled-scroll-positions buffer)
-          (let* ((all-windows (get-buffer-window-list buffer nil t))
+          (let* ((preedit-state (ghostel--capture-preedit-state))
+                 (preedit-window (plist-get preedit-state :window))
+                 (all-windows (get-buffer-window-list buffer nil t))
                  (anchored (cl-remove-if-not #'ghostel--window-anchored-p
                                              all-windows))
                  (non-anchored-states
@@ -3333,14 +3408,27 @@ following the viewport."
             (ghostel--redraw ghostel--term ghostel-full-redraw)
             (when ghostel--has-wide-chars
               (ghostel--compensate-wide-chars))
-            (let ((pt (point))
-                  (vs (ghostel--viewport-start)))
+            (let* ((pt (point))
+                   (vs (ghostel--viewport-start))
+                   (preedit-point
+                    (and preedit-state
+                         (ghostel--restore-preedit-state
+                          preedit-state vs))))
               (setq ghostel--scroll-positions nil)
               (dolist (win all-windows)
                 (if (and vs (memq win anchored))
-                    (ghostel--anchor-window win vs pt)
+                    (let ((preedit-win-p
+                           (and preedit-point
+                                preedit-window
+                                (eq win preedit-window))))
+                      (ghostel--anchor-window
+                       win vs
+                       (if preedit-win-p preedit-point pt)
+                       preedit-win-p))
                   (ghostel--restore-scrollback-window
                    win (assq win non-anchored-states))))
+              (when preedit-point
+                (goto-char preedit-point))
               (when vs
                 (setq ghostel--last-anchor-position vs))
               (ghostel--schedule-link-detection vs (point-max))))

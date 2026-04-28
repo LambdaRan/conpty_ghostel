@@ -4441,6 +4441,104 @@ skip the clamp entirely regardless of where PT sits."
         (set-window-buffer (selected-window) orig-buf))
       (kill-buffer buf))))
 
+;; Declared here so tests can rebind these without byte-compile warnings on
+;; non-X/non-PGTK builds where term/x-win.el and term/pgtk-win.el aren't loaded.
+(defvar x-preedit-overlay)
+(defvar pgtk-preedit-overlay)
+
+(ert-deftest ghostel-test-delayed-redraw-preserves-preedit-anchor ()
+  "Active GUI preedit text keeps its point anchor across redraws.
+GTK/PGTK input-method candidate windows are anchored to the preedit
+overlay at point.  During streaming TUI output, native redraws move
+point to the terminal cursor; while preedit text is visible, the
+composing window must instead keep the overlay and `window-point' at
+the same viewport row and column."
+  (let ((buf (generate-new-buffer " *ghostel-test-preedit-anchor*"))
+        (orig-buf (window-buffer (selected-window)))
+        (old-bound (boundp 'x-preedit-overlay))
+        (old-value (and (boundp 'x-preedit-overlay) x-preedit-overlay))
+        overlay)
+    (unwind-protect
+        (progn
+          (set-window-buffer (selected-window) buf)
+          (with-current-buffer buf
+            (ghostel-mode)
+            (setq-local ghostel--term 'fake-term
+                        ghostel--term-rows 5
+                        ghostel--force-next-redraw nil
+                        ghostel-enable-url-detection nil
+                        ghostel-enable-file-detection nil)
+            (insert "old-0\nold-1\nold-2\nold-3\nold-4")
+            (goto-char (point-max))
+            (setq overlay (make-overlay (point) (point) buf))
+            (overlay-put overlay 'before-string "ni")
+            (overlay-put overlay 'window (selected-window))
+            (setq x-preedit-overlay overlay)
+            (set-window-start (selected-window) (point-min) t)
+            (set-window-point (selected-window) (point)))
+          (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--redraw)
+                     (lambda (&rest _)
+                       ;; Simulate a destructive native redraw that leaves
+                       ;; point at the terminal cursor on a different row.
+                       (erase-buffer)
+                       (insert "new-0\nnew-1\nnew-2\nnew-3\nnew-4")
+                       (goto-char (point-min))
+                       (forward-line 1)))
+                    ((symbol-function 'ghostel--cursor-pending-wrap-p)
+                     (lambda (&rest _)
+                       (error "Preedit anchor should bypass clamp checks")))
+                    ((symbol-function 'ghostel--cursor-on-empty-row-p)
+                     (lambda (&rest _)
+                       (error "Preedit anchor should bypass clamp checks"))))
+            (ghostel--delayed-redraw buf))
+          (with-current-buffer buf
+            (let ((expected (save-excursion
+                              (goto-char (point-min))
+                              (forward-line 4)
+                              (move-to-column 5)
+                              (point))))
+              (should (= expected (overlay-start overlay)))
+              (should (= expected (window-point (selected-window))))
+              (should (= expected (point))))))
+      (if old-bound
+          (setq x-preedit-overlay old-value)
+        (makunbound 'x-preedit-overlay))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (when (and overlay (overlayp overlay))
+        (delete-overlay overlay))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-preedit-window-fallback ()
+  "Verify the `selected-window' fallback in `ghostel--preedit-window'.
+This covers the pgtk-preedit-overlay shape, which has no `window'
+overlay property."
+  (let ((buf (generate-new-buffer " *ghostel-test-preedit-window*"))
+        (orig-buf (window-buffer (selected-window)))
+        overlay)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq overlay (make-overlay (point-min) (point-min) buf))
+          ;; No 'window property — selected-window must show the buffer.
+          (set-window-buffer (selected-window) buf)
+          (should (eq (ghostel--preedit-window overlay) (selected-window)))
+          ;; Explicit 'window wins over the fallback.
+          (overlay-put overlay 'window (selected-window))
+          (should (eq (ghostel--preedit-window overlay) (selected-window)))
+          ;; Selected window showing some other buffer and no 'window
+          ;; property: nothing usable, return nil.
+          (overlay-put overlay 'window nil)
+          (when (buffer-live-p orig-buf)
+            (set-window-buffer (selected-window) orig-buf))
+          (should (null (ghostel--preedit-window overlay))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (when (and overlay (overlayp overlay))
+        (delete-overlay overlay))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-cursor-pending-wrap-p ()
   "`ghostel--cursor-pending-wrap-p' tracks libghostty's pending-wrap flag."
   (let ((term (ghostel--new 5 10 100)))
@@ -7945,6 +8043,8 @@ COLORTERM, INSIDE_EMACS, …) plus pass-through LANG/LC_*."
     ghostel-test-compile-reconciles-skips-when-no-outwin
     ghostel-test-viewport-start-skips-trailing-newline
     ghostel-test-anchor-window-no-clamp-without-pending-wrap
+    ghostel-test-delayed-redraw-preserves-preedit-anchor
+    ghostel-test-preedit-window-fallback
     ghostel-test-exec-errors-on-live-process
     ghostel-test-exec-calls-spawn-pty-with-expected-args
     ghostel-test-exec-threads-remote-p-from-tramp-dir
