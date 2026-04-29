@@ -2657,9 +2657,10 @@ EXTRA-ENV is an optional list of environment variable strings
   (let* ((proxy-path (ghostel--conpty-proxy-path)))
     (unless proxy-path
       (error "conpty_proxy.exe not found; set `ghostel-conpty-proxy-path' or add it to PATH"))
-    (let* ((conpty-id (format "ghostel_%s_%s"
+    (let* ((conpty-id (format "ghostel_%s_%s_%04x"
                               (format-time-string "%s")
-                              (emacs-pid)))
+                              (emacs-pid)
+                              (random #x10000)))
            (process-environment
             (append
              (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
@@ -2683,12 +2684,8 @@ EXTRA-ENV is an optional list of environment variable strings
 (defun ghostel--conpty-proxy-resize (process width height)
   "Resize the ConPTY terminal for PROCESS to WIDTH x HEIGHT."
   (when-let* ((conpty-id (process-get process 'conpty-id)))
-    (let ((exit-code (call-process (ghostel--conpty-proxy-path) nil nil nil
-                                   "resize" conpty-id
-                                   (number-to-string width)
-                                   (number-to-string height))))
-      (unless (eql exit-code 0)
-        (message "ghostel: conpty_proxy resize failed (exit code %s)" exit-code)))))
+    (unless (ghostel--conpty-resize conpty-id width height)
+      (message "ghostel: conpty_proxy resize failed"))))
 
 (defun ghostel--detect-shell (shell)
   "Return shell type symbol (bash, zsh, fish) from SHELL path, or nil."
@@ -3572,7 +3569,7 @@ PROCESS is the shell process, WINDOWS is the list of windows."
     ;; Return size — Emacs calls set-process-window-size (SIGWINCH)
     ;; after this function returns.  nil suppresses the call.
     ;; On Windows, ConPTY resize is handled above instead.
-    size))
+    (if (eq system-type 'windows-nt) nil size)))
 
 (defun ghostel--reshow-snap (window)
   "Mark WINDOW for viewport-snap on the next redraw.
@@ -3626,8 +3623,9 @@ window (not when it has just been deselected)."
               ghostel--force-next-redraw t)
         (when (eq system-type 'windows-nt)
           (ghostel--conpty-proxy-resize ghostel--process width height))
-        (set-process-window-size ghostel--process
-                                 (max 1 height) (max 1 width))
+        (unless (eq system-type 'windows-nt)
+          (set-process-window-size ghostel--process
+                                   (max 1 height) (max 1 width)))
         (when ghostel--redraw-timer
           (cancel-timer ghostel--redraw-timer)
           (setq ghostel--redraw-timer nil))

@@ -51,6 +51,7 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--enable-vt-log", 0, 0, &fnEnableVtLog, "Enable libghostty internal log routing to *ghostel-debug*.\n\n(ghostel--enable-vt-log)");
     env.bindFunction("ghostel--disable-vt-log", 0, 0, &fnDisableVtLog, "Disable libghostty internal log routing.\n\n(ghostel--disable-vt-log)");
     env.bindFunction("ghostel--native-uri-at", 3, 3, &fnUriAt, "Get URI at ROW-from-bottom and COL.\n\n(ghostel--native-uri-at TERM ROW COL)");
+    env.bindFunction("ghostel--conpty-resize", 3, 3, &fnConptyResize, "Resize the ConPTY pseudo-console by writing to the control named pipe.\n\n(ghostel--conpty-resize ID WIDTH HEIGHT)");
 
     emacs.initSymbols(env);
     env.provide("ghostel-module");
@@ -153,40 +154,34 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // the program discards our reply as noise.
     extractOscColorQueries(env, term, raw);
 
-    if (comptime builtin.os.tag == .windows) {
-        // Windows ConPTY handles line discipline (CRLF conversion),
-        // so data already has proper \r\n.  Pass through directly.
-        term.vtWrite(raw);
-    } else {
-        // Normalize CRLF by streaming directly into libghostty's parser.
-        // Emacs PTYs lack ONLCR, so bare \n arrives without \r — insert
-        // one before each bare \n by feeding the preceding segment verbatim
-        // and then "\r\n".  libghostty's VT state machine handles arbitrary
-        // chunking (that's how the process filter already works), so no
-        // scratch buffer, no allocation, no truncation fallback.
-        //
-        // `prev_was_cr` is seeded from `term.last_input_was_cr` so a CRLF
-        // pair split across two writes — chunk A ending with \r, chunk B
-        // starting with \n — is not mis-normalized into \r\r\n.  The final
-        // value is persisted back for the next call. An empty input
-        // round-trips the flag unchanged.
-        var seg_start: usize = 0;
-        var prev_was_cr: bool = term.last_input_was_cr;
-        for (raw, 0..) |ch, i| {
-            if (ch == '\n' and !prev_was_cr) {
-                if (i > seg_start) term.vtWrite(raw[seg_start..i]);
-                term.vtWrite("\r\n");
-                seg_start = i + 1;
-                prev_was_cr = false;
-            } else {
-                prev_was_cr = (ch == '\r');
-            }
+    // Normalize CRLF by streaming directly into libghostty's parser.
+    // Emacs PTYs lack ONLCR, so bare \n arrives without \r — insert
+    // one before each bare \n by feeding the preceding segment verbatim
+    // and then "\r\n".  libghostty's VT state machine handles arbitrary
+    // chunking (that's how the process filter already works), so no
+    // scratch buffer, no allocation, no truncation fallback.
+    //
+    // `prev_was_cr` is seeded from `term.last_input_was_cr` so a CRLF
+    // pair split across two writes — chunk A ending with \r, chunk B
+    // starting with \n — is not mis-normalized into \r\r\n.  The final
+    // value is persisted back for the next call. An empty input
+    // round-trips the flag unchanged.
+    var seg_start: usize = 0;
+    var prev_was_cr: bool = term.last_input_was_cr;
+    for (raw, 0..) |ch, i| {
+        if (ch == '\n' and !prev_was_cr) {
+            if (i > seg_start) term.vtWrite(raw[seg_start..i]);
+            term.vtWrite("\r\n");
+            seg_start = i + 1;
+            prev_was_cr = false;
+        } else {
+            prev_was_cr = (ch == '\r');
         }
-        if (seg_start < raw.len) {
-            term.vtWrite(raw[seg_start..]);
-        }
-        term.last_input_was_cr = prev_was_cr;
     }
+    if (seg_start < raw.len) {
+        term.vtWrite(raw[seg_start..]);
+    }
+    term.last_input_was_cr = prev_was_cr;
 
     // Scan for OSC sequences that libghostty-vt discards (7, 51, 52, 133).
     // One pass, dispatched by code in document order.
@@ -1106,6 +1101,74 @@ fn fnCopyAllText(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?
 fn fnModuleVersion(raw_env: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     return env.makeString(version);
+}
+
+/// (ghostel--conpty-resize ID WIDTH HEIGHT)
+/// Resize the ConPTY pseudo-console by writing directly to the control
+/// named pipe, avoiding a process spawn on every resize.
+/// Returns t on success, nil on failure.
+fn fnConptyResize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    if (comptime builtin.os.tag != .windows) {
+        return env.nil();
+    }
+
+    const HANDLE = *anyopaque;
+    const DWORD = u32;
+    const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+    const GENERIC_WRITE = 0x40000000;
+    const OPEN_EXISTING: DWORD = 3;
+
+    const kernel32 = struct {
+        extern "kernel32" fn CreateFileA(
+            lpFileName: [*:0]const u8,
+            dwDesiredAccess: DWORD,
+            dwShareMode: DWORD,
+            lpSecurityAttributes: ?*anyopaque,
+            dwCreationDisposition: DWORD,
+            dwFlagsAndAttributes: DWORD,
+            hTemplateFile: ?HANDLE,
+        ) callconv(.winapi) HANDLE;
+        extern "kernel32" fn WriteFile(
+            hFile: HANDLE,
+            lpBuffer: [*]const u8,
+            nNumberOfBytesToWrite: DWORD,
+            lpNumberOfBytesWritten: *DWORD,
+            lpOverlapped: ?*anyopaque,
+        ) callconv(.winapi) i32;
+        extern "kernel32" fn CloseHandle(
+            hObject: HANDLE,
+        ) callconv(.winapi) i32;
+    };
+
+    var id_buf: [64]u8 = undefined;
+    const id = env.extractString(args[0], &id_buf) orelse return env.nil();
+    const width: u16 = @intCast(env.extractInteger(args[1]));
+    const height: u16 = @intCast(env.extractInteger(args[2]));
+
+    var pipename_buf: [128]u8 = undefined;
+    const pipename = std.fmt.bufPrintZ(&pipename_buf, "\\\\.\\pipe\\conpty-proxy-ctrl-{s}", .{id}) catch return env.nil();
+
+    const pipe = kernel32.CreateFileA(
+        pipename,
+        GENERIC_WRITE,
+        0,
+        null,
+        OPEN_EXISTING,
+        0,
+        null,
+    );
+    if (pipe == INVALID_HANDLE_VALUE) {
+        return env.nil();
+    }
+    defer _ = kernel32.CloseHandle(pipe);
+
+    var msg_buf: [32]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "{d} {d}", .{width, height}) catch return env.nil();
+
+    var written: DWORD = 0;
+    _ = kernel32.WriteFile(pipe, msg.ptr, @intCast(msg.len), &written, null);
+    return env.t();
 }
 
 // ---------------------------------------------------------------------------
