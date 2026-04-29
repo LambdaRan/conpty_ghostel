@@ -1,6 +1,15 @@
 # Ghostel shell integration for bash
-# Source this from your .bashrc:
-#   [[ "$INSIDE_EMACS" = 'ghostel' ]] && source /path/to/ghostel/etc/shell/ghostel.bash
+# Source this from your .bashrc.
+#
+# Local `~/.bashrc' (prefix match — TRAMP appends `,tramp:VER'):
+#   [[ "${INSIDE_EMACS%%,*}" = 'ghostel' ]] && source /path/to/ghostel/etc/shell/ghostel.bash
+#
+# Remote `~/.bashrc' (also gates on TERM, since ssh propagates it
+# natively and INSIDE_EMACS does not without server-side AcceptEnv):
+#   if [[ "${INSIDE_EMACS%%,*}" = 'ghostel' || "$TERM" = 'xterm-ghostty' ]]; then
+#       source ~/.local/share/ghostel/ghostel.bash
+#   fi
+# See the README "Manual setup" section for the full rationale.
 
 # Idempotency guard — skip if already loaded (e.g. auto-injected).
 [[ "$(type -t __ghostel_osc7)" = "function" ]] && return

@@ -1,6 +1,18 @@
 # Ghostel shell integration for zsh
-# Source this from your .zshrc:
-#   [[ "$INSIDE_EMACS" = 'ghostel' ]] && source /path/to/ghostel/etc/shell/ghostel.zsh
+# Source this from your .zshrc.
+#
+# The `${var-}' fallback inside the trim is for users with `setopt
+# nounset' — zsh errors on `${unset%%pat}' without it (bash doesn't).
+#
+# Local `~/.zshrc' (prefix match — TRAMP appends `,tramp:VER'):
+#   [[ "${${INSIDE_EMACS-}%%,*}" = 'ghostel' ]] && source /path/to/ghostel/etc/shell/ghostel.zsh
+#
+# Remote `~/.zshrc' (also gates on TERM, since ssh propagates it
+# natively and INSIDE_EMACS does not without server-side AcceptEnv):
+#   if [[ "${${INSIDE_EMACS-}%%,*}" = 'ghostel' || "$TERM" = 'xterm-ghostty' ]]; then
+#       source ~/.local/share/ghostel/ghostel.zsh
+#   fi
+# See the README "Manual setup" section for the full rationale.
 
 # Idempotency guard — skip if already loaded (e.g. auto-injected).
 (( $+functions[__ghostel_osc7] )) && return

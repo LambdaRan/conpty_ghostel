@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.18.1
+;; Version: 0.19.0
 ;; Package-Requires: ((emacs "28.1") (evil "1.0") (ghostel "0.8.0"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -26,6 +26,11 @@
 
 (require 'evil)
 (require 'ghostel)
+
+(declare-function ghostel--cursor-position "ghostel-module")
+(declare-function ghostel--mode-enabled "ghostel-module")
+
+(defvar evil-ghostel-mode)
 
 ;; ---------------------------------------------------------------------------
 ;; Customization
@@ -80,7 +85,7 @@ placement math the native module performs in `src/render.zig'."
   (when (and ghostel--term ghostel--term-rows)
     (let ((pos (ghostel--cursor-position ghostel--term)))
       (when pos
-        (let ((scrollback (max 0 (- (line-number-at-pos (point-max))
+        (let ((scrollback (max 0 (- (count-lines (point-min) (point-max))
                                     ghostel--term-rows))))
           (goto-char (point-min))
           (forward-line (+ scrollback (cdr pos)))
@@ -160,7 +165,7 @@ In alt-screen mode, defer to the terminal's cursor style."
 
 (defvar evil-ghostel--sync-inhibit nil
   "When non-nil, skip arrow-key sync in the insert-state-entry hook.
-Set by the `I'/`A' advice which send Home/End directly.")
+Set by the I/A advice which send Home/End directly.")
 
 (defun evil-ghostel--insert-state-entry ()
   "Sync terminal cursor to Emacs point when entering `emacs-state'.
