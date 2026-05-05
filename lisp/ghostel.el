@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.19.0
+;; Version: 0.22.1
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -144,9 +144,19 @@ Also honored via `dir-locals.el' for per-project overrides.
 
 TRAMP caveats:
 - Entries with `=' are propagated to the remote shell.
-- TERM is always reset by TRAMP to `tramp-terminal-type' (see
-  `tramp-handle-make-process'); overrides in `ghostel-environment'
-  do not win remotely.
+- TERM/TERMINFO/TERM_PROGRAM/TERM_PROGRAM_VERSION/COLORTERM here
+  are ignored for remote spawns and overridden unconditionally by
+  the per-spawn `/bin/sh -c' wrapper after `infocmp'-probing the
+  remote for `xterm-ghostty' terminfo.  TRAMP's
+  `tramp-local-environment-variable-p' filter strips env entries
+  that match the local default top-level `process-environment',
+  so pushing TERM via env was unreliable; the wrapper exports
+  these from inside the remote shell instead, where the filter
+  doesn't reach.  Customize `ghostel-term' (locally, or per-host
+  via dir-locals or `connection-local-set-profile-variables') to
+  change what gets advertised; on a customized branch the wrapper
+  exports `TERM=$ghostel-term' only — no `TERM_PROGRAM*' ghostty
+  advertisement.  Every other entry in this list still propagates.
 - INSIDE_EMACS is rewritten by TRAMP via `tramp-inside-emacs',
   which appends `,tramp:VER' to whatever value is in scope.  For
   ghostel that means the remote shell sees `ghostel,tramp:VER'
@@ -214,6 +224,73 @@ practical Emacs heap cost is roughly equal to the libghostty
 allocation, and large values noticeably slow down sustained
 high-throughput output (e.g. `cat huge.log')."
   :type 'integer)
+
+(defcustom ghostel-cell-pixel-scale 'auto
+  "Physical-to-logical pixel ratio for cell-size reporting.
+
+Used when answering XTWINOPS queries (CSI 14/16 t) and when telling
+libghostty's kitty graphics protocol the cell dimensions.  Image
+tools — timg, yazi, tmux passthrough — query the terminal for cell
+pixel size to compute placement dimensions; if the value reported is
+smaller than what the standalone Ghostty terminal would report, they
+either fall back to half-block rendering (timg) or fill more cells
+than expected with upscaled, blocky output (yazi).
+
+`auto' computes the display DPI from `display-mm-width' and
+`display-pixel-width' and uses DPI/96 directly as a float.  Standard
+~96 DPI displays resolve to ~1.0; HiDPI displays (~150 DPI) resolve
+to ~1.5; ~192 DPI displays to ~2.0.  If the display's physical size
+isn't reported (some multi-monitor setups, virtual displays), falls
+back to 1.
+
+This is a heuristic — Emacs has no portable API for the OS-level
+backing scale factor, so exact parity with standalone Ghostty
+\(which measures cell size in real physical pixels via the window
+server) requires setting an explicit number here.  Useful overrides:
+the exact `physical_cell_w / frame-char-width' ratio (e.g. 2.28) for
+pixel-perfect parity with standalone Ghostty's image rendering, or
+1 to opt out of HiDPI-aware reporting altogether.
+
+Note that `image-scaling-factor' is *not* a useful signal here:
+Emacs's `auto' resolves it from `frame-char-width' (a font-width
+heuristic for image-vs-text scaling), not from the display's DPI
+or backing scale factor."
+  :type '(choice (const :tag "Auto-detect from display DPI" auto)
+                 (number :tag "Explicit ratio")))
+
+(defcustom ghostel-kitty-graphics-storage-limit (* 320 1024 1024)  ; 320 MiB
+  "Kitty graphics image storage cap, in bytes, per terminal.
+
+Caps how much memory libghostty's kitty-graphics image store can
+hold per ghostel buffer.  Each transmitted image (PNG bytes or raw
+pixels) counts; libghostty evicts the oldest image when a new
+transmission would exceed this limit.
+
+Set to 0 to disable kitty graphics entirely — image transmissions
+are then ignored and no storage is allocated.  Useful on low-memory
+systems or for terminals you know won't display images."
+  :type 'integer)
+
+(defcustom ghostel-kitty-graphics-mediums nil
+  "Image-loading mediums to enable for the Kitty graphics protocol.
+
+The kitty protocol supports four ways for a program to ship image
+data to the terminal:
+- direct: base64-encoded inline (always enabled, what timg / yazi use)
+- file: program names a local file, terminal reads it
+- temp-file: program names a temp file, terminal reads and unlinks it
+- shared-mem: program names a POSIX shared-memory region
+
+The non-direct mediums let a *remote* program (over SSH, tmux
+passthrough, etc.) instruct ghostel to read arbitrary paths or shared
+memory regions on the local machine — a privilege-escalation surface.
+The default is nil (none enabled), keeping ghostel safe in remote
+sessions while still supporting timg, yazi, and other tools that ship
+data inline.  Enable individual mediums by adding `file', `temp-file',
+or `shared-mem' to the list, e.g. `(file)' for trusted local-only use."
+  :type '(set (const :tag "Local file medium" file)
+              (const :tag "Temp-file medium" temp-file)
+              (const :tag "Shared-memory medium" shared-mem)))
 
 (defcustom ghostel-timer-delay 0.033
   "Delay in seconds before redrawing after output (roughly 30fps).
@@ -311,6 +388,18 @@ Errors in hook functions are demoted to messages via
 non-nil so the debugger can fire)."
   :type 'hook)
 
+(defcustom ghostel-pre-spawn-hook nil
+  "Hook run inside `ghostel--spawn-pty' just before `make-process'.
+Each function is called with no arguments in the buffer that will
+host the new process.  `process-environment' is dynamically bound
+to the env that will be passed to the child, so hook functions can
+inject or override entries with `setenv' and the spawned process
+inherits them.
+
+Use this hook for one-time pre-spawn setup; see `ghostel-environment'
+for static env entries that don't depend on runtime state."
+  :type 'hook)
+
 (defcustom ghostel-eval-cmds '(("find-file" find-file)
                                ("find-file-other-window" find-file-other-window)
                                ("dired" dired)
@@ -344,18 +433,35 @@ originating ghostel buffer as `current-buffer', so it may block or
 spawn processes freely without stalling the terminal."
   :type '(choice (const :tag "Disabled" nil) function))
 
-(defcustom ghostel-progress-function #'ghostel-default-progress
+(defcustom ghostel-progress-function
+  (if (locate-library "spinner")
+      #'ghostel-spinner-progress
+    #'ghostel-default-progress)
   "Function called for ConEmu OSC 9;4 progress reports.
 Called with two arguments: STATE (one of the symbols `remove',
 `set', `error', `indeterminate', `pause') and PROGRESS (an integer
 0-100, or nil when not reported).  Set to nil to ignore progress
 reports.
 
+When spinner.el is on the `load-path' at ghostel load time, the
+default is `ghostel-spinner-progress' (which animates the mode
+line during indeterminate progress).  Otherwise it is
+`ghostel-default-progress' (a plain text indicator).
+
 The handler runs synchronously on the VT-parser callpath because
 progress updates are expected to feed the mode line or similar
 cheap UI.  A slow handler here will stall terminal output — defer
 expensive work via `run-at-time' on your own if you need it."
   :type '(choice (const :tag "Disabled" nil) function))
+
+(defcustom ghostel-spinner-type 'progress-bar
+  "Spinner style used by `ghostel-spinner-progress'.
+Passed to `spinner-create' as its first argument; see
+`spinner-types' in spinner.el for the full list (e.g.
+`progress-bar', `horizontal-moving', `vertical-breathing').
+Only consulted when `ghostel-progress-function' is
+`ghostel-spinner-progress'."
+  :type 'symbol)
 
 (defcustom ghostel-enable-url-detection t
   "Automatically detect and linkify URLs in terminal output.
@@ -414,11 +520,14 @@ When absent, the match is linkified as a bare file/directory
 reference opened at its start.")
 
 (defcustom ghostel-module-auto-install 'ask
-  "What to do when the native module is missing at load time.
-\\=`ask'      — prompt with a choice to download, compile, or skip (default).
-\\=`download' — download a pre-built binary from GitHub releases.
-\\=`compile'  — build from source via `ghostel-module-compile'.
-nil         — do nothing; the user must install the module manually."
+  "What to do when the native module is missing at first interactive use.
+This setting is consulted only when the user invokes an interactive
+entry point such as `\\[ghostel]', not when `ghostel.el' is loaded
+or byte-compiled - loading the file never prompts or downloads.
+\\=`ask'      - prompt with a choice to download, compile, or skip (default).
+\\=`download' - download a pre-built binary from GitHub releases.
+\\=`compile'  - build from source via `ghostel-module-compile'.
+nil        - do nothing; the user must install the module manually."
   :type '(choice (const :tag "Ask interactively" ask)
                  (const :tag "Download pre-built binary" download)
                  (const :tag "Compile from source" compile)
@@ -478,6 +587,7 @@ into the scrollback will first jump to the bottom of the terminal
 before sending the input."
   :type 'boolean)
 
+
 ;;; ANSI color faces
 
 (defface ghostel-color-black
@@ -569,7 +679,7 @@ before sending the input."
 Customize this when downloading pre-built modules from a fork or mirror."
   :type 'string)
 
-(defconst ghostel--minimum-module-version "0.19.0"
+(defconst ghostel--minimum-module-version "0.22.1"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -589,9 +699,13 @@ Bump this only when the Elisp code requires a newer native module
 (declare-function ghostel--redraw "ghostel-module" (term &optional full))
 (declare-function ghostel--set-default-colors "ghostel-module")
 (declare-function ghostel--set-palette "ghostel-module")
-(declare-function ghostel--set-size "ghostel-module")
+(declare-function ghostel--set-size "ghostel-module" (term rows cols &optional cell-w cell-h))
 (declare-function ghostel--write-input "ghostel-module")
 (declare-function ghostel--native-uri-at "ghostel-module")
+
+(declare-function spinner-create "spinner")
+(declare-function spinner-start "spinner")
+(declare-function spinner-stop "spinner")
 
 
 ;;; Automatic download and compilation of native module
@@ -776,7 +890,8 @@ Leaving the prompt empty downloads the latest release."
                (not (yes-or-no-p "Module already exists.  Re-download? ")))
       (user-error "Cancelled"))
     (if (ghostel--download-module dir version latest-release)
-        (progn
+        (if (featurep 'ghostel-module)
+            (message "ghostel: module downloaded.  Restart Emacs to load the new version")
           (module-load mod)
           (message "ghostel: module loaded successfully"))
       (user-error "Download failed.  Try M-x ghostel-module-compile to build from source"))))
@@ -789,11 +904,13 @@ The output is shown in a *ghostel-build* compilation buffer."
     (compile "zig build -Doptimize=ReleaseFast -Dcpu=baseline" t)))
 
 
-(defun ghostel--check-module-version (dir)
+(defun ghostel--check-module-version (dir &optional prompt-user)
   "Check if the loaded module is older than required.
 When the module version is below `ghostel--minimum-module-version',
-offer to update using `ghostel-module-auto-install'.
-DIR is the module directory."
+warn unconditionally and, when PROMPT-USER is non-nil, offer to
+update using `ghostel-module-auto-install'.  DIR is the module
+directory.  At load time PROMPT-USER is nil so a stale module never
+triggers an interactive prompt."
   (let ((mod-ver (and (fboundp 'ghostel--module-version)
                       (ghostel--module-version))))
     (when (or (null mod-ver)
@@ -802,16 +919,20 @@ DIR is the module directory."
                        (format "Module version %s is older than required %s"
                                (or mod-ver "unknown")
                                ghostel--minimum-module-version))
-      (unless noninteractive
+      (when prompt-user
         (ghostel--ensure-module dir)))))
 
 (defun ghostel--load-module (&optional prompt-user)
   "Ensure the ghostel native module is loaded.
-When the module file is missing, trigger `ghostel-module-auto-install'.
 When PROMPT-USER is non-nil (called from an interactive command like
-`ghostel'), failures signal `user-error' so the calling flow aborts.
-Otherwise (load time), failures `display-warning' instead so the user
-can still compile ghostel, read docs, and so on.
+`ghostel'), missing modules trigger `ghostel-module-auto-install' and
+load failures signal `user-error' so the calling flow aborts.
+Otherwise (load time, including byte-compilation and Emacs 31's
+`user-lisp/' auto-compile), this function never prompts, downloads,
+or compiles - it only loads an existing module file and warns if one
+is missing.  Module installation only happens on an explicit user
+action: `M-x ghostel', `M-x ghostel-download-module', or
+`M-x ghostel-module-compile'.
 
 The guard also honours `ghostel--new' being already `fboundp', which
 covers the pure-Elisp test path where `cl-letf' stubs the native
@@ -821,14 +942,14 @@ entry points so tests run without the module present."
     (let* ((dir (ghostel--resource-root))
            (mod (expand-file-name
                  (concat "ghostel-module" module-file-suffix) dir)))
-      (unless (or (file-exists-p mod) noninteractive)
+      (when (and prompt-user (not (file-exists-p mod)))
         (ghostel--ensure-module dir))
       (cond
        ((file-exists-p mod)
         (condition-case err
             (progn
               (module-load mod)
-              (ghostel--check-module-version dir))
+              (ghostel--check-module-version dir prompt-user))
           (error
            (if prompt-user
                (user-error "Failed to load ghostel native module: %s"
@@ -947,6 +1068,13 @@ intent is lost.  That's an accepted tradeoff for avoiding a
 Cleared before each redraw; checked afterwards to decide whether
 pixel-based trailing-space compensation is needed.")
 
+(defvar-local ghostel--kitty-active nil
+  "Non-nil when kitty image overlays are present in the buffer.")
+
+(defvar-local ghostel--kitty-last-error nil
+  "Last error raised inside a kitty display callback, or nil.
+Captured here instead of being lost to a fleeting message so it can be
+inspected when image rendering misbehaves.")
 
 (defvar-local ghostel--last-send-time nil
   "Time of the last `ghostel--send-string' call, for immediate-redraw detection.")
@@ -1068,10 +1196,13 @@ is non-nil.")
                    "<deletechar>" "<insert>"
                    "<f1>" "<f2>" "<f3>" "<f4>" "<f5>" "<f6>"
                    "<f7>" "<f8>" "<f9>" "<f10>" "<f11>" "<f12>"))
-      (define-key map (kbd key) #'ghostel--send-event)
+      (unless (member key ghostel-keymap-exceptions)
+        (define-key map (kbd key) #'ghostel--send-event))
       (dolist (mod '("S-" "C-" "M-" "C-S-" "M-S-" "C-M-"))
-        (ignore-errors
-          (define-key map (kbd (concat mod key)) #'ghostel--send-event))))
+        (let ((key-str (concat mod key)))
+          (unless (member key-str ghostel-keymap-exceptions)
+            (ignore-errors
+              (define-key map (kbd key-str) #'ghostel--send-event))))))
     ;; Bare aliases for unmodified keys (RET=\r, TAB=\t, DEL=\x7f)
     (define-key map (kbd "RET") #'ghostel--send-event)
     (define-key map (kbd "TAB") #'ghostel--send-event)
@@ -1730,6 +1861,8 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
     ;; Hyperlink navigation works in copy mode too
     (define-key map (kbd "C-c C-n") #'ghostel-next-hyperlink)
     (define-key map (kbd "C-c C-p") #'ghostel-previous-hyperlink)
+    (define-key map (kbd "RET")      #'ghostel-open-link-at-point)
+    (define-key map (kbd "<return>") #'ghostel-open-link-at-point)
     ;; Prompt navigation works in copy mode too
     (define-key map (kbd "C-c M-n") #'ghostel-next-prompt)
     (define-key map (kbd "C-c M-p") #'ghostel-previous-prompt)
@@ -1867,9 +2000,9 @@ stripped so the copied text matches the original terminal content."
   (let ((map (make-sparse-keymap)))
     (define-key map [mouse-1] #'ghostel-open-link-at-click)
     (define-key map [mouse-2] #'ghostel-open-link-at-click)
-    (define-key map (kbd "RET") #'ghostel-open-link-at-point)
     map)
-  "Keymap for clickable hyperlinks in ghostel buffers.")
+  "Keymap for clickable hyperlinks in ghostel buffers.
+Mouse clicks on a linkified cell open the link in any input mode.")
 
 (defun ghostel--native-link-help-echo (window _ pos)
   "Return the native OSC8 URI for the link at POS in WINDOW.
@@ -1986,17 +2119,34 @@ Wraps to `point-max' when no link is found before point."
   (dotimes (_ (or n 1))
     (ghostel--goto-hyperlink 'previous)))
 
+(defun ghostel--detect-urls-skip-p (pos active-bounds)
+  "Return non-nil if link detection should leave POS alone.
+Skips spans already linkified (any `help-echo'), the shell's prompt
+decoration (`ghostel-prompt') and the cursor's current line.
+ACTIVE-BOUNDS is a (BOL . EOL) cons covering the cursor's line."
+  (or (get-text-property pos 'help-echo)
+      (get-text-property pos 'ghostel-prompt)
+      (and active-bounds
+           (>= pos (car active-bounds))
+           (<= pos (cdr active-bounds)))))
+
 (defun ghostel--detect-urls (&optional begin end)
   "Scan a buffer region for plain-text URLs and file:line references.
 BEGIN and END default to `point-min' and `point-max' respectively.
-Skips regions that already have a `help-echo' property (e.g. from OSC 8).
+Skips regions that already have a `help-echo' property (e.g. from OSC 8)
+and the user's active input on the current prompt line.
 Bounding the scan keeps streaming output from re-scanning the entire
 materialized scrollback on every redraw.
 Binds `inhibit-read-only' so the scan can attach text properties even
 when called from the deferred-detection timer outside the redraw scope."
-  (let ((begin (or begin (point-min)))
-        (end (or end (point-max)))
-        (inhibit-read-only t))
+  (let* ((begin (or begin (point-min)))
+         (end (or end (point-max)))
+         (inhibit-read-only t)
+         ;; Point sits at the live terminal cursor after a redraw, so its
+         ;; line is the prompt the user is currently editing.  Capture as
+         ;; buffer-position bounds so the per-match skip check is O(1).
+         (active-bounds (cons (line-beginning-position)
+                              (line-end-position))))
     (save-excursion
       ;; Pass 1: http(s) URLs
       (when ghostel-enable-url-detection
@@ -2006,7 +2156,7 @@ when called from the deferred-detection timer outside the redraw scope."
                 end t)
           (let ((beg (match-beginning 0))
                 (mend (match-end 0)))
-            (unless (get-text-property beg 'help-echo)
+            (unless (ghostel--detect-urls-skip-p beg active-bounds)
               (let ((url (match-string-no-properties 0)))
                 (put-text-property beg mend 'help-echo url)
                 (put-text-property beg mend 'mouse-face 'highlight)
@@ -2031,7 +2181,7 @@ when called from the deferred-detection timer outside the redraw scope."
           (while (re-search-forward full-regex end t)
             (let ((beg (match-beginning 1))
                   (mend (match-end 2)))
-              (unless (get-text-property beg 'help-echo)
+              (unless (ghostel--detect-urls-skip-p beg active-bounds)
                 (let* ((path (match-string-no-properties 1))
                        (loc (match-string-no-properties 2))
                        (abs-path (expand-file-name path))
@@ -2115,19 +2265,380 @@ glyph of exactly the remaining pixel width."
                                        `(space :width (,remaining)))))))
             (forward-line 1)))))))
 
+
+;;; Kitty graphics protocol
 
+(defun ghostel--kitty-mediums-bits ()
+  "Encode `ghostel-kitty-graphics-mediums' as a bitfield for the module."
+  (let ((bits 0)
+        (mediums ghostel-kitty-graphics-mediums))
+    (when (memq 'file mediums) (setq bits (logior bits 1)))
+    (when (memq 'temp-file mediums) (setq bits (logior bits 2)))
+    (when (memq 'shared-mem mediums) (setq bits (logior bits 4)))
+    bits))
+
+(define-error 'ghostel-kitty-unsupported-source-rect
+              "Kitty graphics atlas-style source rect not supported"
+              'error)
+
+(defun ghostel--kitty-check-source-rect (src-x src-y src-w src-h pixel-w pixel-h)
+  "Signal `ghostel-kitty-unsupported-source-rect' for non-default crops.
+SRC-X / SRC-Y / SRC-W / SRC-H are the requested source-rect crop in image
+pixels; PIXEL-W / PIXEL-H are the rendered pixel dimensions.  All zeros
+means the whole image (the common case from timg/yazi).
+
+Atlas-style placements (sub-region of the source image) aren't supported
+because Emacs's image system can't crop pre-scale; refuse explicitly so
+mis-rendering is visible as an error instead of silent."
+  (when (or (> src-x 0) (> src-y 0)
+            (and (> src-w 0) (/= src-w pixel-w))
+            (and (> src-h 0) (/= src-h pixel-h)))
+    (signal 'ghostel-kitty-unsupported-source-rect
+            (list src-x src-y src-w src-h pixel-w pixel-h))))
+
+(defun ghostel--kitty-apply-row-slice (row cw ch img
+                                            vp-col-clamped visible-cols
+                                            slice-x slice-w)
+  "Apply one row of the sliced image at point.
+ROW is the slice index (0-based) into the image's grid of cells.
+CW / CH are the cell pixel dimensions.  IMG is the Emacs image object.
+VP-COL-CLAMPED is the placement's column origin clamped to >= 0;
+VISIBLE-COLS is how many columns of that row are on-screen; SLICE-X is
+the slice's x-origin in image pixels (non-zero only when the placement
+is partially scrolled off the left); SLICE-W is the fallback slice
+width when the buffer line is shorter than the placement.
+
+Decides between the text-property and overlay paths based on whether
+the buffer line is long enough to hold the placement's column range."
+  (let* ((line-pos (point))
+         (line-end-pos (line-end-position))
+         (start (min (+ line-pos vp-col-clamped) line-end-pos))
+         (end (min (+ line-pos vp-col-clamped visible-cols) line-end-pos))
+         ;; The slice's pixel width must match the cell-range width Emacs
+         ;; gives us; otherwise the display engine renders the slice at
+         ;; its declared size and either overlaps subsequent cells or
+         ;; truncates.  This bites when `vp-col + g-cols' exceeds the
+         ;; terminal width (line-end-pos clamps `end` shorter than the
+         ;; slice the placement asked for) and shows up as a ghosted
+         ;; copy of the image bleeding to the right.
+         (range-cols (- end start))
+         (clamped-slice-w (* range-cols cw))
+         (slice (list 'slice slice-x (* row ch)
+                      (if (> range-cols 0) clamped-slice-w slice-w)
+                      ch))
+         (spec (list slice img)))
+    (cond
+     ;; Range is empty (line shorter than vp-col) — use an overlay so we
+     ;; don't eat the newline.
+     ((<= end start)
+      (let ((ov (make-overlay start start)))
+        (overlay-put ov 'before-string (propertize " " 'display spec))
+        (overlay-put ov 'ghostel-kitty t)))
+     ;; Line has enough text — use text property.
+     (t
+      (add-text-properties start end
+                           (list 'display spec 'ghostel-kitty t))))
+    (when (< line-end-pos (point-max))
+      (add-text-properties line-end-pos (1+ line-end-pos)
+                           (list 'line-height ch 'ghostel-kitty t)))
+    (setq ghostel--kitty-active t)))
+
+(defun ghostel--kitty-display-image (data is-png abs-row vp-col grid-cols grid-rows pixel-w pixel-h
+                                          src-x src-y src-w src-h)
+  "Display a kitty graphics image placement in the buffer.
+Called from the native module during redraw for each visible placement.
+DATA is a unibyte string (PNG or PPM).
+IS-PNG is non-nil for PNG, nil for PPM.
+ABS-ROW is the absolute buffer row (0-indexed from `point-min'),
+already accounting for materialized scrollback (the C side adds
+`scrollback_in_buffer' to libghostty's viewport-relative row before
+passing it here).  Without that pre-shift, an image at viewport row 0
+would render at the top of the scrollback, jumping into the past as
+soon as anything scrolled.  May be negative when the image's top is
+above the buffer's first line (rare — only when libghostty's scrollback
+got trimmed below the placement's anchor).
+VP-COL is the column (may be negative — image partially off the left).
+GRID-COLS and GRID-ROWS are the cell dimensions.
+PIXEL-W and PIXEL-H are the rendered pixel dimensions.
+SRC-X / SRC-Y / SRC-W / SRC-H are the source-rect crop in image pixels;
+all zero means the whole image (the common case from timg/yazi).
+
+The image is sized to fill its grid cells and then sliced per row, with
+each slice applied on its own buffer line.  Slicing — rather than a
+single multi-line `display' property — is required for the image to
+actually occupy each cell row (otherwise Emacs draws the image once at
+the first character of the range and the remaining rows show the
+underlying text or stay blank).  Mirrors the virtual-placeholder path's
+`:ascent \\='center' and `line-height' clamping so slices tile flush
+across rows.
+
+Falls back to PIXEL-W/PIXEL-H when GRID-COLS/GRID-ROWS arrive as 0 —
+libghostty hasn't computed the cell layout yet on the first redraw
+after a placement (a subsequent layout change would fix it, but the
+user shouldn't have to trigger one)."
+  (when (display-graphic-p)
+    (condition-case err
+        (progn
+          (ghostel--kitty-check-source-rect src-x src-y src-w src-h pixel-w pixel-h)
+          (let* ((cw (frame-char-width))
+                 (ch (frame-char-height))
+                 (g-cols (if (> grid-cols 0) grid-cols
+                           (max 1 (/ (+ pixel-w cw -1) cw))))
+                 (g-rows (if (> grid-rows 0) grid-rows
+                           (max 1 (/ (+ pixel-h ch -1) ch))))
+                 (img (create-image data (if is-png 'png 'pbm) t
+                                    :width (* g-cols cw)
+                                    :height (* g-rows ch)
+                                    :ascent 'center))
+                 (skip (max 0 abs-row))
+                 (start-row (max 0 (- abs-row)))
+                 ;; Clamp negative vp-col (image partially scrolled off
+                 ;; the left edge): start the buffer range at column 0
+                 ;; and skip the off-screen pixel columns inside the
+                 ;; slice.
+                 (vp-col-clamped (max 0 vp-col))
+                 (start-col (max 0 (- vp-col)))
+                 (slice-x (* start-col cw))
+                 (visible-cols (max 0 (- g-cols start-col)))
+                 (slice-w (* visible-cols cw)))
+            (when (> visible-cols 0)
+              (save-excursion
+                (goto-char (point-min))
+                (when (zerop (forward-line skip))
+                  ;; Skip rows already in materialized scrollback — they
+                  ;; got their overlays in an earlier emit and
+                  ;; `kitty-clear' preserves scrollback overlays.
+                  ;; Re-applying here would stack a second overlay on
+                  ;; every scrolled-in row.
+                  (let ((row start-row)
+                        (more t)
+                        (vp-start (or (ghostel--viewport-start) (point-min))))
+                    (while (and more (< row g-rows))
+                      (when (>= (point) vp-start)
+                        (ghostel--kitty-apply-row-slice
+                         row cw ch img
+                         vp-col-clamped visible-cols slice-x slice-w))
+                      (setq row (1+ row))
+                      (unless (zerop (forward-line 1))
+                        (setq more nil)))))))))
+      (error
+       (setq ghostel--kitty-last-error err)
+       (message "ghostel: kitty image error: %S" err)))))
+
+(defun ghostel--kitty-display-virtual (data is-png)
+  "Display a virtual kitty graphics placement (unicode placeholders).
+Searches the buffer for U+10EEEE placeholder characters and overlays
+per-row image slices on the placeholder regions of each line.
+DATA is a unibyte string (PNG or PPM).  IS-PNG is non-nil for PNG."
+  (when (display-graphic-p)
+    (condition-case err
+        (let ((placeholder (string #x10EEEE))
+              (cw (frame-char-width))
+              (ch (frame-char-height))
+              grid-cols grid-rows img)
+          (save-excursion
+            ;; First pass: measure the grid by walking the buffer line by
+            ;; line and counting placeholders.  Tracks the *maximum* count
+            ;; across rows so a short first row doesn't undersize the
+            ;; image.  Avoids `line-number-at-pos' in the search loop —
+            ;; that's O(buffer size) per call and was the dominant cost
+            ;; for large yazi previews.
+            (goto-char (point-min))
+            (let ((max-line-cols 0)
+                  (total-rows 0))
+              (while (not (eobp))
+                (let ((eol (line-end-position))
+                      (this-row 0))
+                  (save-excursion
+                    (while (search-forward placeholder eol t)
+                      (setq this-row (1+ this-row))))
+                  (when (> this-row 0)
+                    (setq total-rows (1+ total-rows))
+                    (when (> this-row max-line-cols)
+                      (setq max-line-cols this-row))))
+                (forward-line 1))
+              (setq grid-cols (max 1 max-line-cols))
+              (setq grid-rows (max 1 total-rows)))
+            ;; Create the image sized to the full grid.  `:ascent center'
+            ;; aligns each slice around the line's vertical center so it
+            ;; tiles flush with adjacent slices regardless of the line's
+            ;; baseline (the default `:ascent 50' splits the slice across
+            ;; the baseline, leaving visible offsets between rows).
+            (setq img (create-image data (if is-png 'png 'pbm) t
+                                    :width (* grid-cols cw)
+                                    :height (* grid-rows ch)
+                                    :ascent 'center))
+            ;; Second pass: apply per-row slices on placeholder regions.
+            ;; Walks line by line — `line-end-position' is O(1) with no
+            ;; full-buffer scan per placeholder.
+            (goto-char (point-min))
+            (let ((row 0))
+              (while (not (eobp))
+                (let* ((eol (line-end-position))
+                       (line-start (save-excursion
+                                     (search-forward placeholder eol t))))
+                  (when line-start
+                    (let ((line-end eol))
+                      (setq line-start (1- line-start))
+                      (when (> line-end line-start)
+                        (add-text-properties
+                         line-start line-end
+                         (list 'display (list (list 'slice 0 (* row ch)
+                                                    (* grid-cols cw) ch)
+                                              img)
+                               'ghostel-kitty t))
+                        ;; Clamp the placeholder line to `ch' so the slice
+                        ;; tiles flush and the file-list column on the same
+                        ;; line doesn't grow taller than non-image lines.
+                        ;; The U+10EEEE fallback font and any Nerd Font
+                        ;; icons would otherwise pull line height above
+                        ;; `frame-char-height', leaving gaps below the
+                        ;; slice and above the next line's content.
+                        (when (< line-end (point-max))
+                          (add-text-properties line-end (1+ line-end)
+                                               (list 'line-height ch
+                                                     'ghostel-kitty t)))
+                        (setq ghostel--kitty-active t)))
+                    (setq row (1+ row))))
+                (forward-line 1)))))
+      (error
+       (setq ghostel--kitty-last-error err)
+       (message "ghostel: kitty virtual image error: %S" err)))))
+
+(defun ghostel--kitty-clear ()
+  "Remove kitty image overlays and per-line clamps from the viewport.
+Both display paths tag the regions/overlays with the `ghostel-kitty'
+property so this strips only kitty-applied `display' and `line-height',
+leaving other consumers of `display' (e.g. wide-char compensation)
+alone.
+
+Only the viewport region is cleared — overlays on rows that have
+already been promoted to materialized scrollback are preserved so
+images stay visible after they scroll past the live viewport.
+libghostty stops reporting placements once they're fully out of the
+viewport (`viewport_visible' goes false), so wiping scrollback would
+leave nothing to re-emit and the image would vanish from history."
+  (when ghostel--kitty-active
+    (let* ((inhibit-read-only t)
+           (vp-start (or (ghostel--viewport-start) (point-min)))
+           (end (point-max))
+           (pos vp-start))
+      (dolist (ov (overlays-in pos end))
+        (when (and (overlay-get ov 'ghostel-kitty)
+                   (>= (overlay-start ov) pos))
+          (delete-overlay ov)))
+      (while (< pos end)
+        (let ((next (next-single-property-change pos 'ghostel-kitty nil end)))
+          (when (get-text-property pos 'ghostel-kitty)
+            (remove-text-properties
+             pos next '(display nil line-height nil ghostel-kitty nil)))
+          (setq pos next)))
+      ;; Drop any image fragment left over by scrollback eviction (see
+      ;; `ghostel--kitty-strip-orphan-top').
+      (ghostel--kitty-strip-orphan-top)
+      ;; Sticky-flag hygiene: once we've stripped the viewport, anything
+      ;; remaining must be in scrollback.  If there's nothing left at all,
+      ;; clear the flag so future redraws skip the buffer scan entirely.
+      (unless (ghostel--kitty-any-remaining-p (point-min) vp-start)
+        (setq ghostel--kitty-active nil)))))
+
+(defun ghostel--kitty-slice-y-at (pos)
+  "Return the slice y-offset of a kitty image at POS, or nil if absent.
+Looks at both the buffer text-property `display' and at any
+`ghostel-kitty'-tagged overlay's `before-string' display property."
+  (let ((display
+         (or (get-text-property pos 'display)
+             (cl-loop for ov in (overlays-at pos)
+                      when (overlay-get ov 'ghostel-kitty)
+                      thereis
+                      (let ((bs (overlay-get ov 'before-string)))
+                        (and bs (get-text-property 0 'display bs)))))))
+    ;; Display spec is `((slice X Y W H) IMAGE)'.
+    (when (and (consp display)
+               (consp (car display))
+               (eq (car (car display)) 'slice)
+               (numberp (nth 2 (car display))))
+      (nth 2 (car display)))))
+
+(defun ghostel--kitty-strip-orphan-top ()
+  "Strip kitty image debris left at point-min by scrollback eviction.
+
+Two distinct artifacts both surface here:
+
+1. Collapsed overlays.  `delete-region' clamps overlays inside the
+   deleted range to its start instead of deleting them, so an evicted
+   row's zero-width kitty overlays all snap onto the new point-min and
+   stack there (dozens for a tall image).  Detected by counting
+   zero-width kitty overlays per start-position — more than one at the
+   same position is never legitimate (the placement loop emits at most
+   one overlay per row).
+
+2. Orphan text-property slices.  When eviction straddles an image, the
+   surviving rows keep their `display' slices into a now-incomplete
+   image.  Detected by a slice y-offset > 0 at point-min (y=0 would
+   mean the row IS the image's top, so it's an intact image's first
+   row, not an orphan)."
+  (let ((inhibit-read-only t))
+    ;; (1) Eviction-collapsed overlay stacks.
+    (let ((counts (make-hash-table)))
+      (dolist (ov (overlays-in (point-min) (point-max)))
+        (when (and (overlay-get ov 'ghostel-kitty)
+                   (= (overlay-start ov) (overlay-end ov)))
+          (let ((pos (overlay-start ov)))
+            (puthash pos (1+ (gethash pos counts 0)) counts))))
+      (dolist (ov (overlays-in (point-min) (point-max)))
+        (when (and (overlay-get ov 'ghostel-kitty)
+                   (= (overlay-start ov) (overlay-end ov))
+                   (> (gethash (overlay-start ov) counts 0) 1))
+          (delete-overlay ov))))
+    ;; (2) Orphan text-property slices at point-min.
+    (let ((slice-y (ghostel--kitty-slice-y-at (point-min))))
+      (when (and slice-y (> slice-y 0))
+        (let ((start (point-min))
+              (end (save-excursion
+                     (goto-char (point-min))
+                     (while (and (< (point) (point-max))
+                                 (or (get-text-property (point) 'ghostel-kitty)
+                                     (cl-some
+                                      (lambda (ov) (overlay-get ov 'ghostel-kitty))
+                                      (overlays-at (point)))))
+                       (forward-line 1))
+                     (point))))
+          (when (> end start)
+            (remove-text-properties
+             start end '(display nil line-height nil ghostel-kitty nil))
+            (dolist (ov (overlays-in start end))
+              (when (overlay-get ov 'ghostel-kitty)
+                (delete-overlay ov)))))))))
+
+(defun ghostel--kitty-any-remaining-p (start end)
+  "Non-nil if any kitty-tagged overlay or text property exists in [START, END)."
+  (catch 'found
+    (dolist (ov (overlays-in start end))
+      (when (overlay-get ov 'ghostel-kitty)
+        (throw 'found t)))
+    (let ((pos start))
+      (while (< pos end)
+        (when (get-text-property pos 'ghostel-kitty)
+          (throw 'found t))
+        (setq pos (next-single-property-change pos 'ghostel-kitty nil end))))
+    nil))
+
+
 ;;; Prompt navigation (OSC 133)
 
 (defun ghostel--osc133-marker (type param)
   "Handle an OSC 133 semantic prompt marker from the Zig module.
-TYPE is a single character string: A, B, C, or D.
+TYPE is a single character string: A, B, C, D, or P.
 PARAM is the exit status string for type D, or nil.
 Note: the `ghostel-prompt' text property is applied by the native
 render loop (which queries libghostty's per-row semantic state),
 not here.  This handler only tracks prompt positions and exit status."
   (pcase type
-    ("A"
-     ;; Prompt start — record line number.
+    ((or "A" "P")
+     ;; Prompt start — record line number.  P is the explicit
+     ;; prompt-start marker (no fresh-line side effect); both mark
+     ;; a navigable prompt position.
      (push (cons (count-lines (point-min) (point-max)) nil)
            ghostel--prompt-positions))
     ("C"
@@ -2313,6 +2824,52 @@ PROGRESS (an integer 0-100 or nil).  STATE is one of the symbols
     (unless (equal new-val mode-line-process)
       (setq mode-line-process new-val)
       (force-mode-line-update))))
+
+(defvar-local ghostel--spinner-active nil
+  "Non-nil when this buffer has a spinner started by `ghostel-spinner-progress'.
+The spinner object itself lives in spinner.el's buffer-local
+`spinner-current'; this flag is what ghostel inspects to keep
+`ghostel-spinner-progress' idempotent and to give the sentinel
+something to gate teardown on.")
+
+(defun ghostel--spinner-stop ()
+  "Stop this buffer's progress spinner, if any.
+Safe to call when no spinner is running.  Errors from spinner.el
+\(e.g. on a half-torn-down buffer) are swallowed — this is
+teardown.  Does not touch `mode-line-process'."
+  (when ghostel--spinner-active
+    (ignore-errors (spinner-stop))
+    (setq ghostel--spinner-active nil)))
+
+(defun ghostel-spinner-progress (state progress)
+  "Spinner-driven handler for OSC 9;4 ConEmu progress reports.
+Animates `mode-line-process' via spinner.el during indeterminate
+progress; falls back to a static text indicator (matching
+`ghostel-default-progress') for `set', `error', `pause', and `remove'.
+STATE is one of those symbols; PROGRESS is an integer 0-100 or nil.
+
+Requires spinner.el to be available; signals a `user-error' on
+the first call if it is not.  The spinner style is controlled by
+`ghostel-spinner-type'."
+  (unless (require 'spinner nil t)
+    (user-error
+     "Cannot run `ghostel-spinner-progress' without spinner.el — install it \
+from MELPA or set `ghostel-progress-function' to #'ghostel-default-progress"))
+  (if (eq state 'indeterminate)
+      ;; Indeterminate: install spinner.el's mode-line construct.
+      ;; Clear any prior determinate text first so the spinner shows alone,
+      ;; not appended to a stale \" [50%]\".
+      (unless ghostel--spinner-active
+        (setq mode-line-process nil)
+        (spinner-start ghostel-spinner-type)
+        (setq ghostel--spinner-active t))
+    ;; Any other state: stop the spinner and clear the (now-inert)
+    ;; mode-line construct it left behind, then defer to the text indicator.
+    (when ghostel--spinner-active
+      (spinner-stop)
+      (setq mode-line-process nil
+            ghostel--spinner-active nil))
+    (ghostel-default-progress state progress)))
 
 (defun ghostel--handle-notification (title body)
   "Dispatch TITLE and BODY to `ghostel-notification-function'.
@@ -2582,14 +3139,18 @@ the redraw is performed immediately to minimize typing latency."
       (when ghostel--term
         ;; Accumulate output for batched write-input at redraw time.
         (push output ghostel--pending-output)
-        ;; Respond to OSC 4/10/11 color queries immediately: programs like
-        ;; `duf' read stdin with a tight timeout and give up if the reply
-        ;; waits for the redraw timer.  Flushing runs the extractor in the
-        ;; native module, which writes the reply back through the PTY
-        ;; before this filter returns.
-        (when (string-match-p
-               "\e\\]\\(?:4;[0-9]+;\\?\\|10;\\?\\|11;\\?\\)" output)
-          (ghostel--flush-pending-output))
+        ;; Respond to OSC 51;E or OSC 4/10/11 color queries immediately:
+        ;; programs like `duf' read stdin with a tight timeout and give up if
+        ;; the reply waits for the redraw timer.
+        ;; Flushing runs the extractor in the native module, which writes the reply
+        ;; back through the PTY before this filter returns.
+        ;; Carry a 16-byte tail so an introducer split across reads still matches.
+        (let* ((prev (cadr ghostel--pending-output))
+               (carry (and prev (substring prev (max 0 (- (length prev) 16))))))
+          (when (string-match-p
+                 "\e\\]\\(?:4;[0-9]+;\\?\\|10;\\?\\|11;\\?\\|51;E\\)"
+                 (if carry (concat carry output) output))
+            (ghostel--flush-pending-output)))
         ;; Immediate redraw for interactive echo: small output arriving
         ;; within `ghostel-immediate-redraw-interval' of last keystroke.
         (if (and (> ghostel-immediate-redraw-threshold 0)
@@ -2627,6 +3188,7 @@ PROCESS is the shell process, EVENT describes the state change."
           (setq ghostel--plain-link-detection-timer nil
                 ghostel--plain-link-detection-begin nil
                 ghostel--plain-link-detection-end nil))
+        (ghostel--spinner-stop)
         (run-hook-with-args 'ghostel-exit-functions buf event)
         (if ghostel-kill-buffer-on-exit
             (kill-buffer buf)
@@ -2972,6 +3534,7 @@ wrapper that would re-claim ghostty over ssh."
                     (list "TERM=xterm-ghostty"
                           (concat "TERMINFO=" tinfo)
                           "TERM_PROGRAM=ghostty"
+                          "TERM_PROGRAM_VERSION=1.3.2"
                           "COLORTERM=truecolor"))
                    (t
                     (unless ghostel--terminfo-warned
@@ -2989,6 +3552,55 @@ to restore the terminfo/ directory, or customize `ghostel-term' to silence."
              (ghostel--ssh-install-enabled-p))
         (append env (list "GHOSTEL_SSH_INSTALL_TERMINFO=1"))
       env)))
+
+(defun ghostel--remote-term-preamble ()
+  "Return a `/bin/sh' snippet that sets TERM for a remote spawn wrapper.
+Designed to run *on the remote*, inside the per-spawn `/bin/sh -c'
+wrapper, so the choice happens after TRAMP env propagation.  This
+sidesteps `tramp-local-environment-variable-p', which strips
+`TERM=' entries that match the local default top-level
+`process-environment' — leaving the remote shell to inherit
+TERM=dumb from TRAMP's connection shell, and disabling
+readline/ZLE/fish line editing on the remote (issue #224).
+
+When `ghostel-term' is the default \"xterm-ghostty\", the snippet:
+1. Prepends ~/.local/share/ghostel/terminfo to TERMINFO_DIRS when
+   that directory holds the bundled entry.  This lets manual
+   setups co-locate terminfo with the shell-integration scripts
+   (see README, \"Option 2: Manual setup\") in one place — no
+   `tic', no touching ~/.terminfo.
+2. Probes via `infocmp xterm-ghostty'.  The probe honors all of
+   ncurses' standard lookup paths (the prepended dir, $TERMINFO,
+   ~/.terminfo, $TERMINFO_DIRS, and the compiled defaults), so
+   it succeeds whenever the entry is reachable any way — bundled,
+   system-installed, or pushed via `ghostel-tramp-shell-integration'.
+   On success, advertise ghostty; on failure, fall back to
+   \"xterm-256color\" (universally available) so echo keeps working.
+
+When `ghostel-term' was customized to anything else, honor it
+verbatim.  `COLORTERM=truecolor' is exported unconditionally."
+  (cond
+   ((equal ghostel-term "xterm-ghostty")
+    (concat
+     ;; Pick up a co-located bundle if the user dropped one alongside
+     ;; the shell integration scripts.  Tilde expands in assignment
+     ;; context per POSIX; ${TERMINFO_DIRS:+:$TERMINFO_DIRS} preserves
+     ;; any prior search list.
+     "if [ -e ~/.local/share/ghostel/terminfo/x/xterm-ghostty ] "
+     "|| [ -e ~/.local/share/ghostel/terminfo/78/xterm-ghostty ]; "
+     "then export TERMINFO_DIRS=~/.local/share/ghostel/terminfo"
+     "${TERMINFO_DIRS:+:$TERMINFO_DIRS}; "
+     "fi; "
+     "TERM=xterm-256color; "
+     "if infocmp xterm-ghostty >/dev/null 2>&1; then "
+     "TERM=xterm-ghostty; "
+     "TERM_PROGRAM=ghostty; TERM_PROGRAM_VERSION=1.3.2; "
+     "export TERM_PROGRAM TERM_PROGRAM_VERSION; "
+     "fi; "
+     "COLORTERM=truecolor; export TERM COLORTERM; "))
+   (t
+    (concat "TERM=" (shell-quote-argument ghostel-term)
+            "; COLORTERM=truecolor; export TERM COLORTERM; "))))
 
 (defun ghostel--spawn-pty (program program-args height width stty-flags
                                    extra-env &optional remote-p)
@@ -3021,19 +3633,28 @@ matches the PTY window size, and stores the process in
   ;; the wrapper so only the target program remains.
   (let* ((shell-command
           (list "/bin/sh" "-c"
-                (concat "stty " stty-flags
-                        (format " rows %d columns %d" height width)
-                        " 2>/dev/null; "
-                        "printf '\\033[H\\033[2J'; exec "
-                        (shell-quote-argument program)
-                        (and program-args
-                             (concat " "
-                                     (mapconcat #'shell-quote-argument
-                                                program-args " "))))))
+                (concat
+                 ;; Remote spawns: pick TERM via an on-remote probe
+                 (and remote-p (ghostel--remote-term-preamble))
+                 "stty " stty-flags
+                 (format " rows %d columns %d" height width)
+                 " 2>/dev/null; "
+                 "printf '\\033[H\\033[2J'; exec "
+                 (shell-quote-argument program)
+                 (and program-args
+                      (concat " "
+                              (mapconcat #'shell-quote-argument
+                                         program-args " "))))))
          (process-environment
           (append
            ghostel-environment
-           (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
+           (cons "INSIDE_EMACS=ghostel"
+                 ;; The remote wrapper sets TERM/TERMINFO/COLORTERM/
+                 ;; TERM_PROGRAM* itself; keeping the local entries
+                 ;; here would also push the local TERMINFO path,
+                 ;; which is meaningless on the remote and (per
+                 ;; terminfo(5)) makes ncurses ignore system entries.
+                 (if remote-p '() (ghostel--terminal-env)))
            extra-env
            process-environment))
          ;; Large TUI redraws (Claude Code, pi on resize) can emit
@@ -3045,25 +3666,30 @@ matches the PTY window size, and stores the process in
          ;; consume a full redraw frame.  Both are captured at
          ;; `make-process' time, so they must be let-bound here.
          (process-adaptive-read-buffering nil)
-         (read-process-output-max (max read-process-output-max (* 1024 1024)))
-         (proc (make-process
-                :name "ghostel"
-                :buffer (current-buffer)
-                :command shell-command
-                :connection-type 'pty
-                :file-handler remote-p
-                :filter #'ghostel--filter
-                :sentinel #'ghostel--sentinel)))
-    (setq ghostel--process proc)
-    ;; Raw binary I/O — no encoding/decoding by Emacs
-    (set-process-coding-system proc 'binary 'binary)
-    ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
-    ;; the program's line editor (readline/ZLE) can render properly.
-    (set-process-window-size proc height width)
-    (set-process-query-on-exit-flag proc nil)
-    (process-put proc 'adjust-window-size-function
-                 #'ghostel--window-adjust-process-window-size)
-    proc))
+         (read-process-output-max (max read-process-output-max (* 1024 1024))))
+    ;; Pre-spawn hook: runs while `process-environment' is dynamically
+    ;; bound to the about-to-be-spawned env, so hook functions can
+    ;; `setenv' to inject/override entries that the child inherits.
+    ;; See `ghostel-pre-spawn-hook'.
+    (run-hooks 'ghostel-pre-spawn-hook)
+    (let ((proc (make-process
+                 :name "ghostel"
+                 :buffer (current-buffer)
+                 :command shell-command
+                 :connection-type 'pty
+                 :file-handler remote-p
+                 :filter #'ghostel--filter
+                 :sentinel #'ghostel--sentinel)))
+      (setq ghostel--process proc)
+      ;; Raw binary I/O — no encoding/decoding by Emacs
+      (set-process-coding-system proc 'binary 'binary)
+      ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
+      ;; the program's line editor (readline/ZLE) can render properly.
+      (set-process-window-size proc height width)
+      (set-process-query-on-exit-flag proc nil)
+      (process-put proc 'adjust-window-size-function
+                   #'ghostel--window-adjust-process-window-size)
+      proc)))
 
 (defun ghostel--start-process ()
   "Start the shell process with a PTY.
@@ -3257,7 +3883,7 @@ position COL columns into the first matched line."
       (save-current-buffer
         (ghostel--write-input ghostel--term combined)))))
 
-(defsubst ghostel--viewport-start ()
+(defun ghostel--viewport-start ()
   "Position of the first line of the terminal viewport, or nil if rows<=0."
   (let ((tr (or ghostel--term-rows 0)))
     (when (> tr 0)
@@ -3500,6 +4126,7 @@ the candidate window does not jump while text is streaming in."
           (setq ghostel--snap-requested nil)
           (setq ghostel--windows-needing-snap nil))))))
 
+
 (defun ghostel-force-redraw ()
   "Force a full terminal redraw (for debugging)."
   (interactive)
@@ -3513,6 +4140,50 @@ the candidate window does not jump while text is streaming in."
 
 
 ;;; Window resize
+
+(defun ghostel--cell-pixel-scale ()
+  "Return the active cell pixel-size scaling factor as a positive number.
+May be a float - callers are expected to round when converting to a
+pixel count."
+  (cond
+   ((numberp ghostel-cell-pixel-scale)
+    (max 1 ghostel-cell-pixel-scale))
+   (t (or (ghostel--detect-cell-pixel-scale) 1))))
+
+(defun ghostel--detect-cell-pixel-scale ()
+  "Compute cell pixel-size scale from display DPI, or nil if unknown.
+Returns a positive number: ratio of the display's DPI to the 96 DPI
+reference, kept as a float so non-integer scales (1.5x displays) flow
+through correctly.  Returns nil when the display's physical size isn't
+reported (some multi-monitor setups), letting the caller fall back."
+  (when (display-graphic-p)
+    ;; Pass the selected frame so multi-monitor setups resolve to the
+    ;; display actually showing the ghostel buffer rather than the
+    ;; primary display.
+    (let* ((frame (selected-frame))
+           (mm-w (display-mm-width frame))
+           (px-w (display-pixel-width frame))
+           (mm-per-inch 25.4)
+           (reference-dpi 96.0))
+      (when (and (numberp mm-w) (> mm-w 0)
+                 (numberp px-w) (> px-w 0))
+        (let ((dpi (/ (* px-w mm-per-inch) mm-w)))
+          (max 1.0 (/ dpi reference-dpi)))))))
+
+(defun ghostel--reported-cell-width ()
+  "Return cell width to report to libghostty, in physical pixels."
+  (round (* (frame-char-width) (ghostel--cell-pixel-scale))))
+
+(defun ghostel--reported-cell-height ()
+  "Return cell height to report to libghostty, in physical pixels."
+  (round (* (frame-char-height) (ghostel--cell-pixel-scale))))
+
+(defun ghostel--set-size-with-cell-dims (term rows cols)
+  "Resize TERM to ROWS×COLS, including the reported cell pixel dimensions.
+Convenience wrapper to keep the five resize sites consistent."
+  (ghostel--set-size term rows cols
+                     (ghostel--reported-cell-width)
+                     (ghostel--reported-cell-height)))
 
 (defun ghostel--window-adjust-process-window-size (process windows)
   "Resize the terminal to match the new Emacs window dimensions.
@@ -3535,21 +4206,10 @@ PROCESS is the shell process, WINDOWS is the list of windows."
            ((and (eql height ghostel--term-rows)
                  (eql width ghostel--term-cols))
             (setq size nil))
-           ;; Crop: minibuffer is active, only height shrank, width unchanged, and the
-           ;; terminal is on the primary screen.  Defer the resize so no SIGWINCH is sent
-           ;; — the Emacs window naturally hides the bottom rows, just like a normal
-           ;; buffer.  Alt-screen apps (vim, htop) own the full viewport and must be told
-           ;; the real size to re-layout, so they take the normal-resize path.  If the
-           ;; user switches focus into the ghostel window while the minibuffer is still
-           ;; open, `ghostel--commit-cropped-size' commits the smaller size then.
-           ((and (> (minibuffer-depth) 0)
-                 (eql width ghostel--term-cols)
-                 (< height ghostel--term-rows)
-                 (not (ghostel--alt-screen-p ghostel--term)))
-            (setq size nil))
            ;; Real resize — update the terminal model and redraw.
            (t
-            (ghostel--set-size ghostel--term (max 1 height) (max 1 width))
+            (ghostel--set-size-with-cell-dims
+             ghostel--term (max 1 height) (max 1 width))
             (when (and (eq system-type 'windows-nt) (process-live-p process))
               (ghostel--conpty-proxy-resize process width height))
             (setq ghostel--term-rows height)
@@ -3616,7 +4276,7 @@ window (not when it has just been deselected)."
           (buf (current-buffer)))
       (unless (and (eql height ghostel--term-rows)
                    (eql width ghostel--term-cols))
-        (ghostel--set-size ghostel--term
+        (ghostel--set-size-with-cell-dims ghostel--term
                            (max 1 height) (max 1 width))
         (setq ghostel--term-rows height
               ghostel--term-cols width
@@ -3662,10 +4322,6 @@ window (not when it has just been deselected)."
   (add-function :after after-focus-change-function #'ghostel--focus-change)
   (add-hook 'window-selection-change-functions #'ghostel--focus-change)
   (add-hook 'window-buffer-change-functions #'ghostel--focus-change)
-  ;; Buffer-local so it only fires for windows showing this buffer, and
-  ;; receives WINDOW directly (rather than FRAME as the default binding).
-  (add-hook 'window-selection-change-functions
-            #'ghostel--commit-cropped-size nil t)
   (add-hook 'window-buffer-change-functions
             #'ghostel--reshow-snap nil t)
   (ghostel--suppress-interfering-modes)
@@ -3733,9 +4389,15 @@ buffer can be found again after title-tracking renames it."
                                 (window-max-chars-per-line w)
                               80))))
         (setq ghostel--term
-              (ghostel--new height width ghostel-max-scrollback))
+              (ghostel--new height width ghostel-max-scrollback ghostel-kitty-graphics-storage-limit (ghostel--kitty-mediums-bits)))
         (setq ghostel--term-rows height)
         (setq ghostel--term-cols width)
+        ;; Seed libghostty's cell dimensions before the shell starts —
+        ;; otherwise kitty graphics placements arriving in the very first
+        ;; output (e.g. timg's transmit-and-place) compute grid_rows=0
+        ;; and the terminal advances the cursor zero rows, leaving the
+        ;; next prompt on top of the image.
+        (ghostel--set-size-with-cell-dims ghostel--term height width)
         (ghostel--apply-palette ghostel--term))
       (ghostel--start-process))))
 
@@ -3779,12 +4441,12 @@ Returns the buffer."
   "Run PROGRAM with ARGS as a ghostel terminal in BUFFER.
 
 BUFFER is switched into `ghostel-mode' (if not already) and a new
-terminal is created sized to the window displaying BUFFER, falling
-back to the selected window if BUFFER is not displayed.  No shell
-integration is applied — PROGRAM is exec'd directly via
-`ghostel--spawn-pty'.  PROGRAM is shell-quoted before it is passed
-to `/bin/sh -c', so shell metacharacters are not interpreted; pass
-extra tokens via ARGS, a list of strings.  Returns the process.
+terminal is created sized to the window displaying BUFFER, or
+80x24 if BUFFER is not currently displayed.  No shell integration
+is applied — PROGRAM is exec'd directly via `ghostel--spawn-pty'.
+PROGRAM is shell-quoted before it is passed to `/bin/sh -c', so
+shell metacharacters are not interpreted; pass extra tokens via
+ARGS, a list of strings.  Returns the process.
 
 Signals `user-error' if BUFFER already has a live ghostel process."
   (ghostel--load-module t)
@@ -3792,20 +4454,27 @@ Signals `user-error' if BUFFER already has a live ghostel process."
              (process-live-p (buffer-local-value 'ghostel--process buffer)))
     (user-error "Buffer %s already has a running ghostel process"
                 (buffer-name buffer)))
-  (let ((window (or (get-buffer-window buffer t) (selected-window))))
+  (let ((window (get-buffer-window buffer t)))
     (with-current-buffer buffer
       (ghostel--prepare-buffer buffer nil)
       ;; Use `window-screen-lines' (not `window-body-height') so the
       ;; height matches the unit `window-adjust-process-window-size-smallest'
       ;; uses — see `ghostel--init-buffer' for why.
-      (let* ((height (max 1 (with-selected-window window
-                              (floor (window-screen-lines)))))
-             (width (max 1 (window-max-chars-per-line window)))
+      (let* ((height (if window
+                         (max 1 (with-selected-window window
+                                  (floor (window-screen-lines))))
+                       24))
+             (width (if window
+                        (max 1 (window-max-chars-per-line window))
+                      80))
              (remote-p (file-remote-p default-directory)))
         (setq ghostel--term
-              (ghostel--new height width ghostel-max-scrollback))
+              (ghostel--new height width ghostel-max-scrollback ghostel-kitty-graphics-storage-limit (ghostel--kitty-mediums-bits)))
         (setq ghostel--term-rows height)
         (setq ghostel--term-cols width)
+        ;; Seed libghostty's cell dimensions before the program starts —
+        ;; see the matching call in `ghostel--ensure-buffer-state'.
+        (ghostel--set-size-with-cell-dims ghostel--term height width)
         (ghostel--apply-palette ghostel--term)
         (ghostel--spawn-pty program args height width
                             "erase '^?' iutf8 -ixon echo" nil remote-p)))))

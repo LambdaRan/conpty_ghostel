@@ -29,7 +29,7 @@ process, keymap, and buffer.
 
 ## Requirements
 
-- Emacs 27.1+ with dynamic module support
+- Emacs 28.1+ with dynamic module support
 - macOS, Linux or FreeBSD
 
 The native module is **automatically downloaded** on first use.  Pre-built
@@ -42,7 +42,7 @@ binaries are available for:
 - `x86_64-freebsd`
 
 If you prefer to build from source or need a different platform, you'll also need
-[Zig](https://ziglang.org/) 0.15.2+ (see [Building from source](#building-from-source)).
+[Zig](https://ziglang.org/) 0.15.2 (see [Building from source](#building-from-source)).
 
 ## Installation
 
@@ -305,15 +305,26 @@ the terminal exits).  You can also enable it for specific shells only:
 
 Copy the integration scripts from ghostel's `etc/shell/` directory to
 each remote host (e.g. `~/.local/share/ghostel/`) and source them from
-your shell configuration.  From a local shell:
+your shell configuration.  Optionally co-locate the bundled
+`xterm-ghostty` terminfo there too — the wrapper that launches a
+TRAMP-spawned remote shell prepends
+`~/.local/share/ghostel/terminfo` to the terminfo search path, so
+ghostty-aware apps (Claude Code, neovim, tmux, …) get their fast
+paths without needing `tic` or `~/.terminfo` (see "Manual install
+\(no auto-machinery)" below for that alternative).  From a local
+shell:
 
 ```bash
-ssh REMOTE 'mkdir -p ~/.local/share/ghostel'
+ssh REMOTE 'mkdir -p ~/.local/share/ghostel/terminfo'
 scp "$EMACS_GHOSTEL_PATH"/etc/shell/ghostel.{bash,zsh,fish} REMOTE:.local/share/ghostel/
+scp -r "$EMACS_GHOSTEL_PATH"/etc/terminfo/{x,78} REMOTE:.local/share/ghostel/terminfo/
 ```
 
 (`$EMACS_GHOSTEL_PATH` is set inside ghostel buffers; outside, substitute
-the install path of the ghostel package.)
+the install path of the ghostel package.  The terminfo `scp` is
+optional — without it, TRAMP-spawned remote shells fall back to
+`TERM=xterm-256color`, which still has working echo and basic
+colors but no ghostty-specific fast paths.)
 
 Then add the appropriate gate to the remote shell config:
 
@@ -490,6 +501,56 @@ output fast-path either.
 - Cursor position updates even without cell changes
 - Theme-aware color palette (syncs with Emacs theme via `ghostel-sync-theme`)
 
+### Inline Images (Kitty Graphics Protocol)
+
+Ghostel renders inline images using the [Kitty graphics
+protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) via libghostty.
+Supports both placement modes used by real-world tools:
+
+- **Traditional placements** — `timg`, `kitty +kitten icat`, and any tool that
+  emits direct kitty graphics commands.
+- **Unicode-placeholder placements** (U+10EEEE) — used by `yazi` and other
+  modern image previewers to anchor images to the buffer's text grid.
+
+Pixel data is rendered through Emacs's built-in image support: PNG payloads
+are decoded by a vendored stb_image, and raw RGB/RGBA/Gray/GrayAlpha
+transmissions are converted to PPM in the native module — no external
+ImageMagick dependency.
+
+XTWINOPS size queries (CSI 14 / 16 / 18 t) are answered so apps can detect
+graphics support and pick image dimensions; without that, `timg` falls back
+to half-block rendering even when `TERM_PROGRAM=ghostty`.
+
+Cell pixel sizes are reported as physical pixels via
+`ghostel-cell-pixel-scale` (default `auto`, derived from display DPI).
+On most displays this approximates standalone Ghostty's output; for
+pixel-perfect parity (especially on Linux Wayland with fractional scaling
+or non-standard DPI), set an explicit number.
+
+#### Limitations
+
+- **Alpha is dropped, not composited.** All formats — raw RGBA,
+  GrayAlpha, and PNG — go through an RGBA→PPM conversion that strips
+  the alpha channel (PNGs are decoded to RGBA by libghostty's PNG hook
+  at transmit time, then follow the same path).  Transparent pixels
+  render as whatever the underlying color value happens to be (most
+  decoders emit black).  Acceptable for thumbnails and screenshots;
+  not ideal for icons with semi-transparent edges.
+- **Source-rect cropping is not supported.** Atlas-style placements
+  that specify a sub-region of the source image (`x=`, `y=`, `w=`, `h=`
+  in the kitty protocol) are refused with an explicit error rather
+  than silently mis-rendering.  Full-image placements — what timg,
+  yazi, and `kitty +kitten icat` use — are unaffected.
+- **Multiple simultaneous virtual placements share rendering.**
+  Unicode-placeholder placements that coexist in the same buffer are
+  rendered as a single image; the most recent transmission wins.
+  `yazi`'s preview pane uses one image at a time, so this hasn't been
+  a problem in practice.
+- **Non-direct mediums are off by default** for safety.  Only the
+  inline (base64) medium is enabled; file / temp-file / shared-memory
+  mediums are opt-in via `ghostel-kitty-graphics-mediums`.  See its
+  docstring for the privilege-escalation reasoning.
+
 ### Calling Elisp from the Shell
 
 Shell scripts running inside ghostel can call whitelisted Elisp functions
@@ -553,37 +614,29 @@ AI agents like Claude Code, and other long-running commands emit it to
 report completion percentage.  Ghostel dispatches these to
 `ghostel-progress-function` with `(STATE PROGRESS)` where STATE is one of
 `remove`, `set`, `error`, `indeterminate`, `pause` and PROGRESS is an
-integer 0-100 or nil.  The default handler, `ghostel-default-progress`,
-updates `mode-line-process` in the terminal buffer:
+integer 0-100 or nil.
 
-- `[42%]` — running at 42% done
-- `[...]` — indeterminate progress
-- `[err 73%]` — error (shown in the `error` face)
-- `[paused 25%]` — paused
-- (cleared) — removed
+Two built-in handlers are available:
 
-#### Example: spinner.el in the mode line
+- `ghostel-default-progress` — plain text in `mode-line-process`:
+  `[42%]`, `[...]`, `[err 73%]`, `[paused 25%]`, or cleared on
+  `remove`.  Zero dependencies.
+- `ghostel-spinner-progress` — animates `mode-line-process` via
+  [spinner.el](https://github.com/Malabarba/spinner.el) during
+  `indeterminate` (e.g. while Claude Code is working) and falls back
+  to the same text indicator for the other states.
 
-For a fancier visual indicator during indeterminate progress, swap
-`ghostel-progress-function` for a handler backed by
-[spinner.el](https://github.com/Malabarba/spinner.el):
+`ghostel-progress-function` defaults to `ghostel-spinner-progress` when
+spinner.el is on the `load-path` at ghostel load time, otherwise to
+`ghostel-default-progress`.  Pin a specific handler explicitly:
 
 ```elisp
-(require 'spinner)
-(defvar-local my/ghostel-spinner nil)
-(defun my/ghostel-progress (state progress)
-  (pcase state
-    ((or 'set 'indeterminate)
-     (unless my/ghostel-spinner
-       (setq my/ghostel-spinner (spinner-create 'progress-bar t))
-       (spinner-start my/ghostel-spinner))
-     (when (eq state 'set)
-       (setq mode-line-process (format " [%d%%]" (or progress 0)))))
-    ((or 'remove 'error 'pause)
-     (when my/ghostel-spinner
-       (spinner-stop my/ghostel-spinner)
-       (setq my/ghostel-spinner nil)))))
-(setq ghostel-progress-function #'my/ghostel-progress)
+;; Pin to spinner (errors with a hint if spinner.el isn't installed):
+(setq ghostel-progress-function #'ghostel-spinner-progress)
+;; Or stay on the plain text indicator:
+(setq ghostel-progress-function #'ghostel-default-progress)
+;; Pick a different spinner style — see `spinner-types' in spinner.el:
+(setq ghostel-spinner-type 'horizontal-moving)
 ```
 
 ### Color Palette
@@ -636,6 +689,9 @@ inside a light Emacs):
 | `ghostel-immediate-redraw-interval`  | `0.05`           | Max seconds since last keystroke for immediate redraw    |
 | `ghostel-input-coalesce-delay`   | `0.003`              | Seconds to buffer rapid keystrokes before sending (0 to disable) |
 | `ghostel-full-redraw`            | `nil`                | Always do full redraws instead of incremental updates    |
+| `ghostel-cell-pixel-scale`       | `auto`               | Physical:logical pixel ratio for cell-size reporting (kitty graphics, XTWINOPS).  `auto` derives from display DPI |
+| `ghostel-kitty-graphics-storage-limit` | `320 MiB`      | Per-terminal cap on kitty graphics image storage.  Set to 0 to disable kitty graphics entirely (image transmissions are ignored, no storage allocated) |
+| `ghostel-kitty-graphics-mediums` | `nil`                | Opt-in image-loading mediums beyond the always-enabled inline base64.  A subset of `(file temp-file shared-mem)`.  Default `nil` keeps SSH sessions safe — the non-direct mediums let a remote program instruct ghostel to read arbitrary local paths or shared memory |
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
 | `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
@@ -1006,6 +1062,7 @@ powering Neovim's built-in terminal.
 | Plain-text URL/file detection | Yes       | No      |
 | OSC 9 / 777 notifications     | Yes       | No      |
 | OSC 9;4 progress reports      | Yes       | No      |
+| Kitty graphics protocol       | Yes       | No      |
 | Kitty keyboard protocol       | Yes       | No      |
 | Mouse passthrough (SGR)       | Yes       | No      |
 | Bracketed paste               | Yes       | Yes     |

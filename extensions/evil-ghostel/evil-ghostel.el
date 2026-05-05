@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.19.0
+;; Version: 0.22.1
 ;; Package-Requires: ((emacs "28.1") (evil "1.0") (ghostel "0.8.0"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -56,6 +56,22 @@ last-writer-wins."
          (set-default-toplevel-value sym val)
          (evil-set-initial-state 'ghostel-mode val)))
 
+(defcustom evil-ghostel-escape 'auto
+  "Where insert-state ESC is routed in ghostel buffers.
+
+`auto'      — when the inner app is in alt-screen mode (DECSET 1049,
+              used by vim, less, htop, nvim, etc.) ESC is sent to the
+              terminal; otherwise evil's binding runs and switches to
+              normal state.
+`terminal'  — always send ESC to the terminal.
+`evil'      — always run evil's binding (ESC stays with evil).
+
+Sets the initial value of the buffer-local state.  Use
+\\[evil-ghostel-toggle-send-escape] to change it for the current buffer."
+  :type '(choice (const :tag "Auto (alt-screen heuristic)" auto)
+                 (const :tag "Always to terminal" terminal)
+                 (const :tag "Always to evil" evil)))
+
 ;; Apply the current value at load.  Covers the case where the user set
 ;; the variable with plain `setq' before loading the package — in that
 ;; path `defcustom' preserves the value without invoking `:set'.
@@ -91,6 +107,36 @@ placement math the native module performs in `src/render.zig'."
           (forward-line (+ scrollback (cdr pos)))
           (move-to-column (car pos)))))))
 
+(defun evil-ghostel--cursor-buffer-line ()
+  "Return the 0-indexed buffer line of the terminal cursor, or nil.
+Translates `ghostel--cursor-position' (viewport-relative row) into a
+buffer line by adding the scrollback line count.  Mirrors the
+placement math the native module performs in `src/render.zig'."
+  (when (and ghostel--term ghostel--term-rows)
+    (let ((pos (ghostel--cursor-position ghostel--term)))
+      (when pos
+        (let ((scrollback (max 0 (- (count-lines (point-min) (point-max))
+                                    ghostel--term-rows))))
+          (+ scrollback (cdr pos)))))))
+
+(defun evil-ghostel--point-on-cursor-line-p ()
+  "Return non-nil when point is on the buffer line of the terminal cursor.
+Reflects current state (libghostty cursor + Emacs buffer); only
+meaningful after a redraw has synchronized the two.  Inside
+`evil-ghostel--around-redraw' the libghostty cursor has already
+advanced past output that the buffer hasn't rendered yet, so this
+helper is unsafe there — use `evil-ghostel--last-cursor-line' instead."
+  (let ((cursor-line (evil-ghostel--cursor-buffer-line)))
+    (when cursor-line
+      (= (- (line-number-at-pos (point) t) 1) cursor-line))))
+
+(defvar-local evil-ghostel--last-cursor-line nil
+  "Buffer line where the previous redraw placed the terminal cursor.
+Used by `evil-ghostel--around-redraw' to decide whether the user has
+navigated point since the last redraw.  When point is still on this
+line, the user is parked at the live prompt and the renderer's new
+cursor placement should win across the redraw.")
+
 (defun evil-ghostel--cursor-to-point ()
   "Move the terminal cursor to Emacs point by sending arrow keys."
   (when ghostel--term
@@ -119,7 +165,12 @@ states) and the evil-specific visual range markers are restored here;
 at this layer.
 
   - `point' in non-terminal states.  In `insert' and `emacs' point
-    intentionally follows the TUI cursor.
+    intentionally follows the TUI cursor.  In `normal' (and other
+    non-visual non-terminal states) point follows the cursor too when
+    the user was parked on the prompt line before the redraw - the
+    renderer leaves point at the new cursor and we keep it there.
+    Otherwise the saved buffer position is restored so scrollback
+    navigation is undisturbed.
   - `evil-visual-beginning' and `evil-visual-end' in `visual' state.
 
 ORIG-FN is the advised `ghostel--redraw' called with TERM and FULL.
@@ -130,19 +181,37 @@ own the screen and drive their own redraw cycle."
       (let* ((preserve-point (not (memq evil-state '(insert emacs))))
              (visual-p (eq evil-state 'visual))
              (saved-point (and preserve-point (point)))
+             ;; If point is still on the line where the previous redraw
+             ;; placed the terminal cursor, the user has not navigated
+             ;; since — they are parked on the live prompt and the new
+             ;; cursor placement should win.  We can't reuse
+             ;; `evil-ghostel--point-on-cursor-line-p' here because the
+             ;; libghostty cursor has already advanced past output that
+             ;; the buffer hasn't rendered yet; comparing against the
+             ;; recorded last-cursor-line avoids that skew.  Skipped in
+             ;; visual state to keep selection markers stable.
+             (on-prompt-line (and preserve-point
+                                  (not visual-p)
+                                  evil-ghostel--last-cursor-line
+                                  (= (- (line-number-at-pos (point) t) 1)
+                                     evil-ghostel--last-cursor-line)))
              (saved-vb (and visual-p (bound-and-true-p evil-visual-beginning)
                             (marker-position evil-visual-beginning)))
              (saved-ve (and visual-p (bound-and-true-p evil-visual-end)
                             (marker-position evil-visual-end))))
         (funcall orig-fn term full)
-        (when preserve-point
+        (when (and preserve-point (not on-prompt-line))
           (goto-char (min saved-point (point-max))))
         (when visual-p
           (let ((pmax (point-max)))
             (when saved-vb
               (set-marker evil-visual-beginning (min saved-vb pmax)))
             (when saved-ve
-              (set-marker evil-visual-end (min saved-ve pmax))))))
+              (set-marker evil-visual-end (min saved-ve pmax)))))
+        ;; Record where the renderer placed the cursor so the next
+        ;; redraw can detect whether the user has navigated away.
+        (setq evil-ghostel--last-cursor-line
+              (evil-ghostel--cursor-buffer-line)))
     (funcall orig-fn term full)))
 
 ;; ---------------------------------------------------------------------------
@@ -369,6 +438,62 @@ ORIG-FN is the advised `evil-redo' called with COUNT."
     (funcall orig-fn count)))
 
 ;; ---------------------------------------------------------------------------
+;; ESC routing: terminal vs evil
+;; ---------------------------------------------------------------------------
+
+(defvar-local evil-ghostel--escape-mode nil
+  "Buffer-local override for ESC routing.
+Initialized from `evil-ghostel-escape' when the minor mode turns on.
+Valid values: `auto', `terminal', `evil'.")
+
+(defconst evil-ghostel--escape-modes '(auto terminal evil)
+  "Cycle order for `evil-ghostel-toggle-send-escape'.")
+
+(defun evil-ghostel--escape ()
+  "Dispatch insert-state ESC based on `evil-ghostel--escape-mode'.
+Terminal-bound ESC is snapped to the live viewport like every other
+typed key in `ghostel-mode-map'.  When falling back to evil and the
+user's `evil-insert-state-map' binding is missing or a chord prefix
+\(e.g. `evil-escape''s `jk'), use `evil-force-normal-state' so the
+keystroke is never silently dropped."
+  (interactive)
+  (let* ((mode evil-ghostel--escape-mode)
+         (to-terminal (or (eq mode 'terminal)
+                          (and (eq mode 'auto)
+                               ghostel--term
+                               (ghostel--mode-enabled ghostel--term 1049)))))
+    (if to-terminal
+        (progn
+          (ghostel--snap-to-input)
+          (ghostel--send-encoded "escape" ""))
+      (let ((cmd (lookup-key evil-insert-state-map (kbd "<escape>"))))
+        (call-interactively (if (commandp cmd) cmd #'evil-force-normal-state))))))
+
+(defun evil-ghostel-toggle-send-escape (&optional arg)
+  "Cycle or set the ESC routing mode for the current buffer.
+Without ARG, cycle through `auto' → `terminal' → `evil' → `auto'.
+With numeric prefix 1, set to `auto'; 2 to `terminal'; 3 to `evil'.
+Other numeric prefixes signal a `user-error'.
+
+The mode is buffer-local; see `evil-ghostel-escape' for the default."
+  (interactive "P")
+  (let ((target
+         (if arg
+             (let ((n (prefix-numeric-value arg)))
+               (or (nth (1- n) evil-ghostel--escape-modes)
+                   (user-error
+                    "Invalid prefix %d; use 1 (auto), 2 (terminal), or 3 (evil)"
+                    n)))
+           (let ((next (cdr (memq evil-ghostel--escape-mode
+                                  evil-ghostel--escape-modes))))
+             (or (car next) (car evil-ghostel--escape-modes))))))
+    (setq evil-ghostel--escape-mode target)
+    (message "evil-ghostel ESC mode: %s" target)))
+
+(evil-define-key* 'insert evil-ghostel-mode-map
+                  (kbd "<escape>") #'evil-ghostel--escape)
+
+;; ---------------------------------------------------------------------------
 ;; Minor mode
 ;; ---------------------------------------------------------------------------
 
@@ -381,6 +506,7 @@ state transitions."
   :keymap evil-ghostel-mode-map
   (if evil-ghostel-mode
       (progn
+        (setq evil-ghostel--escape-mode evil-ghostel-escape)
         (evil-ghostel--escape-stay)
         (add-hook 'evil-insert-state-entry-hook
                   #'evil-ghostel--insert-state-entry nil t)

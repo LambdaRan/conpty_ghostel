@@ -10,11 +10,13 @@ const Terminal = @import("terminal.zig");
 const gt = @import("ghostty.zig");
 const render = @import("render.zig");
 const input = @import("input.zig");
+const kitty_graphics = @import("kitty_graphics.zig");
+const sys = @import("sys.zig");
 
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.19.0";
+const version = "0.22.1";
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -30,9 +32,9 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     const env = emacs.Env.init(raw_env);
 
     // Register functions
-    env.bindFunction("ghostel--new", 2, 3, &fnNew, "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK)");
+    env.bindFunction("ghostel--new", 2, 5, &fnNew, "Create a new ghostel terminal.\n\n(ghostel--new ROWS COLS &optional MAX-SCROLLBACK KITTY-STORAGE-LIMIT KITTY-MEDIUMS)\n\nKITTY-STORAGE-LIMIT is the kitty graphics image storage cap in bytes (default 320 MiB); 0 disables kitty graphics entirely.\nKITTY-MEDIUMS is a bitfield: bit 0 = file medium, bit 1 = temp-file medium, bit 2 = shared-memory medium (default 0 = direct only).");
     env.bindFunction("ghostel--write-input", 2, 2, &fnWriteInput, "Write raw bytes to the terminal.\n\n(ghostel--write-input TERM DATA)");
-    env.bindFunction("ghostel--set-size", 3, 3, &fnSetSize, "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS)");
+    env.bindFunction("ghostel--set-size", 3, 5, &fnSetSize, "Resize the terminal.\n\n(ghostel--set-size TERM ROWS COLS &optional CELL-W CELL-H)");
     env.bindFunction("ghostel--get-title", 1, 1, &fnGetTitle, "Get the terminal title.\n\n(ghostel--get-title TERM)");
     env.bindFunction("ghostel--get-pwd", 1, 1, &fnGetPwd, "Get the terminal's working directory from OSC 7.\n\n(ghostel--get-pwd TERM)");
     env.bindFunction("ghostel--redraw", 1, 2, &fnRedraw, "Redraw the terminal into the current buffer.\n\n(ghostel--redraw TERM &optional FULL)");
@@ -54,6 +56,10 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--conpty-resize", 3, 3, &fnConptyResize, "Resize the ConPTY pseudo-console by writing to the control named pipe.\n\n(ghostel--conpty-resize ID WIDTH HEIGHT)");
 
     emacs.initSymbols(env);
+
+    // Install system callbacks (PNG decoder for kitty graphics, logging).
+    sys.init();
+
     env.provide("ghostel-module");
     return 0;
 }
@@ -68,15 +74,44 @@ export const plugin_is_GPL_compatible: c_int = 0;
 // Exported Elisp functions
 // ---------------------------------------------------------------------------
 
-/// (ghostel--new ROWS COLS &optional MAX-SCROLLBACK)
+/// (ghostel--new ROWS COLS &optional MAX-SCROLLBACK KITTY-STORAGE-LIMIT)
 fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
-    const rows: u16 = @intCast(env.extractInteger(args[0]));
-    const cols: u16 = @intCast(env.extractInteger(args[1]));
+    // Reject out-of-range row/col counts rather than wrapping/panicking.
+    const rows = std.math.cast(u16, env.extractInteger(args[0])) orelse {
+        env.signalError("ghostel: rows out of range");
+        return env.nil();
+    };
+    const cols = std.math.cast(u16, env.extractInteger(args[1])) orelse {
+        env.signalError("ghostel: cols out of range");
+        return env.nil();
+    };
     const max_scrollback: usize = if (nargs > 2 and env.isNotNil(args[2]))
-        @intCast(env.extractInteger(args[2]))
+        (std.math.cast(usize, env.extractInteger(args[2])) orelse {
+            env.signalError("ghostel: max-scrollback out of range");
+            return env.nil();
+        })
     else
         5 * 1024 * 1024; // ~5 MB, roughly 5k rows on an 80-column terminal
+
+    // Default 320 MiB; explicit 0 disables kitty graphics entirely
+    // (skips the storage allocation in libghostty's screen state).
+    const kitty_storage_limit: usize = if (nargs > 3 and env.isNotNil(args[3]))
+        (std.math.cast(usize, env.extractInteger(args[3])) orelse {
+            env.signalError("ghostel: kitty-storage-limit out of range");
+            return env.nil();
+        })
+    else
+        320 * 1024 * 1024;
+
+    // Bit 0 = file medium, bit 1 = temp_file, bit 2 = shared_mem.
+    // Default 0 — only the direct medium (base64 inline) is enabled.
+    // The other mediums let a remote program instruct ghostel to read
+    // arbitrary local files / SHM regions, so opt-in only.
+    const kitty_mediums: u32 = if (nargs > 4 and env.isNotNil(args[4]))
+        (std.math.cast(u32, env.extractInteger(args[4])) orelse 0)
+    else
+        0;
 
     const term = std.heap.c_allocator.create(Terminal) catch {
         env.signalError("ghostel: out of memory");
@@ -96,6 +131,7 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
         term.setBell(&bellCallback) catch break :blk false;
         term.setTitleChanged(&titleChangedCallback) catch break :blk false;
         term.setDeviceAttributes(&deviceAttributesCallback) catch break :blk false;
+        term.setSize(&sizeCallback) catch break :blk false;
         break :blk true;
     };
     if (!setup_ok) {
@@ -110,6 +146,16 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
     const default_bg = gt.ColorRgb{ .r = 0, .g = 0, .b = 0 };
     term.setColorForeground(&default_fg) catch {};
     term.setColorBackground(&default_bg) catch {};
+
+    // Enable kitty graphics protocol if storage limit > 0.
+    if (kitty_storage_limit > 0) {
+        term.enableKittyGraphics(
+            kitty_storage_limit,
+            (kitty_mediums & 0x1) != 0,
+            (kitty_mediums & 0x2) != 0,
+            (kitty_mediums & 0x4) != 0,
+        ) catch {};
+    }
 
     return env.makeUserPtr(&Terminal.emacsFinalize, term);
 }
@@ -326,11 +372,14 @@ fn dispatchPostWriteOscs(env: emacs.Env, term: *Terminal, data: []const u8) void
                     env.makeString(b64),
                 );
             },
-            // OSC 133: semantic prompt markers (A/B/C/D).
+            // OSC 133: semantic prompt markers (A/B/C/D/P).  P is
+            // "explicit prompt start" — same as A for navigation but
+            // without libghostty's fresh-line side effect, used by the
+            // zsh `zle-line-init' fallback when PROMPT-wrap was lost.
             133 => {
                 if (osc.payload.len == 0) continue;
                 const marker_type = osc.payload[0];
-                if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D') continue;
+                if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D' and marker_type != 'P') continue;
                 const has_param = osc.payload.len > 1 and osc.payload[1] == ';';
                 const param_data = if (has_param) osc.payload[2..] else &[_]u8{};
                 const type_str: [1]u8 = .{marker_type};
@@ -583,15 +632,19 @@ fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) voi
         switch (osc.code) {
             10 => {
                 if (!std.mem.eql(u8, osc.payload, "?")) continue;
-                var fg: gt.ColorRgb = undefined;
-                if (!term.getColorForeground(&fg)) continue;
-                sendDynamicColorReply(env, 10, fg, osc.terminator);
+                const fg = term.getColorForeground() catch |err| {
+                    env.logErrorf("ghostel: getColorForeground failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                if (fg) |color| sendDynamicColorReply(env, 10, color, osc.terminator);
             },
             11 => {
                 if (!std.mem.eql(u8, osc.payload, "?")) continue;
-                var bg: gt.ColorRgb = undefined;
-                if (!term.getColorBackground(&bg)) continue;
-                sendDynamicColorReply(env, 11, bg, osc.terminator);
+                const bg = term.getColorBackground() catch |err| {
+                    env.logErrorf("ghostel: getColorBackground failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                if (bg) |color| sendDynamicColorReply(env, 11, color, osc.terminator);
             },
             4 => {
                 // Payload is a ';'-separated list of `index;value` pairs.
@@ -603,7 +656,10 @@ fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) voi
                     const idx = std.fmt.parseInt(u32, index_tok, 10) catch continue;
                     if (idx >= 256) continue;
                     if (!palette_loaded) {
-                        if (!term.getColorPalette(&palette)) break;
+                        palette = term.getColorPalette() catch |err| {
+                            env.logErrorf("ghostel: getColorPalette failed: {s}", .{@errorName(err)});
+                            break;
+                        };
                         palette_loaded = true;
                     }
                     sendPaletteColorReply(env, @intCast(idx), palette[idx], osc.terminator);
@@ -614,25 +670,40 @@ fn extractOscColorQueries(env: emacs.Env, term: *Terminal, data: []const u8) voi
     }
 }
 
-/// (ghostel--set-size TERM ROWS COLS)
-fn fnSetSize(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+/// (ghostel--set-size TERM ROWS COLS &optional CELL-W CELL-H)
+fn fnSetSize(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse {
         env.signalError("ghostel: invalid terminal handle");
         return env.nil();
     };
 
-    const rows: u16 = @intCast(env.extractInteger(args[1]));
-    const cols: u16 = @intCast(env.extractInteger(args[2]));
-
-    term.resize(cols, rows) catch {
-        env.signalError("ghostel: resize failed");
+    const rows = std.math.cast(u16, env.extractInteger(args[1])) orelse {
+        env.signalError("ghostel: rows out of range");
         return env.nil();
     };
-    // Reflow invalidates the materialized scrollback — terminal.resize()
-    // sets rebuild_pending so the next redraw() erases and rebuilds under
-    // inhibit-redisplay, avoiding a visible blank frame.
+    const cols = std.math.cast(u16, env.extractInteger(args[2])) orelse {
+        env.signalError("ghostel: cols out of range");
+        return env.nil();
+    };
 
+    // Clamp cell dimensions to at least 1.  A zero (or negative,
+    // pre-cast) value would propagate into the OPT_SIZE answer, and
+    // some apps treat zero cell sizes as "kitty graphics not
+    // supported" and fall back to half-block rendering.
+    const cell_w: u32 = if (nargs > 3 and env.isNotNil(args[3])) blk: {
+        const raw = env.extractInteger(args[3]);
+        if (raw < 1) break :blk 1;
+        break :blk std.math.cast(u32, raw) orelse 1;
+    } else 1;
+
+    const cell_h: u32 = if (nargs > 4 and env.isNotNil(args[4])) blk: {
+        const raw = env.extractInteger(args[4]);
+        if (raw < 1) break :blk 1;
+        break :blk std.math.cast(u32, raw) orelse 1;
+    } else 1;
+
+    term.resize(cols, rows, cell_w, cell_h);
     return env.nil();
 }
 
@@ -641,10 +712,11 @@ fn fnGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*an
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
-    if (term.getTitle()) |title| {
-        return env.makeString(title);
-    }
-    return env.nil();
+    const title = term.getTitle() catch |err| {
+        env.signalErrorf("ghostel: getTitle failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+    return if (title) |t| env.makeString(t) else env.nil();
 }
 
 /// (ghostel--get-pwd TERM)
@@ -652,10 +724,11 @@ fn fnGetPwd(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyo
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
-    if (term.getPwd()) |pwd| {
-        return env.makeString(pwd);
-    }
-    return env.nil();
+    const pwd = term.getPwd() catch |err| {
+        env.signalErrorf("ghostel: getPwd failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+    return if (pwd) |p| env.makeString(p) else env.nil();
 }
 
 /// (ghostel--redraw TERM &optional FULL)
@@ -669,7 +742,35 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
         vt_log_env = env;
         defer vt_log_env = null;
     }
-    render.redraw(env, term, force_full);
+
+    render.redraw(env, term, force_full) catch |err| {
+        env.logStackTrace(@errorReturnTrace());
+        env.signalErrorf("Redraw failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+
+    // `redraw' parks the libghostty viewport one row above the active
+    // area for the next-redraw incremental change detection.  Kitty
+    // placement queries report `viewport_row' relative to the current
+    // viewport, so reading them with the parked offset shifts every
+    // placement up by 1, anchoring the resulting overlay one row too
+    // low and covering the prompt that sits just below the image.
+    // Restore to the active area (SCROLL_BOTTOM) for the kitty calls,
+    // then re-park afterwards.
+    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+    defer term.scrollViewport(gt.SCROLL_DELTA, -1);
+
+    // Clear viewport-region kitty overlays after redraw so the cleared
+    // region is computed against the post-promotion `scrollback_in_buffer`.
+    // Running kitty-clear before redraw would use the pre-promotion viewport
+    // boundary, wiping the overlay on the row that's about to be promoted
+    // into scrollback — exactly the row we want to keep tagged.
+    _ = env.call0(emacs.sym.@"ghostel--kitty-clear");
+    kitty_graphics.emitPlacements(env, term) catch |err| {
+        env.logStackTrace(@errorReturnTrace());
+        env.logErrorf("ghostel: emitPlacements failed: {s}", .{@errorName(err)});
+    };
+
     return env.nil();
 }
 
@@ -700,10 +801,12 @@ fn fnEncodeKey(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _:
     const key = input.mapKey(key_name);
     const mods = input.parseMods(mod_str);
 
-    if (input.encodeAndSend(env, term, key, mods, utf8)) {
-        return env.t();
-    }
-    return env.nil();
+    const sent = input.encodeAndSend(env, term, key, mods, utf8) catch |err| {
+        env.logStackTrace(@errorReturnTrace());
+        env.signalErrorf("ghostel: encodeAndSend failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+    return if (sent) env.t() else env.nil();
 }
 
 /// (ghostel--mouse-event TERM ACTION BUTTON ROW COL MODS)
@@ -721,10 +824,12 @@ fn fnMouseEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     const col = env.extractInteger(args[4]);
     const mods = env.extractInteger(args[5]);
 
-    if (input.encodeAndSendMouse(env, term, action, button, row, col, mods)) {
-        return env.t();
-    }
-    return env.nil();
+    const sent = input.encodeAndSendMouse(env, term, action, button, row, col, mods) catch |err| {
+        env.logStackTrace(@errorReturnTrace());
+        env.signalErrorf("ghostel: encodeAndSendMouse failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+    return if (sent) env.t() else env.nil();
 }
 
 /// (ghostel--focus-event TERM GAINED)
@@ -737,7 +842,11 @@ fn fnFocusEvent(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // Only send focus events if the terminal has enabled mode 1004
     // Construct mode value manually: DEC private mode 1004 = value & 0x7FFF, ansi=false (bit 15=0)
     const focus_mode: gt.c.GhosttyMode = 1004;
-    if (!term.isModeEnabled(focus_mode)) {
+    const focus_enabled = term.isModeEnabled(focus_mode) catch |err| {
+        env.signalErrorf("ghostel: isModeEnabled failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+    if (!focus_enabled) {
         return env.nil();
     }
 
@@ -764,7 +873,11 @@ fn fnModeEnabled(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const mode: gt.c.GhosttyMode = @intCast(env.extractInteger(args[1]));
-    return if (term.isModeEnabled(mode)) env.t() else env.nil();
+    const enabled = term.isModeEnabled(mode) catch |err| {
+        env.signalErrorf("ghostel: isModeEnabled failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+    return if (enabled) env.t() else env.nil();
 }
 
 /// (ghostel--alt-screen-p TERM)
@@ -772,7 +885,11 @@ fn fnModeEnabled(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?
 fn fnAltScreen(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
-    return if (term.isAltScreen()) env.t() else env.nil();
+    const alt = term.isAltScreen() catch |err| {
+        env.signalErrorf("ghostel: isAltScreen failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+    return if (alt) env.t() else env.nil();
 }
 
 /// (ghostel--set-palette TERM COLORS-STRING)
@@ -792,11 +909,10 @@ fn fnSetPalette(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     };
 
     // Get current palette as base (keeps entries 16-255)
-    var palette: [256]gt.ColorRgb = undefined;
-    if (!term.getColorPalette(&palette)) {
-        env.signalError("ghostel: failed to get current palette");
+    var palette = term.getColorPalette() catch |err| {
+        env.signalErrorf("ghostel: getColorPalette failed: {s}", .{@errorName(err)});
         return env.nil();
-    }
+    };
 
     // Parse "#RRGGBB" entries — 7 chars each
     var idx: usize = 0;
@@ -902,11 +1018,14 @@ fn fnDebugState(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
     // Preserve viewport position
-    const saved_offset: ?usize = if (term.getScrollbar()) |sb| sb.offset else null;
-    defer if (saved_offset) |off| {
+    const saved_offset = (term.getScrollbar() catch |err| {
+        env.signalErrorf("ghostel: getScrollbar failed: {s}", .{@errorName(err)});
+        return env.nil();
+    }).offset;
+    defer {
         term.scrollViewport(gt.SCROLL_TOP, 0);
-        term.scrollViewport(gt.SCROLL_DELTA, @intCast(off));
-    };
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    }
     term.scrollViewport(gt.SCROLL_BOTTOM, 0);
 
     var buf: [4096]u8 = undefined;
@@ -967,11 +1086,14 @@ fn fnDebugFeed(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*a
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
     // Preserve viewport position
-    const saved_offset: ?usize = if (term.getScrollbar()) |sb| sb.offset else null;
-    defer if (saved_offset) |off| {
+    const saved_offset = (term.getScrollbar() catch |err| {
+        env.signalErrorf("ghostel: getScrollbar failed: {s}", .{@errorName(err)});
+        return env.nil();
+    }).offset;
+    defer {
         term.scrollViewport(gt.SCROLL_TOP, 0);
-        term.scrollViewport(gt.SCROLL_DELTA, @intCast(off));
-    };
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    }
     term.scrollViewport(gt.SCROLL_BOTTOM, 0);
 
     var stack_buf: [4096]u8 = undefined;
@@ -1043,11 +1165,14 @@ fn fnCursorPosition(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
 
     // Preserve viewport position.
-    const saved_offset: ?usize = if (term.getScrollbar()) |sb| sb.offset else null;
-    defer if (saved_offset) |off| {
+    const saved_offset = (term.getScrollbar() catch |err| {
+        env.signalErrorf("ghostel: getScrollbar failed: {s}", .{@errorName(err)});
+        return env.nil();
+    }).offset;
+    defer {
         term.scrollViewport(gt.SCROLL_TOP, 0);
-        term.scrollViewport(gt.SCROLL_DELTA, @intCast(off));
-    };
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    }
     term.scrollViewport(gt.SCROLL_BOTTOM, 0);
 
     // Ensure render state is up to date
@@ -1212,13 +1337,35 @@ fn deviceAttributesCallback(_: gt.Terminal, _: ?*anyopaque, out: [*c]gt.DeviceAt
     return true;
 }
 
+/// Called for XTWINOPS size queries (CSI 14/16/18 t).  libghostty
+/// invokes this to learn the terminal's row/column count and cell
+/// pixel dimensions, then encodes the appropriate response itself
+/// and writes it via the write_pty callback.  Image-rendering tools
+/// like timg use these queries to detect kitty graphics support and
+/// size images correctly — without a response they fall back to
+/// half-block rendering.
+fn sizeCallback(_: gt.Terminal, userdata: ?*anyopaque, out: [*c]gt.SizeReportSize) callconv(.c) bool {
+    const term: *Terminal = @ptrCast(@alignCast(userdata));
+    out[0] = .{
+        .rows = term.size.rows,
+        .columns = term.size.cols,
+        .cell_width = term.cell_width_px,
+        .cell_height = term.cell_height_px,
+    };
+    return true;
+}
+
 /// Called when the terminal title changes.
 fn titleChangedCallback(_: gt.Terminal, userdata: ?*anyopaque) callconv(.c) void {
     const term: *Terminal = @ptrCast(@alignCast(userdata));
     const env = term.env orelse return;
 
-    if (term.getTitle()) |title| {
-        _ = env.call1(emacs.sym.@"ghostel--set-title", env.makeString(title));
+    const title = term.getTitle() catch |err| {
+        env.logErrorf("ghostel: getTitle failed in titleChangedCallback: {s}", .{@errorName(err)});
+        return;
+    };
+    if (title) |t| {
+        _ = env.call1(emacs.sym.@"ghostel--set-title", env.makeString(t));
     }
 }
 
@@ -1305,9 +1452,12 @@ fn fnUriAt(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyop
     const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
     const row_from_bottom = env.extractInteger(args[1]);
     const col = env.extractInteger(args[2]);
-    const total_rows = term.getTotalRows();
+    const total_rows = term.getTotalRows() catch |err| {
+        env.signalErrorf("ghostel: getTotalRows failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
 
-    if (col < 0 or col >= term.cols) return env.nil();
+    if (col < 0 or col >= term.size.cols) return env.nil();
     // The Emacs buffer always carries a trailing newline, so the line
     // immediately after the last content row produces row_from_bottom == 0.
     if (row_from_bottom <= 0 or row_from_bottom > total_rows) return env.nil();

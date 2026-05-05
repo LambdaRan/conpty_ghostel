@@ -2,6 +2,277 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [0.22.1] — 2026-05-04
+
+### Fixed
+- Loading `ghostel.el` no longer prompts to download or compile the
+  native module under any circumstances.  Previously `ghostel.el`
+  consulted `ghostel-module-auto-install` at load time and could open
+  an interactive `read-char-choice` prompt — this hung Emacs 31
+  `user-lisp/` auto-byte-compile and similar harnesses where a user
+  `(setq ghostel-module-auto-install nil)` had not yet been
+  evaluated.  Module installation now happens only on an explicit
+  user action: `M-x ghostel`, `M-x ghostel-download-module`, or
+  `M-x ghostel-module-compile`.  When the module is missing at load
+  time the package issues a `display-warning` instead.
+  Closes [#231](https://github.com/dakra/ghostel/issues/231).
+- No-echo on remote shells launched from a TRAMP `default-directory`
+  (`ghostel-tramp-shell-integration nil`).  The previous fix
+  rebound `tramp-terminal-type`, which only takes effect on the
+  generic `tramp-handle-make-process` path; the ssh-method path
+  (`tramp-sh-handle-make-process`) ignores it.  In addition, when
+  the local default-toplevel `process-environment` already has
+  `TERM=xterm-ghostty` (e.g. Emacs launched from ghostty),
+  `tramp-local-environment-variable-p` strips ghostel's pushed
+  TERM as "ambient", and the remote shell inherits TERM=dumb from
+  TRAMP's connection shell — disabling readline/ZLE/fish line
+  editing.
+
+  The per-spawn `/bin/sh -c` wrapper now sets TERM itself on the
+  remote, after probing for `xterm-ghostty` terminfo via
+  `infocmp`.  Single path covers auto-integration (TERMINFO
+  pushed), manual install (system or `~/.terminfo`), and the
+  bare case (fall back to `xterm-256color` so echo works).  The
+  bogus local TERMINFO path is no longer pushed to the remote.
+  Closes [#224](https://github.com/dakra/ghostel/issues/224)
+  again.
+
+### Added
+- Manual remote-integration setups can now drop the bundled
+  `xterm-ghostty` terminfo at `~/.local/share/ghostel/terminfo/`
+  alongside the shell scripts (`scp -r etc/terminfo/{x,78}` from
+  the local package).  TRAMP-spawned remote shells detect it and
+  prepend the directory to `TERMINFO_DIRS` automatically — no
+  `tic`, no touching `~/.terminfo`.  README "Option 2: Manual
+  setup" updated with the one-shot install recipe.
+
+## [0.22.0] — 2026-05-04
+
+### Added
+- `ghostel-pre-spawn-hook`, run inside `ghostel--spawn-pty` just
+  before `make-process` with `process-environment` dynamically
+  bound to the about-to-be-spawned env.  Hook functions can
+  `setenv` to inject entries the child inherits.  Intended for
+  integrations like with-editor — with a `with-editor-setup-environment`
+  exposed upstream, users can wire Magit's `EDITOR` plumbing into
+  ghostel buffers via
+  `(add-hook 'ghostel-pre-spawn-hook
+            #'with-editor-setup-environment)`.  Fires for both
+  `ghostel`/`ghostel-project` and `ghostel-exec` spawns;
+  `ghostel-compile` has its own `make-process` and is not covered.
+- `evil-ghostel-escape` controls how ESC is routed in evil insert
+  state: `auto` (default) inspects DECSET 1049 to send ESC to the
+  terminal in alt-screen apps (vim, less, htop, …) and otherwise
+  fall back to `evil-normal-state`; explicit `terminal` and `evil`
+  values force one or the other.  A toggle command with numeric
+  prefix support is also bound.  The terminal-bound ESC snaps to
+  the live viewport like every other typed key; the evil-bound
+  fallback lands on `evil-force-normal-state` when the user's
+  `<escape>` binding is missing or a chord prefix
+  ([#215](https://github.com/dakra/ghostel/issues/215)).
+- `make bench-e2e` (and a `--e2e` flag on `run-bench.sh`) measures
+  whole-pipeline throughput by installing each backend's production
+  filter+sentinel on a `cat` subprocess and waiting for full
+  quiescence, so the wall clock reflects what users actually feel
+  (including ghostel's `delayed-redraw` link detection / anchoring,
+  vterm's regex split + decode loop, and eat's deferred queue).
+  Composes with `--quick`, `--size`, `--iterations`, and the
+  backend-skip flags.
+
+### Changed
+- The Zig native module has been broadly refactored ("Zigify
+  everything"): libghostty calls are wrapped to be return-value
+  oriented rather than out-pointer oriented, errors propagate via
+  Zig's `try`/`catch` and error unions instead of C error codes,
+  optional absence is distinguished from real errors, and
+  per-error logging/handling is consistent across the module
+  ([#217](https://github.com/dakra/ghostel/pull/217)).  This is
+  internal — no user-visible API changes — but bumps the minimum
+  required native module version, so update both ghostel.el and
+  the prebuilt `.so`/`.dylib` together.
+- Render code is reorganised around a single property-run
+  abstraction (prompt cells, input cells, and ordinary content all
+  flow through the same path), and uses a new internal
+  `FixedArrayList` to cut per-row allocation overhead.  Adds an
+  Emacs↔Zig logging/debugging layer used during the refactor and
+  available for future native-module work.
+
+### Fixed
+- Launching `M-x ghostel` from a TRAMP `default-directory` (e.g.
+  after `find-file /ssh:host:`) now produces a usable remote shell.
+  Previously TRAMP's `make-process' handler reset TERM to
+  `tramp-terminal-type' (default `"dumb"'), which caused
+  bash/readline, zsh/ZLE, and fish to disable interactive line
+  editing on the remote: typed characters didn't echo, although
+  Enter still submitted the line.  Ghostel now rebinds
+  `tramp-terminal-type' for its remote spawns to `xterm-256color'
+  (or `xterm-ghostty' when `ghostel-tramp-shell-integration' has
+  pushed the bundled terminfo), restoring echo and line editing
+  ([#224](https://github.com/dakra/ghostel/issues/224)).
+- Shell integration survives prompt themes and rcfile assignments
+  that overwrite `PROMPT`/`PS1`/`fish_prompt` after ghostel sourced
+  its bootstrap.  The OSC 133 A/B markers are now (re)installed
+  every prompt cycle — modeled on ghostty's own zsh/bash/fish
+  integrations — so powerlevel10k, agnoster, Pure, oh-my-zsh /
+  prezto add-zle-hook chains, bash `PROMPT_COMMAND` reassignments,
+  and fish themes loaded via `conf.d/` no longer strip the
+  prompt-range markers.  Without those markers, the file-path link
+  detector linkified user-typed cells and the link keymap's RET
+  binding shadowed the normal terminal RET in tty Emacs — pressing
+  RET on a typed `cd some/path` opened the link instead of
+  executing the command
+  ([#199](https://github.com/dakra/ghostel/issues/199)).
+- New terminals no longer briefly flash with libghostty's default
+  colors before ghostel applies the Emacs theme.  A regression
+  test guards against the flicker reappearing
+  ([#219](https://github.com/dakra/ghostel/pull/219)).
+- `ghostel-keymap-exceptions` now also excludes special keys
+  (`<return>`, `<tab>`, `<f1>`, …, including their `S-`/`C-`/`M-`/
+  `C-S-`/`M-S-`/`C-M-` variants).  The special-keys binding loop
+  in `ghostel-mode-map` was missing the exceptions check that the
+  `C-<letter>` and `M-<letter>` loops had, so users could not
+  exclude e.g. `C-<return>` or `C-M-<down>`
+  ([#210](https://github.com/dakra/ghostel/issues/210)).
+- `ghostel-download-module` no longer segfaults when the module
+  is already loaded.  Calling `module-load` on a path whose shared
+  library is mapped into the running Emacs makes dyld/ld.so return
+  the existing handle and resolve `emacs_module_init` via `dlsym`
+  on the stale image.  Ghostel now skips the second `module-load`
+  when the module is already `featurep`'d and tells the user to
+  restart Emacs to pick up the new version
+  ([#78](https://github.com/dakra/ghostel/issues/78)).
+
+## [0.21.0] — 2026-05-01
+
+### Added
+- `ghostel-spinner-progress`, a built-in handler for
+  `ghostel-progress-function` that animates `mode-line-process` via
+  [spinner.el](https://github.com/Malabarba/spinner.el) during
+  indeterminate progress (e.g. while Claude Code is working) and
+  shows percentage text for determinate states.  spinner.el is a
+  soft dependency: when it is on the `load-path` at ghostel load
+  time, `ghostel-progress-function` defaults to this handler;
+  otherwise the existing `ghostel-default-progress` text indicator
+  is used.  New `ghostel-spinner-type` defcustom (default
+  `progress-bar`) selects the spinner style.
+
+### Changed
+- Resize redraw work now scales with the resized axis.  Column
+  changes still trigger a full scrollback rebuild (cell wrapping
+  depends on width), but row-only changes only re-render the
+  visible area and defer until after the next redraw, eliminating
+  noticeable lag when only the height changes
+  ([24f6653](https://github.com/dakra/ghostel/commit/24f6653)).
+
+### Fixed
+- Claude Code's progress reports now update `mode-line-process` in
+  ghostel buffers.  Claude Code gates OSC 9;4 progress emission on
+  `TERM_PROGRAM_VERSION` parsing as semver `>= 1.2.0`; ghostel
+  advertised `TERM_PROGRAM=ghostty` without the version, so the
+  gate failed and progress was silently dropped.  Ghostel now also
+  exports `TERM_PROGRAM_VERSION` matching the vendored libghostty
+  pin, satisfying Claude Code's check and any other consumer that
+  applies the same probe.
+- Plain-text URL/file detection no longer linkifies the cell the
+  user is typing into.  In tty Emacs, `RET` on a linkified cell
+  resolved to `ghostel-open-link-at-point` (text-property keymap
+  overrides `ghostel-mode-map`), so pressing return at a path the
+  shell echoed — e.g. `cd src/main.rs` — opened the file instead
+  of running the command.  The renderer now marks OSC 133 B..C
+  cells as `ghostel-input` and `ghostel--detect-urls` skips the
+  prompt prefix unconditionally and the active input line.  The
+  bundled bash/zsh/fish integrations are updated to emit 133;A and
+  133;B from inside the prompt itself rather than back-to-back
+  before prompt expansion, so libghostty sees a non-empty PROMPT
+  range
+  ([c145c5e](https://github.com/dakra/ghostel/commit/c145c5e),
+  closes #199).
+- OSC 51;E callbacks dispatch synchronously from the process
+  filter rather than waiting for the next redraw timer tick.
+  Callers like `b4 prep --edit-cover` write the OSC and continue,
+  cleaning up their tempdir before deferred elisp could `find-file`
+  the path; deferred dispatch produced
+  `Setting current directory: No such file or directory`.
+  Matches vterm's behavior.  OSC 51;A (directory tracking) is left
+  deferred since it has no such race
+  ([3f8846c](https://github.com/dakra/ghostel/commit/3f8846c),
+  fixes #209).
+
+## [0.20.1] — 2026-04-29
+
+### Changed
+- Style-run break detection during render uses a cheap
+  `CellStyleKey` rather than a full `CellStyle` comparison, cutting
+  per-cell overhead on large dirty regions
+  ([81f1258](https://github.com/dakra/ghostel/commit/81f1258)).
+- libghostty can now be built with optimization settings independent
+  from the ghostel module itself, so debug ghostel builds no longer
+  drag libghostty into debug mode
+  ([5baea2d](https://github.com/dakra/ghostel/commit/5baea2d)).
+
+## [0.20.0] — 2026-04-29
+
+### Added
+- Kitty graphics protocol support — render images inline in the
+  ghostel buffer for both traditional non-virtual placements
+  (timg, kitty +kitten icat, applications using direct kitty
+  graphics) and unicode-placeholder placements (yazi, modern image
+  previewers).  All decoding, storage, and protocol parsing flow
+  through libghostty's kitty graphics C API; ghostel queries the
+  placement iterator each redraw and applies image overlays in
+  Emacs.  Non-PNG pixel data (RGBA / RGB / GrayAlpha / Gray) is
+  converted to PPM (P6) for Emacs's built-in image renderer; PNGs
+  go through libghostty's PNG-decode hook backed by vendored
+  stb_image.  Per-row slicing (`:ascent 'center` plus a
+  `line-height` clamp on the trailing newline) keeps image rows
+  flush even when the placeholder line's `line-pixel-height` is
+  pulled above `frame-char-height` by a fallback font or nerd-font
+  icon on the same line
+  ([57ef5a7](https://github.com/dakra/ghostel/commit/57ef5a7)).
+- `ghostel-cell-pixel-scale` controls the physical:logical pixel
+  ratio reported to apps that probe XTWINOPS CSI 14/16/18 t.
+  Apps like timg and yazi expect cell dimensions in *physical*
+  pixels (what standalone Ghostty advertises via the OS window
+  server's backing scale factor), but Emacs only exposes logical
+  pixels — reporting them unscaled makes apps either fall back to
+  half-blocks (timg) or fill many more cells than expected with
+  upscaled, blocky output (yazi).  The `auto` default derives a
+  float scale from display DPI (`display-pixel-width` /
+  `display-mm-width` compared to the 96 DPI reference); a numeric
+  override is available for pixel-perfect parity with standalone
+  Ghostty
+  ([57ef5a7](https://github.com/dakra/ghostel/commit/57ef5a7)).
+- File detection recognises tilde-prefixed paths
+  (`~/file.el:42`) — `~` is added to the leading character class
+  and leading anchor of `ghostel-file-detection-path-regex`
+  ([abae518](https://github.com/dakra/ghostel/commit/abae518)).
+
+### Changed
+- `OPT_SIZE` (XTWINOPS CSI 14/16/18 t) is now answered by ghostel,
+  alongside the existing `OPT_DEVICE_ATTRIBUTES` reply.  Image-
+  rendering tools probe these queries to detect kitty graphics
+  support and pick image dimensions; without a response timg fell
+  back to half-block rendering even when `TERM_PROGRAM=ghostty`.
+  Cell pixel dimensions are stored on the Terminal struct and
+  updated on every resize, and `ghostel--set-size` is seeded once
+  between `ghostel--new` and the process spawn so the very first
+  output (e.g. timg's transmit-and-place) reports authoritative
+  values rather than zero
+  ([57ef5a7](https://github.com/dakra/ghostel/commit/57ef5a7)).
+
+### Fixed
+- `ghostel-exec` uses the universal 80×24 default when BUFFER is
+  not displayed in any window, instead of sizing the PTY from
+  `(selected-window)`.  The selected window had nothing to do with
+  where the agent buffer would eventually be shown — programs
+  ending up in a different window had to rely on SIGWINCH to
+  recover, and TUIs that latch initial dimensions at startup
+  rendered against the wrong size.  Matches eat's behaviour; the
+  displayed-buffer path is unchanged
+  ([a8bf9ae](https://github.com/dakra/ghostel/commit/a8bf9ae)).
+
 ## [0.19.0] — 2026-04-29
 
 ### Added
