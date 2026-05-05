@@ -3225,23 +3225,25 @@ EXTRA-ENV is an optional list of environment variable strings
                               (random #x10000)))
            (process-environment
             (append
+             ghostel-environment
              (cons "INSIDE_EMACS=ghostel" (ghostel--terminal-env))
              extra-env
              process-environment))
            (process-adaptive-read-buffering nil)
-           (read-process-output-max (max read-process-output-max (* 1024 1024)))
-           (proc (make-process
-                  :name "ghostel"
-                  :buffer (current-buffer)
-                  :command `(,proxy-path
-                             "new" ,conpty-id
-                             ,(number-to-string width)
-                             ,(number-to-string height)
-                             ,ghostel-shell)
-                  :filter #'ghostel--filter
-                  :sentinel #'ghostel--sentinel)))
-      (process-put proc 'conpty-id conpty-id)
-      proc)))
+           (read-process-output-max (max read-process-output-max (* 1024 1024))))
+      (run-hooks 'ghostel-pre-spawn-hook)
+      (let ((proc (make-process
+                   :name "ghostel"
+                   :buffer (current-buffer)
+                   :command `(,proxy-path
+                              "new" ,conpty-id
+                              ,(number-to-string width)
+                              ,(number-to-string height)
+                              ,ghostel-shell)
+                   :filter #'ghostel--filter
+                   :sentinel #'ghostel--sentinel)))
+        (process-put proc 'conpty-id conpty-id)
+        proc))))
 
 (defun ghostel--conpty-proxy-resize (process width height)
   "Resize the ConPTY terminal for PROCESS to WIDTH x HEIGHT."
@@ -4250,47 +4252,6 @@ output is arriving."
              ghostel--term)
     (cl-pushnew window ghostel--windows-needing-snap)
     (ghostel--invalidate)))
-
-(defun ghostel--commit-cropped-size (window)
-  "Commit WINDOW's size if the user focused into a cropped ghostel window.
-When the minibuffer opens, `ghostel--window-adjust-process-window-size'
-skips the resize so the PTY keeps its original row count and the bottom
-rows are just hidden.  But if the user switches focus into the ghostel
-window while the minibuffer is still up, they are now actively using
-the smaller viewport — commit the size so the shell/app knows its real
-dimensions.
-
-Intended for buffer-local `window-selection-change-functions'.  When
-registered buffer-locally, Emacs calls this with WINDOW and makes its
-buffer current; we only commit when WINDOW has become the selected
-window (not when it has just been deselected)."
-  (when (and (> (minibuffer-depth) 0)
-             (window-live-p window)
-             (eq window (frame-selected-window (window-frame window)))
-             ghostel--term
-             ghostel--process
-             (process-live-p ghostel--process))
-    (let ((height (with-selected-window window
-                    (floor (window-screen-lines))))
-          (width (window-max-chars-per-line window))
-          (buf (current-buffer)))
-      (unless (and (eql height ghostel--term-rows)
-                   (eql width ghostel--term-cols))
-        (ghostel--set-size-with-cell-dims ghostel--term
-                           (max 1 height) (max 1 width))
-        (setq ghostel--term-rows height
-              ghostel--term-cols width
-              ghostel--force-next-redraw t)
-        (when (eq system-type 'windows-nt)
-          (ghostel--conpty-proxy-resize ghostel--process width height))
-        (unless (eq system-type 'windows-nt)
-          (set-process-window-size ghostel--process
-                                   (max 1 height) (max 1 width)))
-        (when ghostel--redraw-timer
-          (cancel-timer ghostel--redraw-timer)
-          (setq ghostel--redraw-timer nil))
-        (let ((ghostel--redraw-resize-active t))
-          (ghostel--delayed-redraw buf))))))
 
 ;;; Major mode
 
