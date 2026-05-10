@@ -36,6 +36,14 @@
 (declare-function ghostel--alt-screen-p "ghostel-module")
 (declare-function ghostel--mode-enabled "ghostel-module")
 (declare-function ghostel--module-version "ghostel-module")
+(declare-function ghostel--encode-key "ghostel-module")
+(declare-function ghostel--new "ghostel-module")
+(declare-function ghostel--raw-key-sequence "ghostel")
+(declare-function ghostel--cursor-row-text "ghostel")
+(declare-function ghostel--remote-shell-p "ghostel")
+(declare-function ghostel--password-prompt-detected-p "ghostel")
+(declare-function ghostel--cursor-position "ghostel-module" (term))
+(defvar ghostel--password-mode-p)
 
 ;; Forward declarations for TRAMP symbols read by `ghostel-debug-info'
 ;; that don't exist on every supported Emacs.  The actual reads are
@@ -52,23 +60,148 @@
   "Spawn-time diagnostics for this ghostel buffer, or nil.
 Populated by `ghostel-debug-ghostel'.  A plist with:
   :time, :default-directory, :remote-p
+  :start-process-time — when `ghostel--start-process' was entered
+                        (just before any TRAMP shell-detection round-trip)
   :program, :program-args, :height, :width, :stty-flags, :extra-env
-  :command          — the ((\"/bin/sh\" \"-c\" \"<wrapper>\")) list
-                      that was passed to `make-process'
+  :command          — the wrapper command ghostel passed to
+                      `make-process' (the ((\"/bin/sh\" \"-c\" \"<wrapper>\"))
+                      list).  Captured via `cl-letf*' on `make-process'
+                      so it survives TRAMP's non-direct-async rewriting.
+  :executed-command — what `process-command' returns on the resulting
+                      process.  Equals :command on local + direct-async
+                      spawns; differs (e.g. `(\"/bin/sh\" \"-i\")') on
+                      TRAMP's legacy async path, which dispatches the
+                      real wrapper via the connection shell and uses
+                      a local bridge process for stdio.
   :process-environment — copy taken just before `make-process'
-  :filter-bytes     — first `:filter-cap' bytes of PTY output
-  :filter-cap       — soft cap (bytes) for :filter-bytes
-  :filter-truncated — non-nil if more PTY output arrived after the cap
-  :send-keys        — first `:send-cap' (TIMESTAMP . STRING) sends
+  :filter-events    — list of (TIMESTAMP . CHUNK) PTY-output events,
+                      chronological, capped at `:filter-cap' total bytes
+  :filter-cap       — soft cap (total bytes) for :filter-events
+  :filter-bytes     — running total of bytes appended to :filter-events
+  :filter-truncated — non-nil once cap reached and chunks dropped
+  :send-keys        — list of (TIMESTAMP . STRING) sends, capped at `:send-cap'
   :send-cap         — soft cap (count) for :send-keys
   :send-truncated   — non-nil if more sends arrived after the cap
-Read by `ghostel-debug-info'.")
+Read by `ghostel-debug-info'.  Filter events and sends share a
+single chronological timeline in the report so `sent X, received
+no echo for Ns' is visible at a glance.  Phase timestamps
+\(`:start-process-time' → `:time' → first :filter-events entry)
+isolate where time goes per spawn — elisp prep vs TRAMP/ssh
+handshake vs remote shell startup.")
 
-(defconst ghostel-debug--filter-cap 4096
-  "Soft cap (bytes) on `ghostel-debug--spawn-capture' :filter-bytes.")
+(defvar-local ghostel-debug--pending-start-process-time nil
+  "Buffer-local stash for `ghostel--start-process' entry time.
+Set by `ghostel-debug--capture-start-process' (around-advice) and
+read by `ghostel-debug--capture-spawn-pty' when it builds the
+spawn-capture plist.  Cleared once consumed.")
+
+(defconst ghostel-debug--filter-cap (* 16 1024)
+  "Soft cap (total bytes) on `ghostel-debug--spawn-capture' :filter-events.
+Sized to comfortably cover an initial prompt plus a handful of
+input/echo round-trips so post-spawn behavior (not just the prompt)
+is visible in the timeline.")
 
 (defconst ghostel-debug--send-cap 64
   "Soft cap (entries) on `ghostel-debug--spawn-capture' :send-keys.")
+
+(defconst ghostel-debug--password-events-cap 32
+  "Maximum number of password-detection rising-edge events kept in memory.
+Older entries are dropped FIFO when the ring is full.")
+
+(defvar ghostel-debug--password-events nil
+  "Ring of recent password-prompt rising edges across all ghostel buffers.
+Each entry is a plist:
+  :time          (current-time)
+  :buffer        ghostel buffer (may have been killed)
+  :buffer-name   string snapshot
+  :source        symbol — `zig', `regex-remote', `regex-unknown', or
+                 nil if the underlying signal vanished by the time the
+                 advice re-probed (still useful: indicates a transient)
+  :cursor        (COL . ROW) at the moment of the fire, or nil
+  :row-text      cursor row text, or nil
+  :tty           value of `process-tty-name', or nil
+  :default-dir   `default-directory' at fire time
+  :remote-p      `ghostel--remote-shell-p' result
+
+Populated by `ghostel-debug--log-password-edge', which is added as
+:around advice on `ghostel--detect-password-prompt' by
+`ghostel-debug-start' and removed by `ghostel-debug-stop'.  Inspect
+with `ghostel-debug-password-events-show'.")
+
+(defun ghostel-debug--log-password-edge (orig &rest args)
+  "Around-advice on `ghostel--detect-password-prompt' that records rising edges.
+Called only while `ghostel-debug-start' has installed it.  Wraps ORIG
+\(the unadvised `ghostel--detect-password-prompt') with ARGS, observes
+the `ghostel--password-mode-p' transition from nil to t, and on a fresh
+rising edge pushes a snapshot onto `ghostel-debug--password-events'.
+
+The source attribution (`zig' / `regex-remote' / `regex-unknown') is
+recovered by re-running the probe after the call.  Termios may have
+changed in the microseconds between the original detection and the
+re-probe, so a nil source on a logged event means the rising edge
+fired but the underlying signal vanished by the time we looked again
+\(itself a useful clue when investigating spurious fires)."
+  (let ((was-on ghostel--password-mode-p))
+    (apply orig args)
+    (when (and (not was-on) ghostel--password-mode-p)
+      (let ((event (list :time (current-time)
+                         :buffer (current-buffer)
+                         :buffer-name (buffer-name)
+                         :source (ghostel--password-prompt-detected-p)
+                         :cursor (and ghostel--term
+                                      (ignore-errors
+                                        (ghostel--cursor-position
+                                         ghostel--term)))
+                         :row-text (ghostel--cursor-row-text)
+                         :tty (and ghostel--process
+                                   (process-tty-name ghostel--process))
+                         :default-dir default-directory
+                         :remote-p (ghostel--remote-shell-p))))
+        (push event ghostel-debug--password-events)
+        (when (> (length ghostel-debug--password-events)
+                 ghostel-debug--password-events-cap)
+          (setq ghostel-debug--password-events
+                (cl-subseq ghostel-debug--password-events
+                           0 ghostel-debug--password-events-cap)))))))
+
+;;;###autoload
+(defun ghostel-debug-password-events-show ()
+  "Display recent password-prompt rising edges.
+Shows every fire of `ghostel--detect-password-prompt' along with the
+arm that triggered it (libghostty heuristic / regex on remote / regex
+on unobservable tty), the cursor row text at the moment, and the
+buffer's remote-shell state.  Use this to diagnose spurious
+`read-passwd' prompts: the entry that opened the unwanted minibuffer
+will identify which detection arm misfired."
+  (interactive)
+  (let ((out (get-buffer-create "*ghostel-debug-password*")))
+    (with-current-buffer out
+      (let ((inhibit-read-only t))
+        (fundamental-mode)
+        (erase-buffer)
+        (insert "=== Recent password-prompt rising edges ===\n")
+        (insert (format "(most recent first; cap = %d)\n\n"
+                        ghostel-debug--password-events-cap))
+        (if (null ghostel-debug--password-events)
+            (insert "No events captured yet.\n")
+          (dolist (ev ghostel-debug--password-events)
+            (insert (format "[%s] buffer=%S source=%s\n"
+                            (format-time-string "%F %T.%3N"
+                                                (plist-get ev :time))
+                            (plist-get ev :buffer-name)
+                            (plist-get ev :source)))
+            (insert (format "  cursor=%S  remote-p=%s  tty=%S\n"
+                            (plist-get ev :cursor)
+                            (if (plist-get ev :remote-p) "yes" "no")
+                            (plist-get ev :tty)))
+            (insert (format "  default-directory=%S\n"
+                            (plist-get ev :default-dir)))
+            (insert (format "  row-text=%S\n\n"
+                            (plist-get ev :row-text)))))
+        (goto-char (point-min)))
+      (special-mode))
+    (display-buffer out)
+    (message "Password-event log in *ghostel-debug-password*")))
 
 ;;;###autoload
 (defun ghostel-debug-start ()
@@ -92,6 +225,11 @@ Logs filter calls, key sends, resize events, redraw decisions
   (advice-add 'ghostel--delayed-redraw :around #'ghostel-debug--log-redraw)
   (advice-add 'ghostel--window-adjust-process-window-size
               :around #'ghostel-debug--log-resize)
+  ;; Password-prompt rising edges (events stored in
+  ;; `ghostel-debug--password-events', viewable via
+  ;; `ghostel-debug-password-events-show').
+  (advice-add 'ghostel--detect-password-prompt :around
+              #'ghostel-debug--log-password-edge)
   (when (fboundp 'ghostel--enable-vt-log)
     (ghostel--enable-vt-log))
   (message "ghostel-debug: logging started, check *ghostel-debug* buffer"))
@@ -105,6 +243,8 @@ Logs filter calls, key sends, resize events, redraw decisions
   (advice-remove 'ghostel--delayed-redraw #'ghostel-debug--log-redraw)
   (advice-remove 'ghostel--window-adjust-process-window-size
                  #'ghostel-debug--log-resize)
+  (advice-remove 'ghostel--detect-password-prompt
+                 #'ghostel-debug--log-password-edge)
   (when (fboundp 'ghostel--disable-vt-log)
     (ghostel--disable-vt-log))
   ;; Logging is done — flip the buffer to read-only so the captured log
@@ -519,7 +659,7 @@ omit it when the connection itself is the suspected fault."
             (insert "\n(not in a ghostel buffer — buffer/process/window/terminal sections skipped)\n")
           (let (buf-name maj-mode dir remote modes
                 proc cmd shell shell-integ tramp-integ detected
-                term term-rows term-cols force pending timer copy
+                term term-rows term-cols force pending timer input-mode
                 input-bytes input-timer
                 buf-size buf-lines pt dec2026 alt-scr
                 dln-on dln-style spawn-capture)
@@ -545,7 +685,7 @@ omit it when the connection itself is the suspected fault."
                     force ghostel--force-next-redraw
                     pending (length ghostel--pending-output)
                     timer (and ghostel--redraw-timer t)
-                    copy ghostel--copy-mode-active
+                    input-mode ghostel--input-mode
                     input-bytes (apply #'+ (mapcar #'length
                                                    ghostel--input-buffer))
                     input-timer (and ghostel--input-timer t)
@@ -653,8 +793,8 @@ omit it when the connection itself is the suspected fault."
                     (insert (format "Coalesce buffer:     %d bytes  timer: %s\n"
                                     input-bytes
                                     (if input-timer "pending" "none")))
-                    (insert (format "Copy mode:           %s\n"
-                                    (if copy "active" "off"))))
+                    (insert (format "Input mode:          %s\n"
+                                    (or input-mode "(unknown)"))))
                 (insert "Term handle:         nil (no terminal)\n"))
               ;; Size sync — surfaces #192-class bugs.
               ;; Compare term-rows against `floor(window-screen-lines)' (what
@@ -752,6 +892,55 @@ omit it when the connection itself is the suspected fault."
                                   (if remap
                                       (format "%S" remap)
                                     "(none)"))))))))
+        ;; Key encoding probe — show the bytes Ghostel produces for chords
+        ;; that commonly drive `.inputrc' / readline issue reports (#239).
+        ;; Probes a fresh legacy-mode terminal so the bytes are what readline
+        ;; sees in its default state, regardless of whether the live terminal
+        ;; has kitty keyboard / modifyOtherKeys turned on by some app.
+        (insert "\n--- Key encoding (legacy mode) ---\n")
+        (cond
+         ((not (fboundp 'ghostel--encode-key))
+          (insert "(native module not loaded — cannot probe encoder)\n"))
+         (t
+          (let ((probe (ignore-errors (ghostel--new 25 80 100)))
+                (sent nil))
+            (cond
+             ((null probe)
+              (insert "(could not create probe terminal)\n"))
+             (t
+              (cl-letf (((symbol-function 'ghostel--flush-output)
+                         (lambda (s) (setq sent s))))
+                (dolist (chord '(("backspace" ""          "Backspace")
+                                 ("backspace" "ctrl"      "C-Backspace")
+                                 ("backspace" "meta"      "M-Backspace")
+                                 ("f"         "meta"      "M-f")
+                                 ("b"         "meta"      "M-b")
+                                 ("f"         "ctrl,meta" "C-M-f")
+                                 ("v"         "ctrl,meta" "C-M-v")
+                                 ("h"         "ctrl"      "C-h")))
+                  (setq sent nil)
+                  ;; Mirror `ghostel--send-encoded': try encoder, fall back
+                  ;; to the raw-key-sequence path on nil.  Encoder skips
+                  ;; plain Meta+letter when no utf8 is supplied (live
+                  ;; keystrokes don't supply it either) — the fallback
+                  ;; produces ESC + char.
+                  (unless (ghostel--encode-key probe (nth 0 chord)
+                                               (nth 1 chord) nil)
+                    (setq sent (ghostel--raw-key-sequence (nth 0 chord)
+                                                          (nth 1 chord))))
+                  (insert (format "  %-13s → %s\n"
+                                  (nth 2 chord)
+                                  (cond ((null sent) "(no output)")
+                                        ((string-empty-p sent) "(empty)")
+                                        (t (mapconcat
+                                            (lambda (b) (format "0x%02x" b))
+                                            (string-to-list sent) " ")))))))
+              (insert "\nReadline `.inputrc' rules expecting these byte streams:\n")
+              (insert "  \"\\C-?\"     → 0x7f          (Backspace)\n")
+              (insert "  \"\\C-\\b\"    → 0x08          (C-Backspace, also C-h in legacy)\n")
+              (insert "  \"\\eb\"      → 0x1b 0x62     (M-b)\n")
+              (insert "  \"\\e\\C-f\"   → 0x1b 0x06     (C-M-f)\n")
+              (insert "  \"\\e\\C-v\"   → 0x1b 0x16     (C-M-v)\n"))))))
         ;; Non-default ghostel settings
         (insert "\n--- Non-default ghostel settings ---\n")
         (let (changed)
@@ -850,31 +1039,34 @@ and the report should still render usefully on those Emacsen."
                          (length (tramp-compute-multi-hops vec)))
                      (error nil)))))
     (insert (format "Multi-hop length:    %s\n" (or hops "(unknown)"))))
-  ;; The TERM-stripping diagnostic that drove the second #224 fix.
-  ;; If `(getenv "TERM")' equals an entry in the default-toplevel
-  ;; `process-environment', `tramp-local-environment-variable-p'
-  ;; treats it as ambient and strips ghostel's push, leaving the
-  ;; remote shell with `tramp-terminal-type' (= "dumb" by default).
-  (let* ((cur-term (getenv "TERM"))
-         (top-env (default-toplevel-value 'process-environment))
-         (top-term-entry (cl-find-if
-                          (lambda (e)
-                            (and (stringp e)
-                                 (string-prefix-p "TERM=" e)))
-                          top-env))
-         (top-term (and top-term-entry
-                        (substring top-term-entry 5)))
-         (would-strip (and cur-term top-term
-                           (string= cur-term top-term))))
-    (insert (format "TERM (current):      %s\n"
-                    (or cur-term "(unset)")))
-    (insert (format "TERM (toplevel):     %s\n"
-                    (or top-term "(unset)")))
-    (insert (format "TRAMP would strip pushed TERM: %s\n"
-                    (cond (would-strip
-                           "YES — current matches toplevel; ghostel's push\n                                would be filtered as ambient")
-                          ((null cur-term) "n/a (TERM unset)")
-                          (t "no"))))))
+  ;; TERM in the *connection shell* — what TRAMP exports for
+  ;; `process-file' calls and (without our preamble) what the
+  ;; spawned shell would inherit.  Ghostel's spawned shell does
+  ;; NOT see this directly: the on-remote `/bin/sh -c' preamble
+  ;; in `ghostel--remote-term-preamble' overrides TERM via
+  ;; `infocmp xterm-ghostty' before exec'ing the shell.  See the
+  ;; Spawn capture's wrapper command for the actual TERM the
+  ;; spawned shell ends up with.
+  (insert (format "TERM (connection shell): %s\n"
+                  (or (getenv "TERM") "(unset)"))))
+
+(defun ghostel-debug--insert-command-cells (cmd nil-message)
+  "Insert CMD as `program: …' / `args: …' lines.
+CMD is a `make-process' / `process-command'-shaped list (program
+followed by args), or nil.  NIL-MESSAGE is the placeholder shown
+when CMD is nil."
+  (cond
+   ((null cmd) (insert (format "  %s\n" nil-message)))
+   ((not (consp cmd)) (insert (format "  %S\n" cmd)))
+   (t
+    (insert (format "  program: %s\n" (car cmd)))
+    (let ((args (cdr cmd)))
+      (cond
+       ((null args) (insert "  args:    (none)\n"))
+       (t
+        (insert "  args:\n")
+        (dolist (a args)
+          (insert (format "    %s\n" a)))))))))
 
 (defun ghostel-debug--insert-spawn-capture (cap)
   "Render the spawn capture plist CAP into the current buffer.
@@ -907,20 +1099,27 @@ delta is what ghostel + TRAMP actually contributed."
       (dolist (e extra)
         (insert (format "  %s\n" e)))))
   ;; The wrapper script — the single most useful piece for spawn bugs.
+  ;; This is what ghostel passed to `make-process', captured before
+  ;; TRAMP can rewrite it on its non-direct-async dispatch path.
   (let ((cmd (plist-get cap :command)))
     (insert "\nWrapper command sent to `make-process':\n")
-    (cond
-     ((null cmd) (insert "  (nil — make-process did not return a process)\n"))
-     ((not (consp cmd)) (insert (format "  %S\n" cmd)))
-     (t
-      (insert (format "  program: %s\n" (car cmd)))
-      (let ((args (cdr cmd)))
-        (cond
-         ((null args) (insert "  args:    (none)\n"))
-         (t
-          (insert "  args:\n")
-          (dolist (a args)
-            (insert (format "    %s\n" a)))))))))
+    (ghostel-debug--insert-command-cells cmd
+      "(nil — make-process advice did not capture a :command)"))
+  ;; If TRAMP rewrote the command for legacy-async dispatch, the
+  ;; resulting `process-command' won't match what we sent — typically
+  ;; it's a bridge like ("/bin/sh" "-i") that proxies stdio while the
+  ;; real wrapper runs on the remote via the connection shell.  Show
+  ;; the divergence so the path is obvious.
+  (let ((cmd (plist-get cap :command))
+        (executed (plist-get cap :executed-command)))
+    (when (and executed (not (equal cmd executed)))
+      (insert "\nLocal process command (`process-command'):\n")
+      (ghostel-debug--insert-command-cells executed "(unavailable)")
+      (insert
+       (concat "  TRAMP rewrote the command for legacy-async dispatch — the\n"
+               "  wrapper above runs on the remote via the connection shell;\n"
+               "  the bridge process here just proxies stdio.  Direct-async\n"
+               "  would show the wrapper command verbatim in both sections.\n"))))
   ;; process-environment delta — the entries ghostel + TRAMP wove in
   ;; or that differ from the current Emacs env at info-display time.
   ;; Showing only the delta (rather than the full ~100-entry env)
@@ -943,43 +1142,124 @@ delta is what ghostel + TRAMP actually contributed."
         (insert "  Missing vs current (current has these, spawn didn't):\n")
         (dolist (e (sort (copy-sequence removed) #'string<))
           (insert (format "    - %s\n" e)))))))
-  ;; First N bytes of PTY output.  Did bash even start?  Send a
-  ;; prompt?  Echo back garbage?  This is the second-most useful
-  ;; signal after the wrapper script.
-  (let ((bytes (plist-get cap :filter-bytes))
-        (cap-size (plist-get cap :filter-cap))
-        (truncated (plist-get cap :filter-truncated)))
-    (insert (format "\nFirst PTY output (cap=%d bytes, %d captured%s):\n"
-                    cap-size (length bytes)
-                    (if truncated ", more arrived (truncated)" "")))
+  ;; Phase timings — answers `where did the time go per spawn?'.
+  ;; Three deltas: elisp prep (start-process → spawn-pty), TRAMP+ssh
+  ;; handshake (spawn-pty → first PTY byte), and any further wait
+  ;; for the prompt.  See `ghostel-debug--insert-spawn-phase-timings'.
+  (ghostel-debug--insert-spawn-phase-timings cap)
+  ;; Unified RECV/SEND timeline.  Interleaving PTY output and
+  ;; keystrokes by timestamp makes echo gaps obvious — a SEND "l"
+  ;; followed only by another SEND (no RECV "l" between) is the
+  ;; #224 signature.  Keeping them as separate sections (the previous
+  ;; layout) hid that pattern.
+  (ghostel-debug--insert-spawn-timeline cap))
+
+(defun ghostel-debug--insert-spawn-phase-timings (cap)
+  "Render CAP's per-phase timings into the current buffer.
+CAP is the spawn-capture plist (see `ghostel-debug--spawn-capture').
+Shows three checkpoints relative to `ghostel--start-process' entry:
+elisp-prep cost (anything before `make-process' — typically dominated
+by TRAMP shell-detection round-trips), TRAMP+ssh+remote-shell startup
+cost (`make-process' return → first PTY byte), and the inter-byte
+gap between spawn-pty entry and the first byte received from the
+remote shell.
+
+When `:start-process-time' is missing (capture was created from a
+direct `ghostel--spawn-pty' call without going through
+`ghostel--start-process'), the elisp-prep delta is omitted."
+  (let* ((t-sp   (plist-get cap :start-process-time))
+         (t-spawn (plist-get cap :time))
+         (events (plist-get cap :filter-events))
+         (t-first-rx (and events (car (car events)))))
+    (insert "\nPhase timings:\n")
     (cond
-     ((zerop (length bytes))
-      (insert "  (nothing — shell never wrote to its PTY)\n"))
+     ((null t-spawn)
+      (insert "  (no `ghostel--spawn-pty' time recorded)\n"))
+     (t
+      (when t-sp
+        (insert (format "  %8s  ghostel--start-process entered\n" "T0")))
+      (insert (format "  %8s  ghostel--spawn-pty entered%s\n"
+                      (if t-sp
+                          (format "+%dms"
+                                  (round
+                                   (* 1000
+                                      (float-time
+                                       (time-subtract t-spawn t-sp)))))
+                        "T0")
+                      (if t-sp
+                          "  (elisp prep: getent shell, integration setup, env build)"
+                        "")))
+      (cond
+       (t-first-rx
+        (insert (format "  %8s  first PTY byte received  (TRAMP make-process + ssh + remote shell startup)\n"
+                        (format "+%dms"
+                                (round
+                                 (* 1000
+                                    (float-time
+                                     (time-subtract t-first-rx
+                                                    (or t-sp t-spawn))))))))
+        (when t-sp
+          (insert (format "  %8s  ↳ from spawn-pty entry\n"
+                          (format "+%dms"
+                                  (round
+                                   (* 1000
+                                      (float-time
+                                       (time-subtract t-first-rx
+                                                      t-spawn)))))))))
+       (t
+        (insert "  (no PTY output yet — first-byte timing unavailable)\n")))))))
+
+(defun ghostel-debug--insert-spawn-timeline (cap)
+  "Render CAP's interleaved RECV/SEND timeline into the current buffer.
+CAP is the spawn-capture plist (see `ghostel-debug--spawn-capture').
+Long chunks are truncated for display; the full bytes remain in
+the plist."
+  (let* ((t0 (plist-get cap :time))
+         (recv-cap (plist-get cap :filter-cap))
+         (recv-bytes (plist-get cap :filter-bytes))
+         (recv-events (plist-get cap :filter-events))
+         (recv-truncated (plist-get cap :filter-truncated))
+         (send-cap (plist-get cap :send-cap))
+         (sends (plist-get cap :send-keys))
+         (send-truncated (plist-get cap :send-truncated))
+         (events
+          (sort (append
+                 (mapcar (lambda (e)
+                           (list (car e) :recv (cdr e)))
+                         recv-events)
+                 (mapcar (lambda (s)
+                           (list (car s) :send (cdr s))) sends))
+                (lambda (a b) (time-less-p (car a) (car b))))))
+    (insert (format
+             "\nTimeline (RECV cap=%d bytes/%d captured%s; SEND cap=%d/%d captured%s):\n"
+             recv-cap (or recv-bytes 0)
+             (if recv-truncated ", more dropped" "")
+             send-cap (length sends)
+             (if send-truncated ", more dropped" "")))
+    (cond
+     ((null events)
+      (insert "  (no PTY output, no sends — shell never wrote and Emacs never typed)\n"))
      (t
       (let ((print-escape-control-characters t)
-            (print-escape-newlines t))
-        (insert (format "  %s\n" (prin1-to-string bytes)))))))
-  ;; First N keystrokes.  Confirms whether anything left Emacs at all.
-  (let ((keys (plist-get cap :send-keys))
-        (cap-size (plist-get cap :send-cap))
-        (truncated (plist-get cap :send-truncated))
-        (t0 (plist-get cap :time)))
-    (insert (format "\nFirst sends (cap=%d, %d captured%s):\n"
-                    cap-size (length keys)
-                    (if truncated ", more sent (truncated)" "")))
-    (cond
-     ((null keys)
-      (insert "  (no `ghostel--send-string' calls during capture)\n"))
-     (t
-      (let ((print-escape-control-characters t)
-            (print-escape-newlines t))
-        (cl-loop for (ts . s) in keys
-                 for i from 1
-                 do (insert
-                     (format "  %2d. +%6.3fs  %s\n"
-                             i
-                             (float-time (time-subtract ts t0))
-                             (prin1-to-string s)))))))))
+            (print-escape-newlines t)
+            (display-cap 240))
+        (dolist (ev events)
+          (let* ((ts (nth 0 ev))
+                 (kind (nth 1 ev))
+                 (data (nth 2 ev))
+                 (label (if (eq kind :send) "SEND" "RECV"))
+                 (truncated (> (length data) display-cap))
+                 (shown (if truncated
+                            (substring data 0 display-cap)
+                          data)))
+            (insert (format "  +%7.3fs  %s  %s%s\n"
+                            (float-time (time-subtract ts t0))
+                            label
+                            (prin1-to-string shown)
+                            (if truncated
+                                (format " (… +%d bytes)"
+                                        (- (length data) display-cap))
+                              ""))))))))))
 
 (defun ghostel-debug--insert-remote-probes (ghostel-buf)
   "Run live probes against the remote of GHOSTEL-BUF and insert results.
@@ -993,7 +1273,12 @@ Then runs ghostel's actual remote-term preamble inside the same
 probe shell and reports what TERM the spawned shell would inherit.
 This is the load-bearing piece: it answers `what does ghostel's
 shell actually see' rather than `what does TRAMP's connection
-shell export', which is `TERM=dumb' regardless of preamble."
+shell export', which is `TERM=dumb' regardless of preamble.
+
+Last, probes bash version and dumps `~/.inputrc' (or `$INPUTRC'
+when set) so issue reports about readline rules not firing — see
+issue #239 — carry the actual rule file alongside the byte stream
+ghostel produces (rendered locally in the `Key encoding' section)."
   (let* ((preamble (ghostel--remote-term-preamble))
          ;; Strip the trailing "; " so we can append more commands.
          (preamble-clean (replace-regexp-in-string "; *\\'" "" preamble))
@@ -1033,7 +1318,28 @@ shell export', which is `TERM=dumb' regardless of preamble."
            "  echo \"  TERM_PROGRAM=${TERM_PROGRAM:-unset}\"; "
            "  echo \"  TERM_PROGRAM_VERSION=${TERM_PROGRAM_VERSION:-unset}\"; "
            "  echo \"  COLORTERM=${COLORTERM:-unset}\"; "
-           ") 2>&1")))
+           ") 2>&1; "
+           ;; Bash + inputrc probe — answers `.inputrc' issue reports
+           ;; (e.g. #239).  Surfaces bash version, the resolved INPUTRC
+           ;; path, and the file's contents so we can spot $if-term
+           ;; gates, syntax errors, or rules referencing different byte
+           ;; streams than ghostel produces (cross-check against the
+           ;; local `Key encoding' section).  Bound to 80 lines so a
+           ;; large customized inputrc doesn't drown the report.
+           "echo; echo '== bash + inputrc =='; "
+           "if command -v bash >/dev/null 2>&1; then "
+           "  bash --version 2>/dev/null | head -1; "
+           "else echo 'bash: NOT ON PATH'; fi; "
+           "echo \"INPUTRC=${INPUTRC:-unset}\"; "
+           "echo \"HOME=$HOME\"; "
+           "inputrc_path=${INPUTRC:-$HOME/.inputrc}; "
+           "if [ -e \"$inputrc_path\" ]; then "
+           "  lines=$(wc -l < \"$inputrc_path\" 2>/dev/null); "
+           "  echo \"$inputrc_path: $lines lines\"; "
+           "  echo '----- contents (first 80 lines) -----'; "
+           "  head -80 \"$inputrc_path\"; "
+           "  echo '----- end inputrc -----'; "
+           "else echo \"$inputrc_path: missing\"; fi")))
     (with-temp-buffer
       (let* ((default-directory (with-current-buffer ghostel-buf
                                   default-directory))
@@ -1077,22 +1383,40 @@ The new buffer carries a snapshot of:
   TERM preamble for TRAMP spawns — the smoking gun for #224-class
   bugs)
 - the `process-environment' that ghostel was about to push
-- the first ~4 KB of PTY output (did the shell start?  Send a
+- phase timestamps: `ghostel--start-process' entry, `ghostel--spawn-pty'
+  entry, first PTY byte received.  The deltas isolate where time goes
+  per spawn (elisp prep / TRAMP+ssh / remote shell startup) — useful
+  for diagnosing remote-spawn slowness.
+- the first ~16 KB of PTY output (did the shell start?  Send a
   prompt?  Garbage?)
 - the first ~64 keystrokes you typed
 
 ARG is forwarded to `ghostel' (same prefix-argument conventions).
 View the capture with \\[ghostel-debug-info]."
   (interactive "P")
+  (advice-add 'ghostel--start-process :around
+              #'ghostel-debug--capture-start-process)
   (advice-add 'ghostel--spawn-pty :around
               #'ghostel-debug--capture-spawn-pty)
   (unwind-protect
       (ghostel arg)
-    ;; The advice removes itself once `ghostel--spawn-pty' returns,
+    ;; The advices remove themselves once `ghostel--spawn-pty' returns,
     ;; but if the spawn never happened (e.g. user pointed at an
     ;; existing buffer with a live process) clean up here.
+    (advice-remove 'ghostel--start-process
+                   #'ghostel-debug--capture-start-process)
     (advice-remove 'ghostel--spawn-pty
                    #'ghostel-debug--capture-spawn-pty)))
+
+(defun ghostel-debug--capture-start-process (orig &rest args)
+  "Around-advice on `ghostel--start-process' that records its entry time.
+ORIG is the original function; ARGS are forwarded verbatim.  The
+timestamp is stashed buffer-locally so the spawn-pty advice can fold
+it into the spawn-capture plist.  Self-removing — fires at most once."
+  (advice-remove 'ghostel--start-process
+                 #'ghostel-debug--capture-start-process)
+  (setq ghostel-debug--pending-start-process-time (current-time))
+  (apply orig args))
 
 (defun ghostel-debug--capture-spawn-pty
     (orig program program-args height width stty-flags extra-env
@@ -1100,19 +1424,56 @@ View the capture with \\[ghostel-debug-info]."
   "Around-advice on `ghostel--spawn-pty' that snapshots the spawn.
 ORIG is the original function; PROGRAM, PROGRAM-ARGS, HEIGHT, WIDTH,
 STTY-FLAGS, EXTRA-ENV, REMOTE-P are forwarded verbatim and recorded
-into `ghostel-debug--spawn-capture'.  Self-removing — fires at most once."
+into `ghostel-debug--spawn-capture'.  Self-removing — fires at most once.
+
+Captures the wrapper command via `cl-letf*' on `make-process' rather
+than reading `process-command' on the returned process: on TRAMP's
+non-direct-async path `tramp-sh-handle-make-process' substitutes a
+local bridge process (e.g. `/bin/sh -i') for the actual spawn and
+dispatches the real command via the connection shell.  In that case
+`process-command' returns the bridge — useless for diagnosing what
+actually ran on the remote.  The intercept catches the call as ghostel
+made it, before any TRAMP rewriting, so the wrapper section in the
+report stays accurate regardless of TRAMP dispatch path.
+
+Both views are kept: `:command' is what ghostel passed to
+`make-process' (always the meaningful wrapper script), and
+`:executed-command' is what `process-command' reports (post-TRAMP-
+rewrite — handy for telling direct-async vs legacy apart).  When the
+two differ, the renderer flags it."
   (advice-remove 'ghostel--spawn-pty
                  #'ghostel-debug--capture-spawn-pty)
   (let ((spawn-time (current-time))
+        (start-process-time ghostel-debug--pending-start-process-time)
         (spawn-env (copy-sequence process-environment))
-        (spawn-dir default-directory))
-    (let ((proc (funcall orig program program-args height width
-                         stty-flags extra-env remote-p)))
+        (spawn-dir default-directory)
+        (intercepted-cmd nil))
+    ;; Consume the stashed value so a stale entry doesn't survive
+    ;; into a future capture if the user runs ghostel-debug-ghostel
+    ;; again in the same buffer.
+    (setq ghostel-debug--pending-start-process-time nil)
+    (let* ((orig-make-process (symbol-function #'make-process))
+           (proc
+            (cl-letf
+                (((symbol-function #'make-process)
+                  (lambda (&rest plist)
+                    ;; Only capture the OUTERMOST call: with direct-
+                    ;; async, TRAMP's file handler may recursively
+                    ;; call make-process to reach the real spawn —
+                    ;; the first call is ghostel's, which is what
+                    ;; we want.
+                    (unless intercepted-cmd
+                      (setq intercepted-cmd
+                            (plist-get plist :command)))
+                    (apply orig-make-process plist))))
+              (funcall orig program program-args height width
+                       stty-flags extra-env remote-p))))
       ;; `ghostel--spawn-pty' runs in the new ghostel buffer (the
       ;; spawn target), so `setq-local' here lands on the right
       ;; buffer-local.
       (setq ghostel-debug--spawn-capture
             (list :time spawn-time
+                  :start-process-time start-process-time
                   :default-directory spawn-dir
                   :remote-p (and remote-p t)
                   :program program
@@ -1122,10 +1483,12 @@ into `ghostel-debug--spawn-capture'.  Self-removing — fires at most once."
                   :stty-flags stty-flags
                   :extra-env extra-env
                   :process-environment spawn-env
-                  :command (and (processp proc)
-                                (process-command proc))
-                  :filter-bytes ""
+                  :command intercepted-cmd
+                  :executed-command (and (processp proc)
+                                         (process-command proc))
+                  :filter-events nil
                   :filter-cap ghostel-debug--filter-cap
+                  :filter-bytes 0
                   :filter-truncated nil
                   :send-keys nil
                   :send-cap ghostel-debug--send-cap
@@ -1140,15 +1503,18 @@ into `ghostel-debug--spawn-capture'.  Self-removing — fires at most once."
       proc)))
 
 (defun ghostel-debug--capture-filter (proc output)
-  "Append OUTPUT to the capture's :filter-bytes for PROC's buffer.
-Bounded by `:filter-cap'; sets `:filter-truncated' once exceeded."
+  "Append OUTPUT to the capture's :filter-events for PROC's buffer.
+Each call appends a (TIMESTAMP . CHUNK) event so the post-mortem
+report can interleave PTY output with sends on a single timeline.
+Bounded by `:filter-cap' total bytes; sets `:filter-truncated' once
+the cap is hit and further chunks are dropped."
   (when (and (stringp output)
              (buffer-live-p (process-buffer proc)))
     (with-current-buffer (process-buffer proc)
       (when ghostel-debug--spawn-capture
         (let* ((cap (plist-get ghostel-debug--spawn-capture :filter-cap))
-               (cur (plist-get ghostel-debug--spawn-capture :filter-bytes))
-               (room (- cap (length cur))))
+               (total (plist-get ghostel-debug--spawn-capture :filter-bytes))
+               (room (- cap total)))
           (cond
            ((<= room 0)
             (unless (plist-get ghostel-debug--spawn-capture
@@ -1158,10 +1524,16 @@ Bounded by `:filter-cap'; sets `:filter-truncated' once exceeded."
                                :filter-truncated t))))
            (t
             (let* ((take (min room (length output)))
-                   (fits (substring output 0 take)))
+                   (fits (substring output 0 take))
+                   (events (plist-get ghostel-debug--spawn-capture
+                                      :filter-events)))
+              (setq ghostel-debug--spawn-capture
+                    (plist-put ghostel-debug--spawn-capture :filter-events
+                               (append events
+                                       (list (cons (current-time) fits)))))
               (setq ghostel-debug--spawn-capture
                     (plist-put ghostel-debug--spawn-capture :filter-bytes
-                               (concat cur fits)))
+                               (+ total take)))
               (when (> (length output) take)
                 (setq ghostel-debug--spawn-capture
                       (plist-put ghostel-debug--spawn-capture

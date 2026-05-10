@@ -163,9 +163,36 @@ string match -qr '^ghostel(,|$)' -- "$INSIDE_EMACS"; and source "$EMACS_GHOSTEL_
 ```
 </details>
 
-## Key Bindings
+## Input modes
 
-### Terminal mode
+Ghostel offers five eat.el-style input modes.  You enter a ghostel
+buffer in **semi-char mode**; switch modes with the key bindings below
+and watch `mode-line-process` for the current mode indicator.
+
+| Mode        | Indicator | Terminal | Buffer      | Purpose                                       |
+|-------------|-----------|----------|-------------|-----------------------------------------------|
+| semi-char   | *(none)*  | live     | editable    | default — type to terminal, `C-c` reserved    |
+| char        | `:Char`   | live     | editable    | TUI apps — *all* keys go to the terminal      |
+| Emacs       | `:Emacs`  | live     | read-only   | search/read while the terminal keeps running  |
+| copy        | `:Copy`   | frozen   | read-only   | precise text selection without scroll churn   |
+| line        | `:Line`   | live     | editable    | compose input with Emacs keys, send on `RET`  |
+
+### Mode-switch keybindings (available from every live mode)
+
+| Key       | Action                                    |
+|-----------|-------------------------------------------|
+| `C-c C-j` | Switch to semi-char mode (universal exit) |
+| `C-c M-d` | Switch to char mode                       |
+| `C-c C-e` | Switch to Emacs mode                      |
+| `C-c C-t` | Toggle copy mode                          |
+| `C-c C-l` | Switch to line mode                       |
+| `M-RET`   | Char mode only: return to semi-char       |
+
+### Semi-char mode (default)
+
+Most keys are sent to the terminal.  Keys in
+`ghostel-keymap-exceptions` (default: `C-c`, `C-x`, `C-u`, `C-h`,
+`C-g`, `M-x`, `M-o`, `M-:`, `C-\`) pass through to Emacs.
 
 | Key         | Action                                 |
 |-------------|----------------------------------------|
@@ -174,32 +201,60 @@ string match -qr '^ghostel(,|$)' -- "$INSIDE_EMACS"; and source "$EMACS_GHOSTEL_
 | `C-c C-z`   | Send suspend (C-z)                     |
 | `C-c C-d`   | Send EOF (C-d)                         |
 | `C-c C-\`   | Send quit (C-\)                        |
-| `C-c C-t`   | Enter copy mode                        |
 | `C-c M-w`   | Copy entire scrollback to kill ring    |
 | `C-y`       | Yank from kill ring (bracketed paste)  |
 | `M-y`       | Yank-pop (cycle through kill ring)     |
 | `C-c C-y`   | Paste from kill ring                   |
-| `C-c C-l`   | Clear scrollback                       |
+| `C-c M-l`   | Clear scrollback                       |
 | `C-c C-n`   | Jump to next hyperlink                 |
 | `C-c C-p`   | Jump to previous hyperlink             |
-| `C-c M-n`   | Jump to next prompt                    |
-| `C-c M-p`   | Jump to previous prompt                |
+| `C-c M-n`   | Enter Emacs mode and jump to next prompt |
+| `C-c M-p`   | Enter Emacs mode and jump to previous prompt |
 | `C-c C-q`   | Send next key literally (escape hatch) |
 | Mouse wheel | Scroll through scrollback              |
 
-Keys listed in `ghostel-keymap-exceptions` (default: `C-c`, `C-x`, `C-u`,
-`C-h`, `C-g`, `M-x`, `M-o`, `M-:`, `C-\`) pass through to Emacs.
+### Char mode
+
+Entered with `C-c M-d`.  **All** keys (including
+`ghostel-keymap-exceptions`) are sent to the terminal.  Useful for TUI
+apps that want to bind `C-x`, `M-x`, `C-h`, etc. themselves.  `M-RET`
+(or `C-M-m`) is the sole escape hatch.
+
+### Emacs mode
+
+Entered with `C-c C-e`.  **The terminal keeps running**, the buffer is
+read-only, and standard Emacs bindings fall through to the global map.
+`isearch-forward`, `occur`, `M-x`, `C-SPC` + `M-w`, arrow keys, wheel
+scroll — all work unmodified.  The terminal keeps producing output and
+the buffer keeps growing, but your point stays where you navigated it
+(the delayed-redraw path preserves point in Emacs mode).
+
+**Typed keys do not reach the shell** — Emacs mode is a "look but
+don't touch" view.  Self-insert, `RET`, `TAB`, `DEL` fall through to
+the read-only buffer and trigger `text-read-only`, so a stray
+keystroke can't accidentally land at the prompt.  Switch to semi-char
+mode (`C-c C-j`) when you want to type to the shell.  `C-y` is the
+exception: it pastes via bracketed paste as a deliberate action and
+snaps point back to the live cursor.
+
+Use this for searching through scrollback while a build is running,
+filtering streaming logs with `M-x occur`, marking and copying across
+the visible history, or running any buffer-based command over the
+terminal's output without having to freeze it.
 
 ### Copy mode
 
-Enter with `C-c C-t`. Standard Emacs navigation works.
-Normal letter keys exit copy mode and send the key to the terminal.
+Entered with `C-c C-t`.  The terminal is **frozen** — no live output
+updates the buffer until you exit.  Use this when you want to select
+text precisely without the terminal scrolling underneath your cursor.
+The aggressive copy-mode keymap exits on self-insert, so typing a
+letter sends it to the terminal and returns to semi-char mode.
 
 | Key           | Action                           |
 |---------------|----------------------------------|
 | `C-SPC`       | Set mark                         |
 | `M-w` / `C-w` | Copy selection and exit          |
-| `C-n` / `C-p` | Move line (scrolls at edges)     |
+| `C-n` / `C-p` | Move line                        |
 | `M-v` / `C-v` | Scroll page up / down            |
 | `M-<` / `M->` | Jump to top / bottom of buffer   |
 | `C-c C-n`     | Jump to next hyperlink           |
@@ -207,15 +262,61 @@ Normal letter keys exit copy mode and send the key to the terminal.
 | `C-c M-n`     | Jump to next prompt              |
 | `C-c M-p`     | Jump to previous prompt          |
 | `C-l`         | Recenter viewport                |
-| `C-c C-t`     | Exit without copying             |
+| `q`           | Exit without copying             |
 | `a`–`z`       | Exit and send key to terminal    |
 
 Soft-wrapped newlines are automatically stripped from copied text.
 
+### Line mode
+
+Entered with `C-c C-l`.  Line mode buffers the user's input locally in
+Emacs — **no keystrokes are forwarded to the shell** while composing.
+Full Emacs editing (`M-b`, `M-DEL`, `C-y` yank, `transpose-words`,
+etc.) works on the input region.  Pressing `RET` sends the whole line
+to the shell in one write; bash receives it atomically, echoes and
+executes it.
+
+The terminal stays live: output keeps streaming and the buffer keeps
+re-rendering while you compose.  A snapshot/restore step in the
+delayed-redraw path captures the in-progress input before each redraw
+and re-inserts it at the new prompt-end afterwards, so async output
+or a fresh prompt arriving mid-edit does not clobber what you typed.
+After `RET`, line mode stays active — the next prompt is found on the
+following redraw cycle and the input marker moves there.
+
+Line mode uses the terminal cursor as the input-area boundary, so
+REPLs without shell integration (python3, irb, sqlite3, …) work too.
+When OSC 133 prompt markers are present on the cursor's row, the
+prompt prefix is recognised and the input boundary lands right after
+it.
+
+Line mode and fullscreen TUIs (vim, less, htop, …) cannot share the
+same keystroke stream — the TUI needs every key forwarded raw, while
+line mode buffers them locally.  Ghostel handles this transparently:
+when an alt-screen TUI starts, line mode pauses (any in-progress
+input is stashed) and the buffer drops to semi-char so the TUI gets
+its keys.  When the TUI exits, line mode resumes at the new prompt
+and the stashed input is reinstated.  Pressing `C-c C-l` while a TUI
+is already running arms the same auto-resume so line mode activates
+when the TUI exits.  An explicit mode switch (`C-c C-j`,
+`ghostel-char-mode`, etc.) cancels the armed auto-resume.
+
+| Key         | Action                                   |
+|-------------|------------------------------------------|
+| *(letters)* | Edit local input (never sent char-by-char) |
+| `RET`       | Send the whole line to the shell, stay in line mode |
+| `C-c C-c`   | Discard input and send SIGINT, stay in line mode    |
+| `C-d`       | Delete char, or send EOF at empty input  |
+| `M-p` / `M-n` | History ring: previous / next entry    |
+| `C-a`       | Beginning of input on the prompt row, else `beginning-of-line` |
+| `C-c C-j`   | Exit to semi-char mode (discards input)  |
+
+### Scrollback search outside copy mode
+
 The full scrollback is always rendered into the buffer as styled text,
 so `isearch`, `consult-line`, `occur`, `M-x flush-lines`, `C-x h` to
 select all, and any other buffer-based command work across the full
-history — even outside copy mode.
+history in **any** mode that has a read-only buffer (Emacs or copy).
 
 ## Features
 
@@ -244,6 +345,12 @@ history — even outside copy mode.
 - Mouse tracking (press, release, drag) via SGR mouse protocol — TUI apps receive full mouse input
 - Focus events gated by DEC mode 1004
 - Drag-and-drop (file paths and text)
+
+### Password prompt detection
+- When `sudo`, `ssh`, `gpg`, `passwd`, etc. ask for a password, ghostel pops up `read-passwd` and sends the answer through the PTY — keystrokes never flow through Emacs's normal key pipeline, so the password does **not** land in `view-lossage`, the recent-keys ring, or any keyboard-macro recording.
+- Detection mirrors libghostty's heuristic — the slave tty is in canonical mode with echo off — via a tiny `tcgetattr` Zig binding. On a local pty whose foreground program flips `!ECHO` (sudo, ssh's own password prompt, gpg, …), only the libghostty signal fires. The cursor-row regex fallback runs only when the foreground shell is on a remote host (`ghostel--remote-shell-p`, which trusts the TRAMP `default-directory` ghostel keeps in sync via OSC 7), so local raw-mode TUIs like vim or less don't risk false positives from coincidental cursor-row content. The fallback regex defaults to `comint-password-prompt-regexp` — the same regex `M-x shell` and `M-x term` use — so structural anchoring (start-of-line or curated trigger word) keeps `$ echo Password:` and similar shell-typed lines from triggering. See `ghostel-debug-start` / `ghostel-debug-password-events-show` for diagnostics.
+- Mode-line shows ` 🔒Password` while a prompt is open. Wrong-password retries auto-detect (cursor moves to the new prompt row). The wire copy of the password is `clear-string`'d immediately after the send so it doesn't sit in the heap.
+- Extensible via `ghostel-password-prompt-functions` — a chain of `(ROW) -> string-or-nil` sources tried in order. Default reads with `read-passwd`; users prepend their own (auth-source / Keepass / pass / etc) and the default acts as the fallback. The defcustom docstring includes a TRAMP-aware `auth-source-pick-first-password` example.
 
 ### Shell Integration
 - Automatic injection for bash, zsh, and fish — no shell RC edits needed
@@ -755,7 +862,11 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel-other`            | Switch to next terminal or create one        |
 | `M-x ghostel-clear`            | Clear screen and scrollback                  |
 | `M-x ghostel-clear-scrollback` | Clear scrollback only                        |
-| `M-x ghostel-copy-mode`        | Enter copy mode                              |
+| `M-x ghostel-semi-char-mode`   | Switch to semi-char input mode (default)     |
+| `M-x ghostel-char-mode`        | Switch to char input mode                    |
+| `M-x ghostel-emacs-mode`       | Switch to Emacs input mode (read-only, live) |
+| `M-x ghostel-copy-mode`        | Enter copy mode (frozen)                     |
+| `M-x ghostel-line-mode`        | Switch to line input mode                    |
 | `M-x ghostel-copy-all`         | Copy entire scrollback to kill ring          |
 | `M-x ghostel-paste`            | Paste from kill ring                         |
 | `M-x ghostel-send-next-key`    | Send next key literally                      |
@@ -826,11 +937,12 @@ tool gets confused by the unfamiliar `TERM`, set
 
 Commands:
 
-| Command                      | Description                                              |
-|------------------------------|----------------------------------------------------------|
-| `M-x ghostel-compile`        | Prompt for a command and run it (uses `compile-command`) |
-| `M-x ghostel-recompile`      | Re-run the last command in its original directory        |
-| `M-x ghostel-compile-global-mode` | Route *all* `compile`-style calls through ghostel (opt-in) |
+| Command                       | Description                                                                |
+|-------------------------------|----------------------------------------------------------------------------|
+| `M-x ghostel-compile`         | Run a command in a read-only ghostel buffer (uses `compile-command`)       |
+| `C-u M-x ghostel-compile`     | Prompt for the command and run it in an *interactive* (writable) buffer    |
+| `M-x ghostel-recompile`       | Re-run the last command in its original directory (preserves launch mode)  |
+| `M-x ghostel-compile-global-mode` | Route *all* `compile`-style calls through ghostel (opt-in)             |
 
 What a run looks like — the buffer text matches `M-x compile`:
 
@@ -845,6 +957,20 @@ make -j4 test
 Compilation finished at Wed Apr 15 08:30:19, duration 8.20 s
 ```
 
+By default the buffer is **read-only and navigable from the start** —
+just like a `M-x compile` buffer.  `g` reruns, `n`/`p` walk errors
+(parsed once the run finishes), `RET` jumps to the source.
+Keystrokes do *not* reach the running process, so the
+"compile-mode" UX (read coloured output, kill with `C-c C-c`) is
+available even mid-run.
+
+Pass a prefix arg (`C-u M-x ghostel-compile`, mirroring
+`C-u M-x compile`) to launch in **interactive** mode instead — the
+buffer stays writable for the duration of the run, so programs like
+`htop`, `less`, test runners that prompt for input, or anything that
+wants live keystrokes work.  `ghostel-recompile` (`g`) preserves
+whichever mode the buffer was launched in.
+
 When the command finishes, the live process and ghostel renderer are
 torn down and the buffer's major mode is switched to
 `ghostel-compile-view-mode` (derived from `compilation-mode`).  The
@@ -853,9 +979,38 @@ coloured error / line-number faces; the buffer never returns to an
 interactive ghostel terminal — a recompile discards it and starts
 fresh in the original directory.  `mode-line-process` shows
 `:run` while the command is running and `:exit [N]` afterwards, using
-the same faces `M-x compile` uses.
+the same faces `M-x compile` uses.  In an interactive run the marker
+reads `:run/i` instead of `:run` so you can see at a glance that the
+buffer accepts keystrokes.
 
-Keybindings (in `ghostel-compile-view-mode`):
+#### Live mode switching
+
+Sometimes a command turns out to need input — a `read -p`, a `git
+push` password prompt, a test runner asking `y/n`, or you'd like
+to attach to `htop` mid-run.  Two keys switch the buffer's state
+without restarting the process:
+
+| Key                   | Action                                          |
+|-----------------------|-------------------------------------------------|
+| `C-c C-j`             | Switch to interactive (writable terminal)       |
+| `C-c C-e` / `C-c C-t` | Switch back to read-only / compile-mode-style   |
+
+(`C-c C-t` mirrors `ghostel-mode`'s key for entering copy-mode —
+the read-only/navigable state in a regular ghostel terminal — so
+the same muscle memory works in compile buffers.)
+
+Both keys are bound by `ghostel-compile-toggle-mode`, a small
+buffer-local minor mode auto-enabled in compile buffers (so the
+keys don't show up in regular `M-x ghostel` terminals).  They work
+in either run state — the minor-mode keymap takes precedence, so
+your keystrokes are intercepted before they reach the PTY.
+
+Subsequent recompiles preserve whichever state you last switched
+to.  After the run finishes the keys remain bound; calling them
+on a finished buffer is a no-op with a "recompile with `g`
+instead" message.
+
+#### Keybindings (in `ghostel-compile-view-mode`, also active during a read-only run)
 
 | Key             | Action                                                  |
 |-----------------|---------------------------------------------------------|
@@ -864,6 +1019,8 @@ Keybindings (in `ghostel-compile-view-mode`):
 | `RET` / `mouse-2` | Jump to the source of the error under point           |
 | `M-g n` / `M-g p` | Standard `next-error` / `previous-error`              |
 | `C-c C-c`       | `compile-goto-error` (same as RET)                      |
+| `C-c C-k`       | `kill-compilation` — interrupt the running process      |
+| `C-c C-j` / `C-c C-e` / `C-c C-t` | Switch to interactive / read-only (see above) |
 
 These standard `compile` options are honoured:
 
@@ -872,7 +1029,10 @@ These standard `compile` options are honoured:
   written back, and the history list is `compile-history`, so recent
   commands round-trip between the two commands.
 - **`compilation-read-command`** — when nil, `ghostel-compile` runs
-  `compile-command` silently; pass a prefix arg to force the prompt.
+  `compile-command` silently; pass any prefix arg to force the
+  prompt.  The universal prefix (`C-u`) additionally switches the
+  buffer into interactive (writable) mode, mirroring
+  `C-u M-x compile`.
 - **`compilation-ask-about-save`** — modified buffers are offered for
   saving before launching.
 - **`compilation-auto-jump-to-first-error`** — jumps to the first error
@@ -898,10 +1058,21 @@ buffer automatically.
 (ghostel-compile-global-mode 1)
 ```
 
-`grep-mode` falls through to the stock `compilation-start`
-implementation by default, because its output parsing and
-window-management conventions don't fit a live TTY.  Extend
-`ghostel-compile-global-mode-excluded-modes` to opt other modes out.
+How calls are routed:
+
+- Plain `M-x compile` (or any caller passing `MODE=nil`,
+  `compilation-mode`, or a `compilation-mode` subclass) → **read-only**
+  ghostel buffer (the compile-style default).  A subclass is
+  honoured: its error-regexp, font-lock keywords, and keymap take
+  effect when the buffer is finalized.
+- `C-u M-x compile` (i.e. `compilation-start COMMAND t`, the comint
+  variant) → **interactive** ghostel buffer instead of stock
+  `comint-mode`.  You still get a real TTY for the command, just
+  with the writable behaviour the caller asked for.
+- `grep-mode` falls through to the stock `compilation-start`
+  implementation, because its output parsing and window-management
+  conventions don't fit a live TTY.  Extend
+  `ghostel-compile-global-mode-excluded-modes` to opt other modes out.
 
 Ghostel-specific customisation:
 
@@ -1049,34 +1220,38 @@ powering Neovim's built-in terminal.
 
 ### Feature comparison
 
-| Feature                       | ghostel   | vterm   |
-|-------------------------------|-----------|---------|
-| True color (24-bit)           | Yes       | Yes     |
-| OSC 4/10/11 color queries     | Yes       | No      |
-| Bold / italic / faint         | Yes       | Yes     |
-| Underline styles (5 types)    | Yes       | No      |
-| Underline color               | Yes       | No      |
-| Strikethrough                 | Yes       | Yes     |
-| Cursor styles                 | 4 types   | 3 types |
-| OSC 8 hyperlinks              | Yes       | No      |
-| Plain-text URL/file detection | Yes       | No      |
-| OSC 9 / 777 notifications     | Yes       | No      |
-| OSC 9;4 progress reports      | Yes       | No      |
-| Kitty graphics protocol       | Yes       | No      |
-| Kitty keyboard protocol       | Yes       | No      |
-| Mouse passthrough (SGR)       | Yes       | No      |
-| Bracketed paste               | Yes       | Yes     |
-| Alternate screen              | Yes       | Yes     |
-| Shell integration auto-inject | Yes       | No      |
-| Prompt navigation (OSC 133)   | Yes       | Yes     |
-| Elisp eval from shell         | Yes       | Yes     |
-| TRAMP remote terminals        | Yes       | Yes     |
-| OSC 52 clipboard              | Yes       | Yes     |
-| Copy mode                     | Yes       | Yes     |
-| Drag-and-drop                 | Yes       | No      |
-| Auto module download          | Yes       | No      |
-| Scrollback default            | ~5,000    | 1,000   |
-| PTY throughput (plain ASCII)  | 81 MB/s   | 34 MB/s |
+| Feature                       | ghostel  | vterm    |
+|-------------------------------|----------|----------|
+| True color (24-bit)           | ✅       | ✅       |
+| OSC 4/10/11 color queries     | ✅       | ❌       |
+| Bold / italic / faint         | ✅       | ✅       |
+| Underline styles (5 types)    | ✅       | ❌       |
+| Underline color               | ✅       | ❌       |
+| Strikethrough                 | ✅       | ✅       |
+| Cursor styles                 | 4 types  | 3 types  |
+| OSC 8 hyperlinks              | ✅       | ❌       |
+| Plain-text URL/file detection | ✅       | ❌       |
+| OSC 9 / 777 notifications     | ✅       | ❌       |
+| OSC 9;4 progress reports      | ✅       | ❌       |
+| Kitty graphics protocol       | ✅       | ❌       |
+| Kitty keyboard protocol       | ✅       | ❌       |
+| Mouse passthrough (SGR)       | ✅       | ❌       |
+| Bracketed paste               | ✅       | ✅       |
+| Alternate screen              | ✅       | ✅       |
+| Shell integration auto-inject | ✅       | ❌       |
+| Prompt navigation (OSC 133)   | ✅       | ✅       |
+| Elisp eval from shell         | ✅       | ✅       |
+| TRAMP remote terminals        | ✅       | ✅       |
+| OSC 52 clipboard              | ✅       | ✅       |
+| Copy mode                     | ✅       | ✅       |
+| Char mode (runtime toggle)    | ✅       | ❌       |
+| Line mode (local editing)     | ✅       | ❌       |
+| Emacs mode (read-only, live)  | ✅       | ❌       |
+| Drag-and-drop                 | ✅       | ❌       |
+| Password prompt detection     | ✅       | ❌       |
+| Auto module download          | ✅       | ❌       |
+| Scrollback default            | ~5,000   | 1,000    |
+| PTY throughput (plain ASCII)  | 81 MB/s  | 34 MB/s  |
 | Default redraw rate           | ~30 fps   | ~10 fps |
 
 ### Key differences
@@ -1092,6 +1267,24 @@ passes them through to the terminal via SGR mouse protocol.  TUI apps like
 htop or lazygit receive full mouse input.  vterm intercepts mouse clicks for
 Emacs point movement and does not forward them to the terminal.
 
+**Input modes.**  Ghostel offers five eat.el-style input modes (semi-char,
+char, Emacs, copy, line) selected from a single base keymap; see the
+[Input modes](#input-modes) section above.  vterm's default mode is
+roughly equivalent to ghostel's semi-char (a similar set of reserved
+prefixes via `vterm-keymap-exceptions`), and `vterm-copy-mode` lines up
+with our copy mode — both freeze incoming output (vterm via XOFF flow
+control, ghostel by cancelling the redraw timer).  Three of ghostel's
+modes have no vterm equivalent: **line mode** buffers input locally so
+full Emacs editing (`M-b`, `M-DEL`, yank, `transpose-words`, history
+ring) works on the in-progress line and `RET` sends it atomically;
+**Emacs mode** keeps the terminal streaming live but locks the buffer
+read-only, so `isearch`, `occur`, `M-x flush-lines`, and the rest of
+Emacs's vocabulary work over the live log without freezing it; **char
+mode** is a runtime toggle that bypasses the keymap exceptions and
+forwards every key (including `C-c`, `C-x`, `M-x`) to the terminal — vterm
+requires editing `vterm-keymap-exceptions` and reloading the buffer to
+get the same effect.
+
 **Rendering.**  Both use text properties (not overlays) and batch consecutive
 cells with identical styles.  Ghostel's engine provides three-level dirty
 tracking (none / partial / full) with per-row granularity.  vterm uses
@@ -1102,6 +1295,16 @@ defaults to ~30 fps redraw; vterm defaults to ~10 fps.
 bash, zsh, and fish — no shell RC changes needed.  vterm requires manually
 sourcing scripts in your shell configuration.  Both support Elisp eval from
 the shell and TRAMP-aware remote directory tracking.
+
+**Password prompts.**  Ghostel detects when the foreground program is reading
+a password (`sudo`, `ssh`, `gpg`, …) and prompts via `read-passwd`, sending
+the answer down the PTY without routing keystrokes through Emacs's normal
+key pipeline.  vterm has no such interception: each character of your
+password is a regular keypress, so it ends up in `view-lossage`, the
+recent-keys ring, and anything else that observes the key pipeline (e.g.
+keyboard macros being recorded).  Ghostel's hook also lets you plug in
+`auth-source` to satisfy known prompts without typing — see
+[Password prompt detection](#password-prompt-detection) above.
 
 **Performance.**  In PTY throughput benchmarks (1 MB streamed through `cat`,
 both backends configured with ~1,000 lines of scrollback), ghostel is

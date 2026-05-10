@@ -12,11 +12,12 @@ const render = @import("render.zig");
 const input = @import("input.zig");
 const kitty_graphics = @import("kitty_graphics.zig");
 const sys = @import("sys.zig");
+const pty = @import("pty.zig");
 
 const c = emacs.c;
 
 /// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.22.1";
+const version = "0.23.0";
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -46,6 +47,7 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--mode-enabled", 2, 2, &fnModeEnabled, "Return t if terminal DEC private MODE is enabled.\n\n(ghostel--mode-enabled TERM MODE)");
     env.bindFunction("ghostel--alt-screen-p", 1, 1, &fnAltScreen, "Return t if terminal is on the alternate screen buffer.\n\n(ghostel--alt-screen-p TERM)");
     env.bindFunction("ghostel--cursor-position", 1, 1, &fnCursorPosition, "Return terminal cursor position as (COL . ROW), 0-indexed.\n\n(ghostel--cursor-position TERM)");
+    env.bindFunction("ghostel--cursor-row-char-offset", 1, 1, &fnCursorRowCharOffset, "Return cursor's Emacs char offset from its row's start.\n\n(ghostel--cursor-row-char-offset TERM)");
     env.bindFunction("ghostel--debug-state", 1, 1, &fnDebugState, "Return debug info about terminal/render state.\n\n(ghostel--debug-state TERM)");
     env.bindFunction("ghostel--debug-feed", 2, 2, &fnDebugFeed, "Feed STR to terminal and return first row + cursor.\n\n(ghostel--debug-feed TERM STR)");
     env.bindFunction("ghostel--copy-all-text", 1, 1, &fnCopyAllText, "Return entire scrollback as plain text string.\n\n(ghostel--copy-all-text TERM)");
@@ -54,6 +56,7 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     env.bindFunction("ghostel--disable-vt-log", 0, 0, &fnDisableVtLog, "Disable libghostty internal log routing.\n\n(ghostel--disable-vt-log)");
     env.bindFunction("ghostel--native-uri-at", 3, 3, &fnUriAt, "Get URI at ROW-from-bottom and COL.\n\n(ghostel--native-uri-at TERM ROW COL)");
     env.bindFunction("ghostel--conpty-resize", 3, 3, &fnConptyResize, "Resize the ConPTY pseudo-console by writing to the control named pipe.\n\n(ghostel--conpty-resize ID WIDTH HEIGHT)");
+    env.bindFunction("ghostel--pty-password-input-p", 1, 1, &fnPtyPasswordInputP, "Return t if the tty at PATH is in canonical mode with echo off.\n\nThis mirrors libghostty's password-input heuristic.  Returns nil when the path can't be opened, `tcgetattr' fails, or the tty is in some other state.\n\n(ghostel--pty-password-input-p PATH)");
 
     emacs.initSymbols(env);
 
@@ -719,6 +722,14 @@ fn fnGetTitle(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*an
     return if (title) |t| env.makeString(t) else env.nil();
 }
 
+/// (ghostel--pty-password-input-p PATH)
+fn fnPtyPasswordInputP(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    var stack_buf: [1024]u8 = undefined;
+    const path = env.extractString(args[0], &stack_buf) orelse return env.nil();
+    return if (pty.isPasswordMode(path)) env.t() else env.nil();
+}
+
 /// (ghostel--get-pwd TERM)
 fn fnGetPwd(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
     const env = emacs.Env.init(raw_env.?);
@@ -1188,6 +1199,91 @@ fn fnCursorPosition(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _
     _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y, @ptrCast(&cy));
 
     return env.call2(emacs.sym.cons, env.makeInteger(@as(i64, cx)), env.makeInteger(@as(i64, cy)));
+}
+
+/// (ghostel--cursor-row-char-offset TERM)
+/// Return the Emacs character offset of the cursor within its row,
+/// counted from the row's beginning.  Used by line-mode to find the
+/// input boundary without relying on `move-to-column', which uses
+/// `char-width' that disagrees with the terminal column model on
+/// pgtk for box-drawing glyphs (and for any wide cell whose Emacs
+/// width differs from libghostty's grid width).  Returns nil when
+/// the cursor has no value.
+fn fnCursorRowCharOffset(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+
+    const saved_offset = (term.getScrollbar() catch |err| {
+        env.signalErrorf("ghostel: getScrollbar failed: {s}", .{@errorName(err)});
+        return env.nil();
+    }).offset;
+    defer {
+        term.scrollViewport(gt.SCROLL_TOP, 0);
+        term.scrollViewport(gt.SCROLL_DELTA, @intCast(saved_offset));
+    }
+    term.scrollViewport(gt.SCROLL_BOTTOM, 0);
+
+    _ = gt.c.ghostty_render_state_update(term.render_state, term.terminal);
+
+    var cursor_has_value: bool = false;
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_HAS_VALUE, @ptrCast(&cursor_has_value));
+    if (!cursor_has_value) return env.nil();
+
+    var cx: u16 = 0;
+    var cy: u16 = 0;
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_X, @ptrCast(&cx));
+    _ = gt.c.ghostty_render_state_get(term.render_state, gt.RS_DATA_CURSOR_VIEWPORT_Y, @ptrCast(&cy));
+
+    if (cx == 0) return env.makeInteger(0);
+
+    gt.rs.read(term.render_state, gt.RS_DATA_ROW_ITERATOR, &term.row_iterator) catch |err| {
+        env.signalErrorf("ghostel: row-iterator read failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+
+    // Advance iterator to cursor row.
+    {
+        var ri: u16 = 0;
+        while (ri <= cy) : (ri += 1) {
+            if (!gt.rs_row_next(term.row_iterator)) return env.nil();
+        }
+    }
+
+    gt.rs_row.read(term.row_iterator, gt.RS_ROW_DATA_CELLS, &term.row_cells) catch |err| {
+        env.signalErrorf("ghostel: row-cells read failed: {s}", .{@errorName(err)});
+        return env.nil();
+    };
+
+    // Walk cells 0..cx-1, counting Emacs characters.  Spacer tails of
+    // wide cells produce no Emacs character, empty cells map to a
+    // single space, and grapheme-bearing cells contribute their
+    // grapheme count.  Mirrors `positionCursorByCell' in render.zig.
+    var col: u16 = 0;
+    var char_count: i64 = 0;
+    while (col < cx) : (col += 1) {
+        if (!gt.rs_row_cells_next(term.row_cells)) break;
+
+        const graphemes_len = gt.rs_row_cells.get(u32, term.row_cells, gt.RS_CELLS_DATA_GRAPHEMES_LEN) catch |err| {
+            env.signalErrorf("ghostel: graphemes-len read failed: {s}", .{@errorName(err)});
+            return env.nil();
+        };
+        if (graphemes_len == 0) {
+            const raw_cell = gt.rs_row_cells.get(gt.c.GhosttyCell, term.row_cells, gt.c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW) catch |err| {
+                env.signalErrorf("ghostel: raw-cell read failed: {s}", .{@errorName(err)});
+                return env.nil();
+            };
+            const wide = gt.cell.get(c_int, raw_cell, gt.c.GHOSTTY_CELL_DATA_WIDE) catch |err| {
+                env.signalErrorf("ghostel: cell-wide read failed: {s}", .{@errorName(err)});
+                return env.nil();
+            };
+            if (wide == gt.c.GHOSTTY_CELL_WIDE_SPACER_TAIL) continue;
+            char_count += 1;
+        } else {
+            char_count += @intCast(@min(graphemes_len, 16));
+        }
+    }
+
+    return env.makeInteger(char_count);
 }
 
 /// (ghostel--copy-all-text TERM)

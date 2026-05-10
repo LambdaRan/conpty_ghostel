@@ -22,6 +22,13 @@
 ;; header, a "Compilation finished at ..., duration ..." footer, and
 ;; the same `mode-line-process' run/exit faces.
 ;;
+;; By default the buffer is read-only and behaves like a
+;; `compilation-mode' buffer from the start: `g' reruns, `n'/`p'
+;; walk errors, RET jumps to the source.  Pass a prefix arg
+;; (\\[universal-argument] \\[ghostel-compile]) to launch the buffer
+;; in interactive mode instead - keystrokes reach the running
+;; process so programs like `htop', `less', or test prompts work.
+;;
 ;; When the command finishes, the renderer is torn down and the
 ;; buffer's major mode is switched to `ghostel-compile-view-mode'
 ;; (derived from `compilation-mode').  At that point the buffer is a
@@ -29,12 +36,17 @@
 ;; and `next-error' navigation.  It will not return to an interactive
 ;; ghostel terminal — a recompile (`g', `M-x ghostel-recompile')
 ;; discards it and starts fresh in the original `default-directory'.
+;; When invoked from inside the compile buffer, recompile preserves
+;; the launch mode (read-only vs interactive); when invoked from an
+;; unrelated buffer it falls back to the global default (read-only).
 ;;
 ;; Enable `ghostel-compile-global-mode' to route *all* `compile',
 ;; `recompile', `project-compile', ... calls through ghostel.  It
 ;; advises `compilation-start' so every caller benefits without any
-;; further configuration.  `grep-mode' (and comint mode) falls through
-;; to the stock implementation.
+;; further configuration.  `compilation-start' callers asking for
+;; `MODE=t' (the comint variant — \\[universal-argument] \\[compile])
+;; are routed to a writable ghostel terminal instead of comint.
+;; `grep-mode' falls through to the stock implementation.
 ;;
 ;; Standard `compile' options honoured:
 ;;   `compile-command' / `compile-history' (shared with \\[compile])
@@ -136,6 +148,14 @@ survive into the `ghostel-compile-view-mode' buffer after finalize.
 Nil means finalize falls back to the global
 `ghostel-compile-finished-major-mode'.")
 
+(defvar-local ghostel-compile--interactive nil
+  "Non-nil if this run was launched in interactive (writable) mode.
+Nil means the buffer is read-only and navigable like
+`compilation-mode' from the start; non-nil means the buffer behaves
+like an interactive ghostel terminal during the run (keystrokes are
+forwarded to the PTY).  `ghostel-recompile' reads this flag from the
+source buffer so a recompile preserves the launch mode.")
+
 (defvar ghostel-compile-view-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map compilation-mode-map)
@@ -160,16 +180,24 @@ in another window.  `g' runs `ghostel-recompile' instead of
   "Major mode for a finished `ghostel-compile' buffer.
 
 A regular, read-only Emacs buffer.  `g' re-runs the command via
-`ghostel-recompile', `n'/`p' walk errors in the buffer (without
-opening files), RET jumps to the source.  The live process and
-ghostel rendering have been torn down; the buffer will not return
-to a ghostel terminal."
+`ghostel-recompile', `n'/`p' walk errors in the buffer (without opening
+files), RET jumps to the source.  The live process and ghostel rendering
+have been torn down; the buffer will not return to a ghostel terminal.
+
+`ghostel-compile-view-mode-map' is also installed as the buffer's
+local map *during* a read-only run (before the run finishes), so
+the same keys work while the command is still executing."
   :group 'ghostel-compile
   ;; Make sure our keymap actually parents `compilation-mode-map' even
   ;; if it was created earlier — `define-derived-mode' won't reset an
   ;; already-set parent.
   (set-keymap-parent ghostel-compile-view-mode-map compilation-mode-map)
   (setq-local next-error-function #'compilation-next-error-function)
+  ;; Re-enable the live toggle minor mode so `C-c C-j' / `C-c C-e'
+  ;; remain bound on the finished buffer (they error with a clean
+  ;; "No live process" message — better UX than the keys silently
+  ;; disappearing post-finalize).
+  (ghostel-compile-toggle-mode 1)
   ;; Make sure point lands at the top after a successful recompile (and
   ;; that future input doesn't inherit ghostel's terminal-style behaviour).
   (setq-local window-point-insertion-type nil)
@@ -223,10 +251,15 @@ Plain text, matching the `M-x compile' footer format."
             status-word ts (ghostel-compile--format-duration duration))))
 
 (defun ghostel-compile--set-mode-line-running ()
-  "Set `mode-line-process' to the running indicator."
-  (setq mode-line-process
-        (list '(:propertize ":run" face compilation-mode-line-run)
-              'compilation-mode-line-errors))
+  "Set `mode-line-process' to the running indicator.
+Reads `ghostel-compile--interactive' so the indicator reflects the
+*current* run state — `:run' for read-only, `:run/i' for
+interactive.  The toggle commands call this to refresh the marker
+when the user switches state mid-run."
+  (let ((label (if ghostel-compile--interactive ":run/i" ":run")))
+    (setq mode-line-process
+          (list (list :propertize label 'face 'compilation-mode-line-run)
+                'compilation-mode-line-errors)))
   (force-mode-line-update))
 
 (defun ghostel-compile--set-mode-line-exit (exit)
@@ -344,6 +377,10 @@ same as in any compilation buffer."
           (let* ((saved-command command)
                  (saved-start-time start-time)
                  (saved-directory directory)
+                 (saved-interactive ghostel-compile--interactive)
+                 (saved-compilation-arguments
+                  (and (local-variable-p 'compilation-arguments)
+                       compilation-arguments))
                  (target-mode (or ghostel-compile--view-mode-override
                                   ghostel-compile-finished-major-mode)))
             (when target-mode
@@ -352,7 +389,12 @@ same as in any compilation buffer."
                         ghostel-compile--directory saved-directory
                         ghostel-compile--start-time saved-start-time
                         ghostel-compile--last-exit exit
+                        ghostel-compile--interactive saved-interactive
                         ghostel-compile--finalized t)
+            ;; Preserve `compilation-arguments' so `revert-buffer' on
+            ;; the finished buffer still reproduces the same run.
+            (when saved-compilation-arguments
+              (setq-local compilation-arguments saved-compilation-arguments))
             ;; Pin the buffer's `default-directory' to the directory the
             ;; user invoked `ghostel-compile' from, so it doesn't drift if
             ;; the command happened to `cd' elsewhere during the run.
@@ -423,11 +465,13 @@ same as in any compilation buffer."
             (compilation--update-in-progress-mode-line))
           (ghostel-compile--finalize buffer exit (current-time)))))))
 
-(defconst ghostel-compile--stty-flags "erase '^?' iutf8 -ixon -echo"
+(defconst ghostel-compile--stty-flags
+  (concat ghostel--default-stty " -echo")
   "`stty' flags for the compile PTY.
-Matches `ghostel--spawn-pty's flags for non-shell programs, with
-`echo' off so we don't render an echoed copy of the command (which
-users already see in the header).")
+Layers `-echo' on top of `ghostel--default-stty' so we don't render
+an echoed copy of the command (which users already see in the
+header).  `sane' in the baseline turns echo on; the trailing
+`-echo' overrides it.")
 
 (defun ghostel-compile--spawn (command buffer height width)
   "Spawn COMMAND in BUFFER via a PTY sized HEIGHT rows by WIDTH columns.
@@ -497,7 +541,7 @@ local machine happens to have)."
 
 ;;; Buffer management
 
-(defun ghostel-compile--prepare-buffer (name dir)
+(defun ghostel-compile--prepare-buffer (name dir &optional interactive)
   "Return the ghostel buffer named NAME, reset for a fresh run from DIR.
 If a buffer with NAME already exists, the run is prepared in place
 — the buffer is erased and the terminal rebuilt, but the buffer
@@ -510,7 +554,19 @@ before killing it, unless `compilation-always-kill' is non-nil or
 the process has its query-on-exit flag cleared.
 
 Creates the terminal directly — no interactive shell is spawned —
-so there is no remote-integration round-trip on TRAMP buffers."
+so there is no remote-integration round-trip on TRAMP buffers.
+
+When INTERACTIVE is non-nil the buffer keeps the regular
+`ghostel-mode' keymap so keystrokes reach the running process —
+the same UX a user gets from \\[universal-argument]
+\\[ghostel-compile] or from `compilation-start' under
+`ghostel-compile-global-mode' with `MODE=t'.  When INTERACTIVE is
+nil (the default) the buffer is made read-only and the local map is
+set to `ghostel-compile-view-mode-map' so it behaves like a
+`compilation-mode' buffer.  Either way the major mode stays
+`ghostel-mode' during the run so the renderer, redraw timer, and
+resize hooks
+\(all gated on `derived-mode-p \\='ghostel-mode\\=') keep working."
   (let ((existing (get-buffer name)))
     (when existing
       (with-current-buffer existing
@@ -565,12 +621,34 @@ so there is no remote-integration round-trip on TRAMP buffers."
       ;; also fired, but also made state-reset implicit; make it
       ;; explicit here so this helper doesn't have two code paths.
       (ghostel-mode)
+      ;; Wire up `next-error' so `\\[next-error]' / `M-g n' work as soon
+      ;; as errors land, including in the interactive variant.
+      (setq-local next-error-function #'compilation-next-error-function)
+
+      ;; In read-only (compile-style) mode, swap the local keymap to the
+      ;; compile-style one and lock the buffer.  Major mode stays `ghostel-mode'
+      ;; so the renderer/timer/resize hooks (which all gate on `derived-mode-p
+      ;; \\='ghostel-mode\\=') keep working; only input handling changes.
+      (unless interactive
+        (use-local-map ghostel-compile-view-mode-map)
+        (setq buffer-read-only t))
+      ;; Enable the live toggle (`C-c C-j' / `C-c C-e') in compile
+      ;; buffers, regardless of which run mode they're in.  The
+      ;; minor-mode keymap takes precedence over the major-mode map
+      ;; and the buffer-local map, so the keys work in both states.
+      (ghostel-compile-toggle-mode 1)
       (let ((inhibit-read-only t))
         (erase-buffer))
       (setq ghostel--pending-output nil)
       ;; Disable OSC 2 title tracking so a compile command's title
       ;; sequence can't rename the buffer mid-run.
       (setq-local ghostel-set-title-function nil)
+      ;; Disable password-prompt detection: `ghostel-compile--stty-flags'
+      ;; runs the pty in `canonical+!echo' so the compile command isn't
+      ;; double-echoed, but that's exactly the state libghostty's
+      ;; password heuristic looks for - leaving detection on would pop
+      ;; a `read-passwd' minibuffer at the start of every compile.
+      (setq-local ghostel-detect-password-prompts nil)
       (setq ghostel--term (ghostel--new height width ghostel-max-scrollback))
       (setq ghostel--term-rows height)
       (ghostel--apply-palette ghostel--term)
@@ -590,7 +668,9 @@ so there is no remote-integration round-trip on TRAMP buffers."
 
 ;;; Entry points
 
-(defun ghostel-compile--start (command buffer-name dir &optional finished-mode)
+(defun ghostel-compile--start (command buffer-name dir
+                                       &optional finished-mode interactive
+                                       compilation-args)
   "Run COMMAND in BUFFER-NAME from DIR and return the buffer.
 Creates or resets the buffer, spawns COMMAND via `shell-file-name',
 and displays the buffer.  Used by both `ghostel-compile' and the
@@ -600,26 +680,47 @@ FINISHED-MODE, when non-nil, is the major mode to switch the
 buffer into after finalize (overriding
 `ghostel-compile-finished-major-mode').  The advice uses this to
 honour custom compile-mode subclasses the caller passed to
-`compilation-start'."
+`compilation-start'.
+
+INTERACTIVE, when non-nil, runs COMMAND in a writable ghostel terminal.
+
+COMPILATION-ARGS, when non-nil, is the list `(COMMAND MODE
+NAME-FUNCTION HIGHLIGHT-REGEXP)' that gets stored as
+`compilation-arguments' on the buffer so `\\[revert-buffer]' (and
+any other code that walks `compilation-arguments') re-runs via
+`compilation-start' with the original mode/name-function preserved."
   (unless (and command (not (string-blank-p command)))
     (user-error "Empty compile command"))
   (save-some-buffers (not compilation-ask-about-save)
                      compilation-save-buffers-predicate)
-  (let* ((buffer (ghostel-compile--prepare-buffer buffer-name dir))
+  (let* ((buffer (ghostel-compile--prepare-buffer buffer-name dir interactive))
          (outwin (display-buffer buffer '(nil (allow-no-window . t))))
          (start-time (current-time)))
     (with-current-buffer buffer
-      ;; During the run the buffer stays plain `ghostel-mode' so
-      ;; keystrokes reach the process for interactive programs like
-      ;; `htop', `less', or read prompts.  Compile-mode semantics
-      ;; (`g', `n'/`p', error nav) kick in at finalize when the
+      ;; The buffer's major mode stays `ghostel-mode' during the run
+      ;; (so the renderer/timer/resize hooks keep firing).  When
+      ;; INTERACTIVE is non-nil, keystrokes reach the process for
+      ;; programs like `htop', `less', or read prompts; otherwise the
+      ;; buffer is read-only with `compilation-mode'-style keys via
+      ;; `ghostel-compile-view-mode-map' (see `--prepare-buffer').
+      ;; Compile-mode error parsing kicks in at finalize when the
       ;; buffer is switched to `ghostel-compile-view-mode'.
       (setq ghostel-compile--command command
             ghostel-compile--directory dir
             ghostel-compile--start-time start-time
             ghostel-compile--last-exit nil
             ghostel-compile--finalized nil
-            ghostel-compile--view-mode-override finished-mode)
+            ghostel-compile--view-mode-override finished-mode
+            ghostel-compile--interactive interactive)
+      ;; Make `revert-buffer' (and third-party code that walks
+      ;; `compilation-arguments') restart the run via `compilation-start'.
+      ;; Direct callers don't pass a tuple — synthesize one that records
+      ;; the launch mode in the MODE slot so a revert routes through the
+      ;; advice and lands back on the same variant.
+      (setq-local compilation-arguments
+                  (or compilation-args
+                      (list command (and interactive t) nil nil)))
+      (setq-local revert-buffer-function #'compilation-revert-buffer)
       ;; `prepare-buffer' sized the VT from the selected window (no
       ;; display-buffer had happened yet).  `display-buffer' above may
       ;; have placed the buffer in a smaller window — reconcile the VT
@@ -681,7 +782,7 @@ honour custom compile-mode subclasses the caller passed to
     buffer))
 
 ;;;###autoload
-(defun ghostel-compile (command)
+(defun ghostel-compile (command &optional interactive)
   "Run COMMAND in a ghostel terminal with compilation integration.
 
 Like \\[compile], but uses a ghostel buffer so programs that require
@@ -696,6 +797,15 @@ scripts work exactly as in \\[shell-command].  No shell-integration
 setup is required — the process sentinel reports the real exit
 status.
 
+If optional second arg INTERACTIVE is non-nil the buffer is a
+writable ghostel terminal during the run.
+Otherwise (the default) the buffer is read-only and behaves like a
+`compilation-mode' buffer with `g' reruns, `n'/`p' walk errors, etc.
+
+Interactively, prompts for the command if option
+`compilation-read-command' is non-nil, otherwise uses
+`compile-command'.  With prefix arg, always prompts.
+
 Output always scrolls as it arrives (equivalent to
 `compilation-scroll-output' being non-nil).  `compilation-ask-about-save'
 and `compilation-auto-jump-to-first-error' are honoured.  The command
@@ -709,10 +819,12 @@ and `compile-history'."
                               (if (equal (car compile-history) default)
                                   '(compile-history . 1)
                                 'compile-history))
-        default))))
+        default))
+    (consp current-prefix-arg)))
   (unless (equal command (eval compile-command t))
     (setq compile-command command))
-  (ghostel-compile--start command ghostel-compile-buffer-name default-directory))
+  (ghostel-compile--start command ghostel-compile-buffer-name
+                          default-directory nil interactive))
 
 (defun ghostel-recompile (&optional edit-command)
   "Re-run the last `ghostel-compile' command in its original directory.
@@ -725,7 +837,11 @@ local `ghostel-compile--command'), re-runs into THAT buffer — the
 window showing it stays put.  This matches `M-x recompile' in a
 `*compilation*' buffer.  Otherwise falls back to
 `ghostel-compile-buffer-name', and ultimately to `compile-command'
-with the current `default-directory' when no prior run exists."
+with the current `default-directory' when no prior run exists.
+
+The launch mode (read-only vs interactive) is preserved from the
+source buffer's `ghostel-compile--interactive' flag, so a buffer
+launched with \\[universal-argument] reruns interactively."
   (interactive "P")
   (let* ((source (cond
                   ((local-variable-p 'ghostel-compile--command)
@@ -739,7 +855,10 @@ with the current `default-directory' when no prior run exists."
                   default-directory))
          (name (if (buffer-live-p source)
                    (buffer-name source)
-                 ghostel-compile-buffer-name)))
+                 ghostel-compile-buffer-name))
+         (launched-interactive (and (buffer-live-p source)
+                                    (buffer-local-value
+                                     'ghostel-compile--interactive source))))
     (unless (and cmd (not (string-blank-p cmd)))
       (user-error "No previous `ghostel-compile' command to re-run"))
     (when edit-command
@@ -750,7 +869,102 @@ with the current `default-directory' when no prior run exists."
                    'compile-history)))
       (unless (equal cmd (eval compile-command t))
         (setq compile-command cmd)))
-    (ghostel-compile--start cmd name dir)))
+    (ghostel-compile--start cmd name dir nil launched-interactive)))
+
+
+;;; Live toggle: switch between read-only (compile-style) and interactive
+
+(defun ghostel-compile--assert-live-run ()
+  "Signal a `user-error' unless the current buffer has a live compile run.
+Both toggle commands need a live process: switching is meaningful
+only while the command is still running.  Post-finalize there is
+nothing to send keystrokes to, and a non-compile buffer has no
+`ghostel-compile--command' to begin with."
+  (unless (and (derived-mode-p 'ghostel-mode)
+               (local-variable-p 'ghostel-compile--command))
+    (user-error "Not in a `ghostel-compile' buffer"))
+  (unless (and (boundp 'ghostel--process) (process-live-p ghostel--process))
+    (user-error "No live process - recompile with `g' instead")))
+
+(defun ghostel-compile-switch-to-interactive ()
+  "Switch the current `ghostel-compile' run to interactive mode.
+The buffer becomes writable and `ghostel-mode's keymap is
+restored, so keystrokes reach the running process — useful when
+the command turned out to need input (a `read -p', a `git push'
+password prompt, an `htop'-style program).  No-op if the buffer is
+already interactive.
+
+Bound to \\[ghostel-compile-switch-to-interactive] in
+`ghostel-compile-toggle-mode' (active in compile buffers)."
+  (interactive)
+  (ghostel-compile--assert-live-run)
+  (if ghostel-compile--interactive
+      (message "ghostel-compile: already interactive")
+    (setq ghostel-compile--interactive t)
+    (use-local-map ghostel-mode-map)
+    (setq buffer-read-only nil)
+    ;; Place point at the VT cursor so the user's first keystroke
+    ;; lands at the prompt, not at wherever they happened to be
+    ;; navigating in the read-only buffer.
+    (when ghostel--term
+      (let ((rc (ghostel--cursor-position ghostel--term)))
+        (goto-char (point-min))
+        (forward-line (cdr rc))
+        (move-to-column (car rc))))
+    (ghostel-compile--set-mode-line-running)
+    (when ghostel-compile-debug
+      (message "ghostel-compile: switched to interactive"))))
+
+(defun ghostel-compile-switch-to-readonly ()
+  "Switch the current `ghostel-compile' run to read-only/compile-mode-style.
+Restores `ghostel-compile-view-mode-map' as the local map and
+locks the buffer, so `g' reruns, `n'/`p' walk errors, RET jumps —
+the normal `compilation-mode' UX — even while the command keeps
+running.  Subsequent recompiles will preserve this state.  No-op
+if the buffer is already read-only.
+
+Bound to \\[ghostel-compile-switch-to-readonly] in
+`ghostel-compile-toggle-mode' (active in compile buffers)."
+  (interactive)
+  (ghostel-compile--assert-live-run)
+  (if (not ghostel-compile--interactive)
+      (message "ghostel-compile: already read-only")
+    (setq ghostel-compile--interactive nil)
+    (use-local-map ghostel-compile-view-mode-map)
+    (setq buffer-read-only t)
+    (ghostel-compile--set-mode-line-running)
+    (when ghostel-compile-debug
+      (message "ghostel-compile: switched to read-only"))))
+
+(defvar ghostel-compile-toggle-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "C-c C-j") #'ghostel-compile-switch-to-interactive)
+    (define-key m (kbd "C-c C-e") #'ghostel-compile-switch-to-readonly)
+    ;; Mirror `ghostel-mode's `C-c C-t' (= enter copy-mode, the
+    ;; navigable freeze).  Compile-mode read-only state is the
+    ;; closest analogue, so binding it to the same key carries the
+    ;; muscle memory across.
+    (define-key m (kbd "C-c C-t") #'ghostel-compile-switch-to-readonly)
+    m)
+  "Keymap for `ghostel-compile-toggle-mode'.
+\\<ghostel-compile-toggle-mode-map>\\[ghostel-compile-switch-to-interactive] switches to interactive
+\(writable terminal); \\[ghostel-compile-switch-to-readonly] switches
+back to read-only/compile-mode-style.  The latter is also bound to
+the same key `ghostel-mode' uses for entering copy-mode, so muscle
+memory carries across.  The minor-mode keymap takes precedence over
+both `ghostel-mode-map' and the buffer-local
+`ghostel-compile-view-mode-map', so the keys work regardless of
+which run state the buffer is in.")
+
+(define-minor-mode ghostel-compile-toggle-mode
+  "Minor mode providing live mode-switching for `ghostel-compile' buffers.
+Auto-enabled in `ghostel-compile' buffers (both during the run and
+post-finalize).  Off elsewhere — regular `ghostel' terminals don't
+get these bindings.
+
+\\{ghostel-compile-toggle-mode-map}"
+  :lighter nil
+  :keymap ghostel-compile-toggle-mode-map)
 
 
 ;;; ghostel-compile-global-mode — opt-in: advise compilation-start
@@ -769,21 +983,42 @@ opt a specific caller out."
 Falls back to ORIG-FN (with COMMAND, MODE, NAME-FUNCTION,
 HIGHLIGHT-REGEXP, CONTINUE unchanged) when:
 
-- MODE is t — `compilation-start' asks for a comint buffer, which
-  we don't emulate.
 - MODE is in `ghostel-compile-global-mode-excluded-modes' — e.g.
   `grep-mode' by default.
 - CONTINUE is non-nil — the caller wants to append to an existing
   compilation buffer; each `ghostel-compile' run replaces its
   buffer from scratch, so we can't honour that.
 
-Otherwise routes COMMAND through `ghostel-compile--start', honouring
-NAME-FUNCTION for the buffer name and HIGHLIGHT-REGEXP for error
-highlighting."
-  (if (or (eq mode t)
-          continue
-          (memq mode ghostel-compile-global-mode-excluded-modes))
-      (funcall orig-fn command mode name-function highlight-regexp continue)
+Otherwise routes COMMAND through `ghostel-compile--start':
+
+- MODE is nil or `compilation-mode' - read-only ghostel buffer
+- MODE is t - `compilation-start's request for an interactive
+  comint buffer.  We honour the *interactive* part by spawning a
+  writable ghostel terminal (so programs that want a TTY still
+  work) instead of falling through to `comint-mode'.
+- MODE is a `compilation-mode' subclass — read-only ghostel
+  buffer; finalize switches to that subclass so its error-regexp,
+  font-lock keywords, and keymap are honoured.
+
+NAME-FUNCTION drives the buffer name and HIGHLIGHT-REGEXP the
+error highlighting in all cases."
+  (cond
+   ((or continue (memq mode ghostel-compile-global-mode-excluded-modes))
+    (funcall orig-fn command mode name-function highlight-regexp continue))
+   ((eq mode t)
+    ;; Mirror stock `compilation-start': name-of-mode is "compilation"
+    ;; when MODE is t.  Spawn a writable ghostel terminal — same UX
+    ;; the legacy `ghostel-compile' had, so callers asking for an
+    ;; interactive buffer still get one (just rendered by ghostel).
+    (let* ((buf-name (compilation-buffer-name "compilation" t name-function))
+           (buffer (ghostel-compile--start
+                    command buf-name default-directory nil t
+                    (list command mode name-function highlight-regexp))))
+      (when highlight-regexp
+        (with-current-buffer buffer
+          (setq-local compilation-highlight-regexp highlight-regexp)))
+      buffer))
+   (t
     (let* ((actual-mode (or mode 'compilation-mode))
            (name-of-mode
             (replace-regexp-in-string "-mode\\'" ""
@@ -799,13 +1034,14 @@ highlighting."
            ;; from `compilation-mode' and adds our own keybindings.
            (finished-mode (unless (eq actual-mode 'compilation-mode)
                             actual-mode))
-           (buffer (ghostel-compile--start command buf-name
-                                           default-directory
-                                           finished-mode)))
+           (buffer (ghostel-compile--start
+                    command buf-name default-directory
+                    finished-mode nil
+                    (list command mode name-function highlight-regexp))))
       (when highlight-regexp
         (with-current-buffer buffer
           (setq-local compilation-highlight-regexp highlight-regexp)))
-      buffer)))
+      buffer))))
 
 ;;;###autoload
 (define-minor-mode ghostel-compile-global-mode
@@ -816,6 +1052,18 @@ When enabled, advises `compilation-start' so that \\[compile],
 goes through `compilation-start' runs in a ghostel terminal —
 giving you a real TTY for progress bars, colours, and curses tools
 without having to switch commands.
+
+The default routing is read-only: a plain \\[compile] (or any caller
+passing `MODE=nil' / `MODE=compilation-mode') yields a read-only buffer
+that behaves like a `compilation-mode' buffer.  Callers asking for the
+comint variant \(\\[universal-argument] \\[compile], i.e. `MODE=t') are
+routed to a writable ghostel terminal - interactive throughout the run,
+so programs like `htop' or test prompts work - instead of falling
+through to `comint-mode'.  Note: this means `compilation-shell-minor-mode'
+is *not* enabled in the interactive variant - its keymap would shadow
+`ghostel-mode's input handlers and break key forwarding to the PTY.
+Custom `compilation-mode' subclasses yield a read-only buffer that
+finalizes into the subclass.
 
 Modes in `ghostel-compile-global-mode-excluded-modes' (by default,
 `grep-mode') still use the stock implementation, since their output
