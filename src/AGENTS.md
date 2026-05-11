@@ -1,5 +1,11 @@
 # ghostel/src — Zig coding principles
 
+## Architectural guidelines
+
+- Updating the `RenderState` with `ghostty_render_state_update`, directly or indirectly, **consumes** dirty state from the terminal. For this reason, **only** the Renderer (in `Renderer.zig`) may do so. Any other usage of `ghostty_render_state_update` **will** break the `Renderer`.
+- The viewport scroll position must always remain at the position that the `Renderer` left it at. Its position is always intentional and is used to track scrolling. Moving it and not restoring it **will** break the `Renderer`.
+- With the above in mind: If you need information from the rendering process - add ways for the `Renderer` to communicate that information as output from the rendering process. This can be in the form of text properties, buffer local variables. A last resort method is also to add callbacks, but this is more fragile and harder to follow.
+
 ## Error handling
 
 - **Errors are always errors.** Never swallow with bare `catch {}` or `catch continue` unless you can prove the specific error code means "no value" (see below). Log or propagate every real error.
@@ -72,3 +78,13 @@ Any function with `callconv(.c)` is part of a fixed ABI contract with libghostty
 After editing any `.zig` file:
 1. `zig build` — must pass before moving on
 2. Format via Emacs: `(with-current-buffer (find-file-noselect "/path/to/file.zig") (indent-region (point-min) (point-max)) (save-buffer))`
+
+## Logging and Formatting
+
+- **Logging Format:** Always prefix log and signal messages with `ghostel: ` and follow the pattern `ghostel: [function_name] failed: {s}` where `{s}` is the error name.
+- **Line Length:** Keep logic lines within the **80-100 column** range.
+- **Wrapping Logging Calls:** When a `catch` block with logging exceeds the line length, wrap it consistently:
+  ```zig
+  term.setColorForeground(&default_fg) catch |err|
+      env.logErrorf("ghostel: setColorForeground failed: {s}", .{@errorName(err)});
+  ```
