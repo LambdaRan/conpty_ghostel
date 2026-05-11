@@ -24,7 +24,6 @@ const builtin = @import("builtin");
 /// a stray write through this fd can't garble the child's input.
 pub fn isPasswordMode(path: []const u8) bool {
     if (comptime builtin.os.tag == .windows) {
-        _ = path;
         return false;
     }
     const fd = std.posix.open(path, .{

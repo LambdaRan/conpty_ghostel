@@ -4399,15 +4399,17 @@ Two arms:
     own password prompt, gpg, etc.
 
   - cursor-row regex (`ghostel-password-prompt-regex', defaulting to
-    `comint-password-prompt-regexp').  Used only when the libghostty
-    heuristic returns nil AND `ghostel--remote-shell-p' indicates a
-    remote shell - the case where the local pty is in raw mode for ssh
-    forwarding and the remote pty's canonical+!echo isn't visible locally.
+    `comint-password-prompt-regexp').  Used when the libghostty
+    heuristic returns nil AND either (a) `ghostel--remote-shell-p'
+    indicates a remote shell (local pty in raw mode for ssh forwarding,
+    remote pty's canonical+!echo invisible locally), or (b) on Windows
+    where ConPTY has no termios fd — regex is the only signal.
 
 Returns nil on miss, or a symbol naming the arm on hit (`zig' or`regex')."
   (cond
    ((ghostel--probe-password-tty) 'zig)
-   ((and (ghostel--remote-shell-p)
+   ((and (or (ghostel--remote-shell-p)
+             (eq system-type 'windows-nt))
          (ghostel--password-regex-matches-cursor-row-p))
     'regex)))
 

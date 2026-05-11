@@ -1075,6 +1075,10 @@ delta is what ghostel + TRAMP actually contributed."
   (insert (format "Captured at:         %s\n"
                   (format-time-string "%F %T.%3N"
                                       (plist-get cap :time))))
+  (insert (format "Spawn method:         %s\n"
+                  (if (eq (plist-get cap :spawn-method) 'conpty)
+                      "ConPTY (Windows)"
+                    "PTY")))
   (insert (format "default-directory:   %s\n"
                   (plist-get cap :default-directory)))
   (insert (format "Remote-p:            %s\n"
@@ -1085,8 +1089,9 @@ delta is what ghostel + TRAMP actually contributed."
                     (if args (format "%S" args) "(none)"))))
   (insert (format "Geometry:            %sx%s (cols x rows)\n"
                   (plist-get cap :width) (plist-get cap :height)))
-  (insert (format "stty flags:          %s\n"
-                  (plist-get cap :stty-flags)))
+  (unless (eq (plist-get cap :spawn-method) 'conpty)
+    (insert (format "stty flags:          %s\n"
+                    (plist-get cap :stty-flags))))
   (let ((extra (plist-get cap :extra-env)))
     (insert "extra-env:           ")
     (if (null extra)
@@ -1155,26 +1160,41 @@ delta is what ghostel + TRAMP actually contributed."
 CAP is the spawn-capture plist (see `ghostel-debug--spawn-capture').
 Shows three checkpoints relative to `ghostel--start-process' entry:
 elisp-prep cost (anything before `make-process' — typically dominated
-by TRAMP shell-detection round-trips), TRAMP+ssh+remote-shell startup
-cost (`make-process' return → first PTY byte), and the inter-byte
-gap between spawn-pty entry and the first byte received from the
-remote shell.
+by TRAMP shell-detection round-trips), the spawn-to-first-byte gap,
+and the inter-byte gap between spawn entry and the first byte received
+from the shell.
 
 When `:start-process-time' is missing (capture was created from a
-direct `ghostel--spawn-pty' call without going through
-`ghostel--start-process'), the elisp-prep delta is omitted."
+direct spawn call without going through `ghostel--start-process'),
+the elisp-prep delta is omitted."
   (let* ((t-sp   (plist-get cap :start-process-time))
          (t-spawn (plist-get cap :time))
          (events (plist-get cap :filter-events))
-         (t-first-rx (and events (car (car events)))))
+         (t-first-rx (and events (car (car events))))
+         (conpty-p (eq (plist-get cap :spawn-method) 'conpty))
+         (spawn-label (if conpty-p
+                          "ghostel--conpty-proxy-make-process entered"
+                        "ghostel--spawn-pty entered"))
+         (prep-desc (if conpty-p
+                        "  (elisp prep: proxy discovery, env build)"
+                      "  (elisp prep: getent shell, integration setup, env build)"))
+         (first-byte-label (if conpty-p
+                               "first ConPTY output byte received  (proxy start + shell startup)"
+                             "first PTY byte received  (TRAMP make-process + ssh + remote shell startup)"))
+         (byte-from-label (if conpty-p
+                              "  ↳ from ConPTY spawn entry"
+                            "  ↳ from spawn-pty entry")))
     (insert "\nPhase timings:\n")
     (cond
      ((null t-spawn)
-      (insert "  (no `ghostel--spawn-pty' time recorded)\n"))
+      (insert (format "  (no %s time recorded)\n"
+                      (if conpty-p
+                          "ghostel--conpty-proxy-make-process"
+                        "ghostel--spawn-pty"))))
      (t
       (when t-sp
         (insert (format "  %8s  ghostel--start-process entered\n" "T0")))
-      (insert (format "  %8s  ghostel--spawn-pty entered%s\n"
+      (insert (format "  %8s  %s%s\n"
                       (if t-sp
                           (format "+%dms"
                                   (round
@@ -1182,28 +1202,30 @@ direct `ghostel--spawn-pty' call without going through
                                       (float-time
                                        (time-subtract t-spawn t-sp)))))
                         "T0")
-                      (if t-sp
-                          "  (elisp prep: getent shell, integration setup, env build)"
-                        "")))
+                      spawn-label
+                      (if t-sp prep-desc "")))
       (cond
        (t-first-rx
-        (insert (format "  %8s  first PTY byte received  (TRAMP make-process + ssh + remote shell startup)\n"
+        (insert (format "  %8s  %s\n"
                         (format "+%dms"
                                 (round
                                  (* 1000
                                     (float-time
                                      (time-subtract t-first-rx
-                                                    (or t-sp t-spawn))))))))
+                                                    (or t-sp t-spawn))))))
+                        first-byte-label))
         (when t-sp
-          (insert (format "  %8s  ↳ from spawn-pty entry\n"
+          (insert (format "  %8s  %s\n"
                           (format "+%dms"
                                   (round
                                    (* 1000
                                       (float-time
                                        (time-subtract t-first-rx
-                                                      t-spawn)))))))))
+                                                      t-spawn)))))
+                          byte-from-label))))
        (t
-        (insert "  (no PTY output yet — first-byte timing unavailable)\n")))))))
+        (insert (format "  (no %s output yet — first-byte timing unavailable)\n"
+                        (if conpty-p "ConPTY" "PTY")))))))))
 
 (defun ghostel-debug--insert-spawn-timeline (cap)
   "Render CAP's interleaved RECV/SEND timeline into the current buffer.
@@ -1375,15 +1397,16 @@ ghostel produces (rendered locally in the `Key encoding' section)."
   "Like `ghostel', but capture spawn diagnostics into the new buffer.
 
 The new buffer carries a snapshot of:
-- the wrapper script as sent to `make-process' (with the on-remote
+- the wrapper command as sent to `make-process' (with the on-remote
   TERM preamble for TRAMP spawns — the smoking gun for #224-class
   bugs)
 - the `process-environment' that ghostel was about to push
-- phase timestamps: `ghostel--start-process' entry, `ghostel--spawn-pty'
-  entry, first PTY byte received.  The deltas isolate where time goes
-  per spawn (elisp prep / TRAMP+ssh / remote shell startup) — useful
-  for diagnosing remote-spawn slowness.
-- the first ~16 KB of PTY output (did the shell start?  Send a
+- phase timestamps: `ghostel--start-process' entry, spawn entry
+  (`ghostel--spawn-pty' or `ghostel--conpty-proxy-make-process'),
+  first output byte received.  The deltas isolate where time goes
+  per spawn (elisp prep / transport + shell startup) — useful for
+  diagnosing spawn slowness on any platform.
+- the first ~16 KB of output (did the shell start?  Send a
   prompt?  Garbage?)
 - the first ~64 keystrokes you typed
 
@@ -1392,15 +1415,20 @@ View the capture with \\[ghostel-debug-info]."
   (interactive "P")
   (advice-add 'ghostel--start-process :around
               #'ghostel-debug--capture-start-process)
-  (advice-add 'ghostel--spawn-pty :around
-              #'ghostel-debug--capture-spawn-pty)
+  (if (eq system-type 'windows-nt)
+      (advice-add 'ghostel--conpty-proxy-make-process :around
+                  #'ghostel-debug--capture-conpty-spawn)
+    (advice-add 'ghostel--spawn-pty :around
+                #'ghostel-debug--capture-spawn-pty))
   (unwind-protect
       (ghostel arg)
-    ;; The advices remove themselves once `ghostel--spawn-pty' returns,
+    ;; The advices remove themselves once the spawn returns,
     ;; but if the spawn never happened (e.g. user pointed at an
     ;; existing buffer with a live process) clean up here.
     (advice-remove 'ghostel--start-process
                    #'ghostel-debug--capture-start-process)
+    (advice-remove 'ghostel--conpty-proxy-make-process
+                   #'ghostel-debug--capture-conpty-spawn)
     (advice-remove 'ghostel--spawn-pty
                    #'ghostel-debug--capture-spawn-pty)))
 
@@ -1469,6 +1497,7 @@ two differ, the renderer flags it."
       ;; buffer-local.
       (setq ghostel-debug--spawn-capture
             (list :time spawn-time
+                  :spawn-method 'pty
                   :start-process-time start-process-time
                   :default-directory spawn-dir
                   :remote-p (and remote-p t)
@@ -1733,6 +1762,68 @@ process state."
     (display-buffer out)
     (message "Wrote *ghostel-debug-keypress* — paste into the issue")))
 
+
+
+
+;;; ConPTY spawn capture (Windows)
+
+(defun ghostel-debug--capture-conpty-spawn (orig width height &optional extra-env)
+  "Around-advice on `ghostel--conpty-proxy-make-process' that snapshots the spawn.
+ORIG is the original function; WIDTH, HEIGHT, EXTRA-ENV are forwarded
+verbatim and recorded into `ghostel-debug--spawn-capture'.
+Self-removing — fires at most once.
+
+Mirrors `ghostel-debug--capture-spawn-pty' but for the ConPTY path on
+Windows, where the spawn goes through `conpty_proxy.exe' instead of a
+PTY fd.  Captures the conpty-id, proxy path, and the make-process
+command so the diagnostic report can show the same spawn snapshot
+that the PTY path provides on Unix."
+  (advice-remove 'ghostel--conpty-proxy-make-process
+                 #'ghostel-debug--capture-conpty-spawn)
+  (let ((spawn-time (current-time))
+        (start-process-time ghostel-debug--pending-start-process-time)
+        (spawn-env (copy-sequence process-environment))
+        (spawn-dir default-directory)
+        (intercepted-cmd nil))
+    (setq ghostel-debug--pending-start-process-time nil)
+    (let* ((orig-make-process (symbol-function #'make-process))
+           (proc
+            (cl-letf
+                (((symbol-function #'make-process)
+                  (lambda (&rest plist)
+                    (unless intercepted-cmd
+                      (setq intercepted-cmd
+                            (plist-get plist :command)))
+                    (apply orig-make-process plist))))
+              (funcall orig width height extra-env))))
+      (setq ghostel-debug--spawn-capture
+            (list :time spawn-time
+                  :spawn-method 'conpty
+                  :start-process-time start-process-time
+                  :default-directory spawn-dir
+                  :remote-p nil
+                  :program ghostel-shell
+                  :program-args nil
+                  :height height
+                  :width width
+                  :stty-flags nil
+                  :extra-env extra-env
+                  :process-environment spawn-env
+                  :command intercepted-cmd
+                  :executed-command (and (processp proc)
+                                         (process-command proc))
+                  :filter-events nil
+                  :filter-cap ghostel-debug--filter-cap
+                  :filter-bytes 0
+                  :filter-truncated nil
+                  :send-keys nil
+                  :send-cap ghostel-debug--send-cap
+                  :send-truncated nil))
+      (advice-add 'ghostel--filter :before
+                  #'ghostel-debug--capture-filter)
+      (advice-add 'ghostel--send-string :before
+                  #'ghostel-debug--capture-send-string)
+      proc)))
 
 (provide 'ghostel-debug)
 ;;; ghostel-debug.el ends here

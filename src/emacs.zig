@@ -160,15 +160,15 @@ pub const Env = struct {
 
     // --- Vectors ---
 
-    pub fn vecGet(self: Env, vec: Value, i: c_long) Value {
+    pub fn vecGet(self: Env, vec: Value, i: isize) Value {
         return self.raw.vec_get.?(self.raw, vec, i);
     }
 
-    pub fn vecSet(self: Env, vec: Value, i: c_long, value: Value) void {
+    pub fn vecSet(self: Env, vec: Value, i: isize, value: Value) void {
         self.raw.vec_set.?(self.raw, vec, i, value);
     }
 
-    pub fn vecSize(self: Env, vec: Value) c_long {
+    pub fn vecSize(self: Env, vec: Value) isize {
         return self.raw.vec_size.?(self.raw, vec);
     }
 
