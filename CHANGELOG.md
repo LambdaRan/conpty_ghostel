@@ -4,50 +4,188 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Fixed
-- Spurious `read-passwd` minibuffer prompts when the terminal cursor
-  row happened to end in `Password:` / `passphrase:` — typing
-  `echo Password:` at a local shell prompt would pop a password
-  prompt because the regex fallback ran unconditionally whenever
-  the libghostty heuristic returned nil, and the regex itself was
-  anchored only at end-of-line.  The fallback regex now defaults to
-  `comint-password-prompt-regexp` — the same regex `M-x shell` and
-  `M-x term` use — which structurally requires the password word at
-  start-of-line or after a curated trigger word, so a row like
-  `$ echo Password:` is correctly ignored.  The fallback also runs
-  only when `ghostel--remote-shell-p` indicates a remote shell, so
-  local raw-mode TUIs (vim, less, htop) don't risk false positives
-  from coincidental cursor-row content.  Fixes
-  [#244](https://github.com/dakra/ghostel/issues/244).
+## [0.25.0] — 2026-05-11
 
 ### Added
+- `ghostel-mouse-drag-input-mode` defcustom: a bare left click in
+  semi-char mode no longer freezes the buffer into copy mode on
+  press — it only focuses the window and sets point, matching
+  standard Emacs behavior.  A drag switches input mode on release
+  so streaming output cannot clobber the selection; the target
+  mode is `copy` (default; freezes redraws, selection is
+  rock-solid), `emacs` (terminal keeps streaming, buffer becomes
+  read-only), or `nil` (stay in semi-char; scrollback selections
+  still survive, selections over live-redrawn rows can be lost).
+  Closes [#257](https://github.com/dakra/ghostel/issues/257).
+- `ghostel-module-directory` defcustom selects where the compiled
+  native module lives.  Defaults to the package directory (current
+  behavior).  Set it to a path outside the package manager's tree
+  (e.g. elpaca's `repos/` dir, which gets deleted on rebuild) to
+  keep the artifact stable across rebuilds.
+  `M-x ghostel-module-compile` builds in the resource root and
+  moves the artifact into the configured directory.
+- `ghostel-password-prompt-debounce` defcustom (default 0.2s).
+  Ghostel's canonical+!echo heuristic is checked on every redraw
+  (sub-100ms), so short-lived termios flips that ghostty's 200ms
+  poller silently misses became user-visible `read-passwd` popups
+  in ghostel.  The rising edge is now debounced: the source chain
+  only runs if the heuristic still reports password mode at the
+  deadline.  Sub-debounce flickers leave nothing behind except a
+  brief mode-line indicator flash, matching ghostty's transient
+  lock-icon UX.
+
+### Changed
+- `ghostel-download-module` and `M-x ghostel-module-compile` now
+  write to a sibling temp file and `rename-file` it into place.
+  Renaming swaps the directory entry to a fresh inode, so any
+  Emacs still holding the previous file mmap'd retains a valid
+  mapping — updating the native module is safe under a running
+  Emacs and no longer risks crashes on the next code-resolution.
+  Fixes [#247](https://github.com/dakra/ghostel/issues/247).
+- Native module internals: function-registration table reworked
+  for readability and alphabetical ordering; error/logging
+  helpers unified; ergonomic variadic `Env.f("fn", .{…})` replaces
+  the per-arity `callN` family; remaining legacy interop usage
+  removed.  No user-visible API changes, but the Elisp/native
+  pairing changes — the bundled `ghostel-module-version` is bumped
+  and `ghostel--minimum-module-version` is now `0.25.0`.  Use
+  `M-x ghostel-download-module` after updating ghostel.el.
+
+### Fixed
+- An open `read-passwd` minibuffer that ghostel opened auto-cancels
+  on the falling edge of the heuristic.  When the foreground
+  program exits (e.g. the user kills sudo with `C-c C-c` sending
+  Ctrl+C), the prompt now disappears with it instead of waiting
+  for the user to dismiss it.  Three gates ensure ghostel only
+  aborts its own minibuffer (active-flag, minibuffer depth, and
+  the minibuffer-buffer identity captured at open time), so
+  unrelated concurrent minibuffers are never closed.
+
+## [0.24.0] — 2026-05-10
+
+### Added
+- OSC 133 imenu integration: each shell prompt with OSC 133
+  `A`/`B`/`C` markers becomes an imenu entry of the form
+  `<cwd>  <command>`, with the target landing on the prompt
+  prefix's start.  Composes with `consult-imenu`, `imenu-list`,
+  evil's `]m`/`[m`, etc.  The cwd is captured at command-start
+  (OSC 133 `C`) and tracked chronologically, so prompts issued
+  before a `cd` keep the correct directory in their imenu label.
+  Selecting an entry leaves line and copy modes untouched; only
+  semi-char and char modes switch to Emacs mode so point can move.
+- `ghostel-readonly-fake-cursor`: shows a thin hint cursor at the
+  live terminal-cursor position when point has moved away in copy
+  or Emacs mode, so the next-output spot stays visible while the
+  user reads scrollback.  Faces `ghostel-fake-cursor` (hollow) and
+  `ghostel-fake-cursor-box` (solid) are user-customisable; the
+  hollow box uses `:line-width (-1 . -1)` to stay inside the
+  character cell and not reflow the line.  Updates are driven by
+  `pre-redisplay-functions` installed buffer-locally on read-only
+  entry — no `post-command-hook` overhead.
+- Click-to-focus in semi-char mode no longer drops the press when
+  no app is tracking the mouse.  Left mouse-1 falls back to
+  `mouse-drag-region` / `mouse-set-point` / `mouse-set-region`
+  when no DEC mouse-tracking mode (1000/1002/1003) is active, so
+  click-set-point and drag-to-select work in any input mode.
+  (Refined further in 0.25.0 by `ghostel-mouse-drag-input-mode`.)
 - `ghostel-detect-password-prompts` — defcustom (default t) gating
-  the entire detector.  ghostel-compile binds it to nil
-  buffer-locally because compile buffers run with `stty -echo' to
-  avoid double-echoing the command, which puts the pty into the
-  exact `canonical+!echo' state that the libghostty heuristic
-  matches — leaving detection on would pop a `read-passwd'
-  minibuffer at the start of every compile.
+  the entire password-prompt detector.  `ghostel-compile` binds it
+  to nil buffer-locally because compile buffers run with
+  `stty -echo` to avoid double-echoing the command, which puts the
+  pty into the exact `canonical+!echo` state the libghostty
+  heuristic matches — leaving detection on would pop a
+  `read-passwd` minibuffer at the start of every compile.
 - `M-x ghostel-debug-password-events-show` — view the last 32
   password-prompt rising edges with the detection arm that fired
   (`zig` or `regex`), the cursor row text, and the buffer's
   remote-shell state.  Capture is enabled by
-  `M-x ghostel-debug-start` (which installs the advice; the events
-  buffer survives `ghostel-debug-stop`).
+  `M-x ghostel-debug-start`; the events buffer survives
+  `ghostel-debug-stop`.
 
 ### Changed
 - `ghostel-password-prompt-regex` now defaults to
   `comint-password-prompt-regexp` (the same regex `M-x shell`,
   `M-x term`, and eshell use).  The previous default
   (`[Pp]ass\(?:word\|phrase\)[^:]*:[ \t]*\'`) was too permissive
-  and caused the false-positive class above.  Users who want to
-  extend the regex should prefer customizing
+  and caused the false-positive class fixed below.  Users who
+  want to extend the regex should prefer customizing
   `comint-password-prompt-regexp` itself (BEFORE loading ghostel)
   so other Emacs facilities benefit from the same change.
 - `ghostel--password-prompt-detected-p` now returns nil or a
   symbol (`zig` or `regex`) identifying which arm fired.
-  Truthiness is unchanged for callers that treat the return value
-  as a boolean.
+  Truthiness is unchanged for callers that treat the return
+  value as a boolean.
+- Wide-char / emoji rendering is now handled in the native module
+  rather than by an elisp pixel-compensation pass.  The renderer
+  reports glyph adjustments directly, so emoji-heavy output no
+  longer trips the `string-width` vs. pixel-width divergence that
+  used to overflow the window.  Eliminates the `ghostel--has-wide-chars`
+  / `ghostel--compensate-wide-chars` round-trip on every redraw.
+- Native module switched to strict Zig error handling: bare
+  `catch {}` swallow sites in color, PWD-update, and render-state
+  paths now log to `*Messages*` (or signal) with the unified
+  `ghostel: [function] failed: [error]` pattern.  Cursor tracking
+  no longer goes through accessor methods that clobbered render
+  state; the renderer publishes cursor position as buffer-local
+  variables matching what was rendered, which removes a class of
+  subtle bugs.
+
+### Fixed
+- Spurious `read-passwd` minibuffer prompts when the terminal
+  cursor row happened to end in `Password:` / `passphrase:` —
+  typing `echo Password:` at a local shell prompt would pop a
+  password prompt because the regex fallback ran unconditionally
+  whenever the libghostty heuristic returned nil, and the regex
+  itself was anchored only at end-of-line.  The fallback regex
+  now defaults to `comint-password-prompt-regexp` (structurally
+  anchored at start-of-line or after curated trigger words), and
+  the fallback only runs when `ghostel--remote-shell-p` indicates
+  a remote shell — local raw-mode TUIs (vim, less, htop) don't
+  risk false positives from coincidental cursor-row content.
+  Fixes [#244](https://github.com/dakra/ghostel/issues/244).
+- `consult-line`, `consult-imenu`, and other `goto-char` jumps in
+  line mode no longer snap back to the live cursor.  The
+  minibuffer that consult opens resizes the ghostel window twice
+  (open + close); each resize forced a redraw whose anchored-window
+  predicate ignored `window-point`, so the closing resize
+  re-anchored the window and yanked point back to the live cursor.
+  The predicate now also checks `window-point` against the anchor.
+- Several evil-ghostel operator and motion bugs in multi-line TUI
+  input and single-line shell prompts:
+  `dd` / `cc` on a non-cursor row of a multi-line input (pi,
+  ipython, prompt_toolkit) now deletes the line at point instead
+  of the last line; `cw` lands at the start of the deleted range,
+  not at column 0; `dw` on a single trailing space treats it as
+  content in single-line ranges; `0` / `^` skip the shell prompt
+  prefix on prompt rows and fall through to the original motion
+  on scrollback / output rows; `^` / `$` / `0` followed by `i`
+  preserves the navigated column across scrollback; column
+  navigation in normal state survives idle redraws on the
+  cursor's line; `evil-replace`'s paste count matches its delete
+  count when trailing whitespace is stripped.  Underneath: cursor
+  delta math now subtracts scrollback before comparing buffer to
+  viewport rows, and a new `evil-ghostel--shadow-cursor` models
+  the pending terminal cursor between PTY-bound key emits and
+  their echo back through the redraw.
+  Fixes [#218](https://github.com/dakra/ghostel/issues/218).
+- `<mouse-2>` in semi-char or copy mode no longer drops the click
+  when no app is tracking the mouse.  Middle-click now feeds
+  `gui-get-primary-selection` to `ghostel--paste-text` (bracketed
+  paste at the live prompt) when no tracking mode is on, matching
+  the standard X primary-selection paste on Linux.  In copy /
+  Emacs mode with `ghostel-readonly-fast-exit` on, the click
+  exits to the prior input mode first so the paste lands at the
+  prompt; with fast-exit off it pastes in place, mirroring
+  `ghostel-yank` / `C-y`.
+- RET in copy mode no longer dies in `text-read-only` after
+  `ghostel-mouse-press-or-copy-mode` flipped the buffer into copy
+  mode on a focus click.  RET now exits read-only mode (when
+  `ghostel-readonly-fast-exit` is on) and forwards a CR via the
+  encoder; hyperlinks under point still call
+  `ghostel-open-link-at-point` as before.  `C-c C-l` was renamed
+  to `C-c M-l` so the parent map's `ghostel-line-mode` binding is
+  no longer shadowed.
+  Fixes [#251](https://github.com/dakra/ghostel/issues/251).
 
 ## [0.23.0] — 2026-05-08
 

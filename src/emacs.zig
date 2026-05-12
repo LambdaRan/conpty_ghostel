@@ -31,38 +31,28 @@ pub const Env = struct {
 
     // --- Function calls ---
 
-    pub fn funcall(self: Env, func: Value, args: []Value) Value {
-        return self.raw.funcall.?(self.raw, func, @intCast(args.len), args.ptr);
+    pub fn funcall(self: Env, func: Value, args: []const Value) Value {
+        return self.raw.funcall.?(self.raw, func, @intCast(args.len), @constCast(args.ptr));
     }
 
-    pub fn call0(self: Env, func: Value) Value {
-        return self.raw.funcall.?(self.raw, func, 0, null);
+    pub fn f(self: Env, comptime func: []const u8, args: anytype) Value {
+        return self.funcall(@field(sym, func), &self.makeValues(args));
     }
 
-    pub fn call1(self: Env, func: Value, a0: Value) Value {
-        var args = [_]Value{a0};
-        return self.raw.funcall.?(self.raw, func, 1, &args);
+    // --- Accessing values ---
+
+    pub fn set(self: Env, comptime symbol: []const u8, value: anytype) void {
+        _ = self.f("set", .{ @field(sym, symbol), value });
     }
 
-    pub fn call2(self: Env, func: Value, a0: Value, a1: Value) Value {
-        var args = [_]Value{ a0, a1 };
-        return self.raw.funcall.?(self.raw, func, 2, &args);
-    }
-
-    pub fn call3(self: Env, func: Value, a0: Value, a1: Value, a2: Value) Value {
-        var args = [_]Value{ a0, a1, a2 };
-        return self.raw.funcall.?(self.raw, func, 3, &args);
-    }
-
-    pub fn call4(self: Env, func: Value, a0: Value, a1: Value, a2: Value, a3: Value) Value {
-        var args = [_]Value{ a0, a1, a2, a3 };
-        return self.raw.funcall.?(self.raw, func, 4, &args);
+    pub fn symbolValue(self: Env, comptime symbol: []const u8) Value {
+        return self.f("symbol-value", .{@field(sym, symbol)});
     }
 
     // --- Type constructors ---
 
-    pub fn makeList(self: Env, items: []const Value) Value {
-        return self.funcall(sym.list, @constCast(items));
+    pub fn list(self: Env, items: anytype) Value {
+        return self.f("list", items);
     }
 
     pub fn makeInteger(self: Env, n: i64) Value {
@@ -79,6 +69,37 @@ pub const Env = struct {
 
     pub fn makeUserPtr(self: Env, finalizer: ?*const fn (?*anyopaque) callconv(.c) void, ptr: ?*anyopaque) Value {
         return self.raw.make_user_ptr.?(self.raw, finalizer, ptr);
+    }
+
+    pub fn makeValues(self: Env, args: anytype) [std.meta.fields(@TypeOf(args)).len]Value {
+        const fields = std.meta.fields(@TypeOf(args));
+        var converted_args: [fields.len]Value = undefined;
+        inline for (fields, 0..) |field, i| {
+            converted_args[i] = self.makeValue(@field(args, field.name));
+        }
+        return converted_args;
+    }
+
+    pub fn makeValue(self: Env, value: anytype) Value {
+        const T = @TypeOf(value);
+
+        switch (@typeInfo(T)) {
+            .float, .comptime_float => return self.makeFloat(value),
+            .int, .comptime_int => return self.makeInteger(@as(i64, @intCast(value))),
+            .optional => return if (value) |v| self.makeValue(v) else self.nil(),
+            .bool => return if (value) self.t() else self.nil(),
+            .pointer => |ptr| {
+                if (comptime isStringLike(ptr)) return self.makeString(value);
+                if (T == *c.struct_emacs_value_tag) return value;
+            },
+            else => {},
+        }
+
+        @compileError(std.fmt.comptimePrint("Non-supported type: {}", .{T}));
+    }
+
+    pub fn cons(self: Env, car: anytype, cdr: anytype) Value {
+        return self.f("cons", .{ car, cdr });
     }
 
     pub fn getUserPtr(self: Env, comptime T: type, val: Value) ?*T {
@@ -213,78 +234,78 @@ pub const Env = struct {
     pub fn bindFunction(self: Env, name: [*:0]const u8, min_arity: i32, max_arity: i32, func: *const fn (?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value, docstring: [*:0]const u8) void {
         const fun = self.makeFunction(min_arity, max_arity, func, docstring, null);
         const name_sym = self.intern(name);
-        _ = self.call2(self.intern("fset"), name_sym, fun);
+        _ = self.funcall(sym.fset, &[_]Value{ name_sym, fun });
     }
 
     /// Call (provide 'feature).
     pub fn provide(self: Env, feature: [*:0]const u8) void {
-        _ = self.call1(self.intern("provide"), self.intern(feature));
+        _ = self.funcall(sym.provide, &[_]Value{self.intern(feature)});
     }
 
     // --- Buffer helpers ---
 
     pub fn point(self: Env) Value {
-        return self.call0(sym.point);
+        return self.f("point", .{});
     }
 
     pub fn gotoChar(self: Env, pos: Value) void {
-        _ = self.call1(sym.@"goto-char", pos);
+        _ = self.f("goto-char", .{pos});
     }
 
     pub fn gotoCharN(self: Env, pos: i64) void {
-        _ = self.call1(sym.@"goto-char", self.makeInteger(pos));
+        _ = self.f("goto-char", .{pos});
     }
 
     pub fn insert(self: Env, text: []const u8) void {
-        _ = self.call1(sym.insert, self.makeString(text));
+        _ = self.f("insert", .{text});
     }
 
     pub fn forwardLine(self: Env, n: i64) i64 {
-        return self.extractInteger(self.call1(sym.@"forward-line", self.makeInteger(n)));
+        return self.extractInteger(self.f("forward-line", .{n}));
     }
 
     pub fn moveToColumn(self: Env, col: i64) void {
-        _ = self.call1(sym.@"move-to-column", self.makeInteger(col));
+        _ = self.f("move-to-column", .{col});
     }
 
     pub fn eraseBuffer(self: Env) void {
-        _ = self.call0(sym.@"erase-buffer");
+        _ = self.f("erase-buffer", .{});
     }
 
     pub fn lineEndPosition(self: Env) Value {
-        return self.call0(sym.@"line-end-position");
+        return self.f("line-end-position", .{});
     }
 
     pub fn lineBeginningPosition2(self: Env) Value {
-        return self.call1(sym.@"line-beginning-position", self.makeInteger(2));
+        return self.f("line-beginning-position", .{2});
     }
 
     pub fn pointMin(self: Env) Value {
-        return self.call0(sym.@"point-min");
+        return self.f("point-min", .{});
     }
 
     pub fn pointMax(self: Env) Value {
-        return self.call0(sym.@"point-max");
+        return self.f("point-max", .{});
     }
 
     pub fn markMarker(self: Env) Value {
-        return self.call0(sym.@"mark-marker");
+        return self.f("mark-marker", .{});
     }
 
     pub fn markerPosition(self: Env, marker: Value) Value {
-        return self.call1(sym.@"marker-position", marker);
+        return self.f("marker-position", .{marker});
     }
 
     pub fn setMarker(self: Env, marker: Value, pos: Value) Value {
-        return self.call2(sym.@"set-marker", marker, pos);
+        return self.f("set-marker", .{ marker, pos });
     }
 
     pub fn deleteRegion(self: Env, start: Value, end: Value) void {
-        _ = self.call2(sym.@"delete-region", start, end);
+        _ = self.f("delete-region", .{ start, end });
     }
 
     pub fn putTextProperty(self: Env, start: Value, end: Value, prop: Value, value: Value) void {
-        _ = self.call4(sym.@"put-text-property", start, end, prop, value);
+        _ = self.f("put-text-property", .{ start, end, prop, value });
     }
 
     /// Create a unibyte string (for binary data like PNG images).
@@ -297,32 +318,29 @@ pub const Env = struct {
     // --- Logging and debugging ---
 
     /// Signal an error with a message string.
-    pub fn signalError(self: Env, msg: []const u8) void {
+    pub fn signalError(self: Env, comptime msg: []const u8, objects: anytype) void {
         self.nonLocalExitSignal(
-            self.intern("error"),
-            self.call1(self.intern("list"), self.makeString(msg)),
+            sym.@"error",
+            self.f("list", .{self.format("ghostel: " ++ msg, objects)}),
         );
     }
 
-    /// Signal an error with a formatted message string.
-    pub fn signalErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
-        callFmt(self, Env.signalError, fmt, args);
+    pub fn message(self: Env, msg: []const u8, objects: anytype) void {
+        const all_args = [1]Value{self.makeString(msg)} ++ self.makeValues(objects);
+        _ = self.funcall(sym.message, &all_args);
     }
 
-    pub fn message(self: Env, msg: []const u8) void {
-        _ = self.call1(sym.message, self.makeString(msg));
+    pub fn format(self: Env, msg: []const u8, objects: anytype) Value {
+        const all_args = [1]Value{self.makeString(msg)} ++ self.makeValues(objects);
+        return self.funcall(sym.format, &all_args);
     }
 
-    pub fn messagef(self: Env, comptime fmt: []const u8, args: anytype) void {
-        callFmt(self, Env.message, fmt, args);
-    }
-
-    pub fn logError(self: Env, msg: []const u8) void {
-        _ = self.call3(sym.@"display-warning", sym.ghostel, self.makeString(msg), sym.@":error");
-    }
-
-    pub fn logErrorf(self: Env, comptime fmt: []const u8, args: anytype) void {
-        callFmt(self, Env.logError, fmt, args);
+    pub fn logError(self: Env, comptime msg: []const u8, objects: anytype) void {
+        _ = self.f("display-warning", .{
+            sym.ghostel,
+            self.format("ghostel: " ++ msg, objects),
+            sym.@":error",
+        });
     }
 
     /// Writes stack trace as Emacs messages if in debug mode
@@ -332,23 +350,26 @@ pub const Env = struct {
                 var buffer: [4096]u8 = undefined;
                 var writer = std.Io.Writer.fixed(&buffer);
                 const debug_info = std.debug.getSelfDebugInfo() catch |err| {
-                    self.logErrorf("Unable to get debug info: {s}", .{@errorName(err)});
+                    self.logError("Unable to get debug info: %s", .{@errorName(err)});
                     return;
                 };
                 std.debug.writeStackTrace(trace.*, &writer, debug_info, .no_color) catch |err| {
-                    self.logErrorf("Unable to print stack trace: {s}", .{@errorName(err)});
+                    self.logError("Unable to print stack trace: %s", .{@errorName(err)});
                     return;
                 };
-                self.logError(buffer[0..writer.end]);
+                self.logError("%s", .{buffer[0..writer.end]});
             }
         }
     }
 
-    fn callFmt(self: Env, func: anytype, comptime fmt: []const u8, args: anytype) void {
-        var buffer: [1024]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buffer);
-        writer.print(fmt, args) catch {};
-        @call(.auto, func, .{ self, buffer[0..writer.end] });
+    fn isStringLike(comptime ty: std.builtin.Type.Pointer) bool {
+        const child_info = @typeInfo(ty.child);
+        const ret = switch (ty.size) {
+            .slice => ty.child == u8,
+            .one => child_info == .array and child_info.array.child == u8,
+            else => false,
+        };
+        return ret;
     }
 };
 
@@ -358,112 +379,122 @@ pub const Env = struct {
 // stays valid across different emacs_env pointers.
 // ---------------------------------------------------------------------------
 
-pub const Sym = struct {
-    // Common values
-    nil: Value,
-    t: Value,
-
-    // Face property keywords
-    @":foreground": Value,
-    @":background": Value,
-    @":weight": Value,
-    @":slant": Value,
-    @":underline": Value,
-    @":style": Value,
-    @":color": Value,
-    @":strike-through": Value,
-
-    // Face property values
-    bold: Value,
-    light: Value,
-    italic: Value,
-    wave: Value,
-    @"double-line": Value,
-    dot: Value,
-    dash: Value,
-    line: Value,
-    @":font": Value,
-
-    // Built-in functions
-    cons: Value,
-    list: Value,
-    set: Value,
-    @"symbol-value": Value,
-    @"put-text-property": Value,
-    @"goto-char": Value,
-    point: Value,
-    insert: Value,
-    @"forward-line": Value,
-    @"move-to-column": Value,
-    @"erase-buffer": Value,
-    @"line-end-position": Value,
-    @"line-beginning-position": Value,
-    @"point-min": Value,
-    @"point-max": Value,
-    @"delete-region": Value,
-    @"char-before": Value,
-    @"mark-marker": Value,
-    @"marker-position": Value,
-    @"set-marker": Value,
-    ding: Value,
-    @"face-attribute": Value,
-    @"query-font": Value,
-    @"font-at": Value,
-    @"font-get-glyphs": Value,
-    @"selected-window": Value,
-    fontp: Value,
-    @"font-object": Value,
-    @"font-has-char-p": Value,
-
-    // Text properties
-    face: Value,
-    @"help-echo": Value,
-    @"mouse-face": Value,
-    highlight: Value,
-    keymap: Value,
-    default: Value,
-    display: Value,
-    @"min-width": Value,
-    height: Value,
-    @"ghostel-wrap": Value,
-    @"ghostel-prompt": Value,
-    @"ghostel-input": Value,
-
-    // Ghostel symbols
-    @"ghostel-link-map": Value,
-    @"ghostel--set-buffer-face": Value,
-    @"ghostel--set-cursor-style": Value,
-    @"ghostel--update-directory": Value,
-    @"ghostel--osc51-eval": Value,
-    @"ghostel--osc52-handle": Value,
-    @"ghostel--osc133-marker": Value,
-    @"ghostel--handle-notification": Value,
-    @"ghostel--osc-progress": Value,
-    @"ghostel--flush-output": Value,
-    @"ghostel--set-title": Value,
-    @"ghostel--debug-log-vt": Value,
-    @"ghostel--native-uri-at": Value,
-    @"ghostel--native-link-help-echo": Value,
-    @"ghostel--kitty-display-image": Value,
-    @"ghostel--kitty-display-virtual": Value,
-    @"ghostel--kitty-clear": Value,
-    @"ghostel--rendered-font": Value,
-    @"ghostel--cursor-pos": Value,
-    @"ghostel--cursor-char-pos": Value,
-
-    // Debugging and logging
-    message: Value,
-    @"display-warning": Value,
-    @":error": Value,
-    ghostel: Value,
+const interned_symbols = [_][:0]const u8{
+    ":background",
+    ":color",
+    ":error",
+    ":font",
+    ":foreground",
+    ":slant",
+    ":strike-through",
+    ":style",
+    ":underline",
+    ":weight",
+    "bold",
+    "char-before",
+    "cons",
+    "dash",
+    "default",
+    "delete-region",
+    "ding",
+    "display",
+    "display-warning",
+    "dot",
+    "double-line",
+    "erase-buffer",
+    "error",
+    "face",
+    "face-attribute",
+    "font-at",
+    "font-get-glyphs",
+    "font-has-char-p",
+    "font-object",
+    "fontp",
+    "format",
+    "forward-line",
+    "fset",
+    "ghostel",
+    "ghostel--cursor-char-pos",
+    "ghostel--cursor-pos",
+    "ghostel--debug-log-vt",
+    "ghostel--flush-output",
+    "ghostel--handle-notification",
+    "ghostel--kitty-clear",
+    "ghostel--kitty-display-image",
+    "ghostel--kitty-display-virtual",
+    "ghostel--native-link-help-echo",
+    "ghostel--native-uri-at",
+    "ghostel--osc-progress",
+    "ghostel--osc133-marker",
+    "ghostel--osc51-eval",
+    "ghostel--osc52-handle",
+    "ghostel--rendered-font",
+    "ghostel--set-buffer-face",
+    "ghostel--set-cursor-style",
+    "ghostel--set-title",
+    "ghostel--update-directory",
+    "ghostel-input",
+    "ghostel-link-map",
+    "ghostel-prompt",
+    "ghostel-wrap",
+    "goto-char",
+    "height",
+    "help-echo",
+    "highlight",
+    "insert",
+    "italic",
+    "keymap",
+    "light",
+    "line",
+    "line-beginning-position",
+    "line-end-position",
+    "list",
+    "mark-marker",
+    "marker-position",
+    "message",
+    "min-width",
+    "mouse-face",
+    "move-to-column",
+    "nil",
+    "point",
+    "point-max",
+    "point-min",
+    "provide",
+    "put-text-property",
+    "query-font",
+    "selected-window",
+    "set",
+    "set-marker",
+    "symbol-value",
+    "t",
+    "wave",
 };
 
-pub var sym: Sym = undefined;
+fn SymbolCache(comptime symbols: []const [:0]const u8) type {
+    var cache_fields: [symbols.len]std.builtin.Type.StructField = undefined;
+    for (symbols, 0..) |symbol, i| {
+        cache_fields[i] = .{
+            .name = symbol,
+            .type = Value,
+            .default_value_ptr = null,
+            .is_comptime = false,
+            .alignment = @alignOf(Value),
+        };
+    }
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = &cache_fields,
+        .decls = &[_]std.builtin.Type.Declaration{},
+        .is_tuple = false,
+    } });
+}
+
+pub var sym: SymbolCache(&interned_symbols) = undefined;
 
 /// Initialize the global symbol cache.  Must be called once from
 /// emacs_module_init with the environment provided by Emacs.
 pub fn initSymbols(env: Env) void {
-    inline for (std.meta.fields(Sym)) |field| {
+    inline for (std.meta.fields(@TypeOf(sym))) |field| {
         @field(sym, field.name) = env.makeGlobalRef(env.intern(field.name));
     }
 }

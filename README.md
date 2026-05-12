@@ -267,6 +267,28 @@ letter sends it to the terminal and returns to semi-char mode.
 
 Soft-wrapped newlines are automatically stripped from copied text.
 
+### Mouse selection
+
+Click-and-drag inside a ghostel buffer creates a region.  On release,
+`ghostel-mouse-drag-or-set-region` switches input mode so streaming
+terminal output cannot clobber the selection — the target is picked
+by `ghostel-mouse-drag-input-mode` (default `'copy`):
+
+- `'copy` — enter copy mode.  Redraws pause; the selection is
+  stable regardless of where it sits.
+- `'emacs` — enter Emacs mode.  The terminal keeps streaming and the
+  buffer becomes read-only; selections wholly in scrollback survive,
+  selections over rows the live program rewrites can still be lost.
+- `nil` — stay in semi-char.  Same selection-survival guarantees as
+  `'emacs`, but `M-w` is forwarded to the shell so it cannot copy
+  the region — pick this only if you copy via primary selection or
+  the GUI menu.
+
+A pure click without a drag only focuses the window and sets point —
+no mode switch.  When a TUI has DEC mouse-tracking enabled
+(1000/1002/1003 — htop, lazygit, etc.) the click is forwarded to the
+program and none of the above applies.
+
 ### Line mode
 
 Entered with `C-c C-l`.  Line mode buffers the user's input locally in
