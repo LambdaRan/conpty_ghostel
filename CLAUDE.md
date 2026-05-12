@@ -23,10 +23,14 @@ Ghostel 是嵌入 Emacs 的终端模拟器，基于 libghostty-vt 驱动。本�
 
 ## 构建命令
 
-### Windows（本 fork 的主要开发平台）
+### 构建命令 (Windows)
+
+在 MSYS2/Bash 环境下调用 `build.cmd` 需禁用路径转换：
+
+```bash
+MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
 ```
-build.cmd                    # 完整构建：libghostty-vt + ghostel-module.dll
-```
+
 依赖：Zig 0.15.2+，Emacs 头文件从 `C:\Program Files\Emacs\` 自动检测（或设置 `EMACS_INCLUDE_DIR`）。
 
 ### Unix
@@ -90,9 +94,83 @@ libghostty-vt 由 Zig 包管理器获取（见 `build.zig.zon`）。`vendor/ghos
 - `module.zig` CRLF 分支 — Windows 路径跳过 CRLF 规范化（ConPTY 处理行规则）
 - `build.cmd` — 使用 GNU ABI (`-Dtarget=native-native-gnu`) 避免 MSVC libcpmt 冲突；手动从 zig-cache 复制 simdutf.lib + highway.lib
 
-### 上游同步注意事项
+## 上游同步工作流
 
-合并上游时，冲突通常发生在 `ghostel--start-process` (Elisp) 和 `fnWriteInput` (Zig) 中 Windows 条件分支所在的位置。确保 ConPTY 路径与 `ghostel--spawn-pty` 保持功能对等（环境变量、性能设置如 `process-adaptive-read-buffering`、`read-process-output-max`）。
+每次上游发布新版本时执行以下步骤：
+
+### 步骤 1：拉取并合并
+
+```bash
+git fetch upstream
+git log main..upstream/main --oneline --no-decorate   # 查看新增 commit
+git merge upstream/main --no-edit
+```
+
+如果冲突发生，通常出现在以下位置：
+- `src/module.zig` — `bindFunction` 注册区域（上游重构 vs fork 特有函数）
+- `lisp/ghostel.el` — `ghostel--start-process` 中 Windows 条件分支
+- `src/emacs.zig` — Emacs API 封装层
+
+解决冲突原则：
+1. 采用上游的代码风格改进（如：`f` 函数替代 `callN`，多行文档字符串格式）
+2. 保留 fork 特有的 Windows/ConPTY 函数（`ghostel--conpty-resize`、`fnConptyResize` 等）
+3. 新增的上游函数如果与 fork 功能重叠，以前者为准（上游已合入 `ghostel--pty-password-input-p`）
+
+### 步骤 2：审查 ConPTY Patch 影响
+
+对每个上游变更，检查是否影响 fork 特有代码：
+
+| 审查点 | 涉及文件 | 检查方法 |
+|---|---|---|
+| `module.zig` 注册区域 | `src/module.zig:34-178` | `diff upstream/main...HEAD -- src/module.zig` 确认 ConPTY 函数未被覆盖 |
+| CRLF 处理路径 | `src/module.zig` 中 `fnWriteInput` | 检查 `windows-nt` 条件分支逻辑是否完整 |
+| Emacs API 调用方式 | `src/emacs.zig` | 上游重构可能改变调用签名（如 `callN` → `f`）——确保 fork 代码跟上 |
+| Elisp 进程管理 | `lisp/ghostel.el` `ghostel--start-process` | 对比 `ghostel--spawn-pty` 确保 ConPTY 路径环境变量、buffer 设置同步 |
+| 构建脚本 | `build.zig` / `build.zig.zon` | 确认 GNU ABI 目标、依赖版本、libghostty-vt 依赖声明未被覆盖 |
+
+### 步骤 3：逻辑审查清单
+
+合并后逐个检查：
+
+- [ ] `ghostel--conpty-proxy-make-process` 与 `ghostel--spawn-pty` 功能对等（环境变量、`process-adaptive-read-buffering`、`read-process-output-max`）
+- [ ] `ghostel--conpty-proxy-resize` 与 Unix `ioctl` resize 路径功能对等
+- [ ] `ghostel--conpty-resize` (Zig) 注册仍存在
+- [ ] `fnConptyResize` 实现完整（函数签名与注册声明一致）
+- [ ] CRLF 规范化跳过逻辑仍适用（`comptime builtin.os.tag == .windows`）
+- [ ] 上游新增的 OSC handler 在 ConPTY 路径下是否也需要处理
+- [ ] `version` 常量与上游版本号一致
+
+### 步骤 4：构建验证
+
+```bash
+MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
+```
+
+零错误零警告才算通过。
+
+### 步骤 5：总结变更
+
+输出格式：
+```
+## 上游合并总结：vX.Y.Z (N commits)
+
+### 分类 1
+- **变更点** — 一句话描述
+
+### 分类 2
+...
+
+### 冲突解决
+- 文件 — 具体处理方式
+```
+
+### 步骤 6：同步到 Emacs（可选）
+
+```powershell
+Copy-Item E:\lambda\selfcode\conpty_ghostel\ghostel-module.dll C:\emacs-lambda\site-lisp\extensions\ghostel\
+Copy-Item E:\lambda\selfcode\conpty_ghostel\lisp\*.el C:\emacs-lambda\site-lisp\extensions\ghostel\lisp\
+Copy-Item E:\lambda\selfcode\conpty_ghostel\extensions\evil-ghostel\*.el C:\emacs-lambda\site-lisp\extensions\ghostel\extensions\evil-ghostel\
+```
 
 ## 关键约定
 
