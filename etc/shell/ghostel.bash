@@ -19,9 +19,23 @@
 # kernel echo input immediately.
 builtin command stty echo 2>/dev/null
 
+# Capture gethostname(2) for OSC 7.  $HOSTNAME is inherited from the environment;
+# toolbox/container runtimes export it with a value that disagrees with the
+# kernel hostname - so Emacs' (system-name), which calls gethostname(2), would
+# see a mismatch and ghostel would misclassify the buffer as remote, switching
+# on TRAMP.  Bash captures gethostname(2) at startup into the value behind the
+# \H prompt escape; ${var@P} (bash 4.4+) reads it back without forking.
+# On bash <4.4 the @P transform is unavailable, so fall back to $HOSTNAME.
+if ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))); then
+    __ghostel_host=$'\\H'
+    __ghostel_host=${__ghostel_host@P}
+else
+    __ghostel_host=$HOSTNAME
+fi
+
 # Report working directory to the terminal via OSC 7
 __ghostel_osc7() {
-    printf '\e]7;file://%s%s\a' "$HOSTNAME" "$PWD"
+    printf '\e]7;file://%s%s\a' "$__ghostel_host" "$PWD"
 }
 
 # --- Semantic prompt markers (OSC 133) ---
@@ -84,9 +98,14 @@ __ghostel_wrapped_prompt_command() {
     fi
 
     __ghostel_prompt_start
-    __ghostel_osc7
 
     eval "${__ghostel_original_prompt_command:-}"
+
+    # OSC 7 must fire AFTER the user/system PROMPT_COMMAND so we win the race
+    # against competing OSC 7 emitters.  Fedora's /etc/profile.d/vte.sh
+    # registers __vte_prompt_command which emits OSC 7 with $HOSTNAME
+    # (which may be polluted by container/toolbox runtimes; See #276).
+    __ghostel_osc7
 
     local __ghostel_p_initial='\[\e]133;P;k=i\a\]'
     if [[ "$PS1" != *"$__ghostel_p_initial"* ]]; then

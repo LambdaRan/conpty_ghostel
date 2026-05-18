@@ -190,8 +190,18 @@ __ghostel_install_zle_hook() {
     precmd_functions=(${precmd_functions:#__ghostel_install_zle_hook})
 }
 
-precmd_functions=(__ghostel_save_status __ghostel_prompt_start __ghostel_osc7 "${precmd_functions[@]}")
-precmd_functions+=(__ghostel_ensure_prompt_wrap __ghostel_install_zle_hook)
+# `__ghostel_save_status' must run first so $? still reflects the last
+# command.  `__ghostel_prompt_start' emits the OSC 133;D boundary marker
+# for the previous command and is also order-sensitive.
+#
+# `__ghostel_osc7' is APPENDED (not prepended) so we win the race
+# against competing OSC 7 emitters in user/system precmds.  Same
+# rationale as the bash side: libghostty stores whichever OSC 7 fires
+# last per cycle, so a precmd like Fedora's __vte_prompt_command -
+# which emits OSC 7 using $HOSTNAME, possibly polluted by container
+# runtimes - would otherwise overwrite our value.
+precmd_functions=(__ghostel_save_status __ghostel_prompt_start "${precmd_functions[@]}")
+precmd_functions+=(__ghostel_osc7 __ghostel_ensure_prompt_wrap __ghostel_install_zle_hook)
 preexec_functions=(__ghostel_preexec "${preexec_functions[@]}")
 
 # Outbound `ssh' wrapper.  See etc/ghostel.bash for the full design

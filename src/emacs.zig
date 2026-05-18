@@ -391,6 +391,7 @@ const interned_symbols = [_][:0]const u8{
     ":underline",
     ":weight",
     "bold",
+    "bright",
     "char-before",
     "cons",
     "dash",

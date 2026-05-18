@@ -15,8 +15,9 @@ const pty = @import("pty.zig");
 
 const c = emacs.c;
 
-/// Module version — keep in sync with ghostel.el and build.zig.zon.
-const version = "0.25.0";
+/// Module version — see src/version.zig.  Keep in sync with ghostel.el
+/// and build.zig.zon.
+const version = @import("version.zig").version;
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -91,6 +92,13 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
         \\Set default foreground and background colors.
         \\
         \\(ghostel--set-default-colors TERM FG-HEX BG-HEX)
+    );
+    env.bindFunction("ghostel--set-bold-config", 2, 2, &fnSetBoldConfig,
+        \\Configure bold text coloring.
+        \\
+        \\CONFIG can be nil (none), 'bright, or a hex color string.
+        \\
+        \\(ghostel--set-bold-config TERM CONFIG)
     );
     env.bindFunction("ghostel--mode-enabled", 2, 2, &fnModeEnabled,
         \\Return t if terminal DEC private MODE is enabled.
@@ -1091,6 +1099,36 @@ fn fnSetDefaultColors(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value,
         env.signalError("failed to set background color: %s", .{@errorName(err)});
         return env.nil();
     };
+    return env.t();
+}
+
+/// (ghostel--set-bold-config TERM CONFIG)
+///
+/// CONFIG can be nil (none), 'bright, or a hex color string.
+fn fnSetBoldConfig(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*anyopaque) callconv(.c) c.emacs_value {
+    const env = emacs.Env.init(raw_env.?);
+    const term = env.getUserPtr(Terminal, args[0]) orelse return env.nil();
+    const val = args[1];
+
+    if (env.isNil(val)) {
+        term.renderer.bold_config = .none;
+    } else if (env.eq(val, emacs.sym.bright)) {
+        term.renderer.bold_config = .bright;
+    } else {
+        var hex_buf: [16]u8 = undefined;
+        const hex = env.extractString(val, &hex_buf) orelse {
+            env.signalError("invalid bold config value", .{});
+            return env.nil();
+        };
+
+        if (parseHexColor(hex)) |color| {
+            term.renderer.bold_config = .{ .fixed = color };
+        } else {
+            env.signalError("invalid bold color: %s", .{hex});
+            return env.nil();
+        }
+    }
+
     return env.t();
 }
 

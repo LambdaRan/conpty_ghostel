@@ -4,6 +4,53 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-05-13
+
+### Added
+- `ghostel-bold-color` defcustom mirrors Ghostty 1.2.0's
+  `bold-color`: bold text with palette colors 0-7 is mapped to
+  the 8-15 bright slot when set to `bright` (the default), or
+  rendered in a fixed face/color when set to a color spec.
+  Existing terminals pick up the change live.
+
+### Changed
+- `S-<insert>` is bound to `ghostel-yank`, matching the
+  conventional alternative-paste binding in browsers, terminal
+  emulators, and file managers.  In the same pass, semi-char and
+  read-only maps layer `<remap> <yank>` so any key Emacs binds to
+  yank globally — `s-v` on macOS plus user rebinds — routes
+  through `ghostel-yank` without per-key entries.  `C-y` stays
+  explicitly bound so user rebinds of the global yank key cannot
+  break ghostel paste; line mode keeps Emacs's regular yank so
+  paste lands in the input region.
+  Closes [#263](https://github.com/dakra/ghostel/issues/263).
+- `ghostel-readonly-RET-or-exit-and-send` now honours
+  `ghostel-readonly-fast-exit` when point is on a hyperlink:
+  read-only mode exits first (capturing the URL beforehand, since
+  exit moves point and `file://` / `fileref:` links switch
+  buffers), then the link is opened.  Previously RET on a
+  hyperlink left the buffer in copy mode.
+
+### Fixed
+- Exiting read-only modes (copy, Emacs) no longer flickers.
+  The viewport snap-back to the live terminal cursor used to
+  schedule an async redraw; in the gap, Emacs would observe
+  point at `point-max` and recenter, only for the timer to
+  anchor the window back a few ms later.  The redraw is now
+  synchronous, so the window is anchored to the active viewport
+  before redisplay runs.
+  Fixes [#269](https://github.com/dakra/ghostel/issues/269).
+- Upgrading the elisp package ahead of the native module no
+  longer requires two restarts.  build.zig writes a
+  `ghostel-module.version` sidecar next to the binary, and
+  `ghostel--load-module` consults it before `module-load` and
+  refuses to map a stale `.so` — so a fresh install loads in the
+  same Emacs process.  The interactive version check also runs
+  unconditionally on existing installs without a sidecar, so
+  `M-x ghostel` surfaces the install prompt instead of only
+  warning.
+  Fixes [#256](https://github.com/dakra/ghostel/issues/256).
+
 ## [0.25.0] — 2026-05-11
 
 ### Added

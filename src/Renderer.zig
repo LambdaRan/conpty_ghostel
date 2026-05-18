@@ -38,6 +38,15 @@ row: RowContent = .{},
 
 font_info: ?FontInfo = null,
 
+/// Bold text coloring configuration.
+bold_config: BoldConfig = .none,
+
+pub const BoldConfig = union(enum) {
+    none,
+    bright,
+    fixed: gt.ColorRgb,
+};
+
 const FontInfo = struct {
     width: i64,
     height: i64,
@@ -285,7 +294,7 @@ fn formatColor(color: gt.ColorRgb, buf: *[7]u8) []const u8 {
 }
 
 /// Read the style for the current cell from the render state.
-fn readCellProps(cells: gt.RenderStateRowCells, key: CellPropKey) !?CellProps {
+fn readCellProps(self: *Self, term: *Terminal, cells: gt.RenderStateRowCells, key: CellPropKey) !?CellProps {
     var props: CellProps = .{};
 
     props.fg = gt.rs_row_cells.get(gt.ColorRgb, cells, gt.RS_CELLS_DATA_FG_COLOR) catch |err| switch (err) {
@@ -309,6 +318,22 @@ fn readCellProps(cells: gt.RenderStateRowCells, key: CellPropKey) !?CellProps {
         // Underline color
         if (gs.underline_color.tag == gt.c.GHOSTTY_STYLE_COLOR_RGB) {
             props.underline_color = gs.underline_color.value.rgb;
+        }
+
+        // Bold color handling (matches Ghostty 1.2.0+)
+        if (props.bold and self.bold_config != .none) {
+            if (gs.fg_color.tag == gt.c.GHOSTTY_STYLE_COLOR_PALETTE) {
+                const index = gs.fg_color.value.palette;
+                if (index < 8) {
+                    const palette = try term.getColorPalette();
+                    props.fg = palette[index + 8];
+                }
+            } else if (gs.fg_color.tag == gt.c.GHOSTTY_STYLE_COLOR_NONE) {
+                switch (self.bold_config) {
+                    .fixed => |fixed_color| props.fg = fixed_color,
+                    else => {},
+                }
+            }
         }
     }
 
@@ -500,6 +525,7 @@ pub const RowContent = struct {
     /// styled blanks are preserved.
     pub fn build(
         self: *RowContent,
+        term: *Terminal,
         row: gt.RenderStateRowIterator,
         row_cells: *gt.RenderStateRowCells,
         adjustment_threshold: u32,
@@ -568,7 +594,7 @@ pub const RowContent = struct {
                 try self.runs.append(RowContent.allocator, .{
                     .start_char = self.char_len,
                     .end_char = self.char_len,
-                    .props = try readCellProps(row_cells.*, prop_key),
+                    .props = try readCellProps(&term.renderer, term, row_cells.*, prop_key),
                 });
                 current_prop_key = prop_key;
             }
@@ -716,9 +742,11 @@ fn adjustGlyphs(self: *Self, env: emacs.Env, row_start: i64) void {
 fn insertRow(
     self: *Self,
     env: emacs.Env,
+    term: *Terminal,
     default_colors: *const BgFg,
 ) !void {
     try self.row.build(
+        term,
         self.row_iterator,
         &self.row_cells,
         if (self.font_info) |f| f.coverage else std.math.maxInt(u32),
@@ -853,7 +881,7 @@ pub fn render(self: *Self, env: emacs.Env, term: *Terminal, skip: usize, force_f
             const dirty_row = dirty_full or try gt.rs_row.get(bool, self.row_iterator, gt.RS_ROW_DATA_DIRTY);
             if (dirty_row) {
                 env.deleteRegion(env.point(), env.lineBeginningPosition2());
-                try self.insertRow(env, &default_colors);
+                try self.insertRow(env, term, &default_colors);
             } else {
                 _ = env.forwardLine(1);
             }
