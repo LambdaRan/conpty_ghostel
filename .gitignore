@@ -2,6 +2,7 @@ zig-out/
 .zig-cache/
 zig-pkg/
 vendor/ghostty
+.build/
 *.dylib
 *.so
 *.elc

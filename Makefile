@@ -1,4 +1,7 @@
-EMACS ?= emacs
+EMACS      ?= emacs
+# Extra flags injected before every Emacs invocation (e.g. `-L /tmp/compat'
+# in CI so older Emacs versions can find the compat library).
+EMACSFLAGS ?=
 
 XDG_CACHE_HOME ?= $(HOME)/.cache
 MELPAZOID_DIR  ?= $(XDG_CACHE_HOME)/melpazoid
@@ -8,11 +11,29 @@ ELC := lisp/ghostel.elc lisp/ghostel-debug.elc lisp/ghostel-compile.elc \
        lisp/ghostel-eshell.elc \
        extensions/evil-ghostel/evil-ghostel.elc
 
+# Native module artifact (kept in sync with `clean').  Listed as a real
+# file so the per-test stamp rules depend on its mtime instead of on the
+# phony `build' target — that way the Zig sources, not the act of asking
+# for `build', decide whether tests need to re-run.
+UNAME := $(shell uname)
+ifeq ($(UNAME),Darwin)
+  MODULE := ghostel-module.dylib
+else
+  MODULE := ghostel-module.so
+endif
+ZIG_SOURCES := $(wildcard src/*.zig src/*.c build.zig build.zig.zon symbols.map) \
+               $(wildcard vendor/*.h)
+
 .PHONY: all build test test-native test-zig test-all test-evil lint melpazoid melpazoid-ghostel melpazoid-evil-ghostel byte-compile docquotes bench bench-quick bench-e2e bench-tui-partial clean regen-terminfo
 
+# Recommended invocation: `make -j$(nproc) all' on Linux,
+# `make -j$(sysctl -n hw.ncpu) all' on macOS.  GNU make 4+ also accepts
+# bare `-j' (unlimited); pair with `-l$(nproc)' to cap by load.
 all: build test-all test-evil lint
 
-build:
+build: $(MODULE)
+
+$(MODULE): $(ZIG_SOURCES)
 	zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
 test-zig:
@@ -23,7 +44,7 @@ test-zig:
 # test targets never load stale .elc (Emacs prefers .elc over .el
 # even when the source is newer, which silently masks edits).
 lisp/%.elc: lisp/%.el
-	$(EMACS) --batch -Q -L lisp --eval "(setq byte-compile-error-on-warn t)" -f batch-byte-compile $<
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp --eval "(setq byte-compile-error-on-warn t)" -f batch-byte-compile $<
 
 # Extension packages depend on third-party libraries; reuse the evil
 # checkout that `test-evil' manages.
@@ -31,19 +52,46 @@ $(EVIL_DIR):
 	git clone --depth 1 https://github.com/emacs-evil/evil.git "$@"
 
 extensions/evil-ghostel/%.elc: extensions/evil-ghostel/%.el | $(EVIL_DIR)
-	$(EMACS) --batch -Q -L "$(EVIL_DIR)" -L lisp -L extensions/evil-ghostel \
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L "$(EVIL_DIR)" -L lisp -L extensions/evil-ghostel \
 		--eval "(setq byte-compile-error-on-warn t)" -f batch-byte-compile $<
 
-test: $(ELC)
-	$(EMACS) --batch -Q -L lisp -l ert -l test/ghostel-test.el -f ghostel-test-run-elisp
+# Per-topic test files.  Each file becomes its own Make target with a
+# per-file stamp under .build/tests/, so `make -jN' parallelises test
+# execution across cores.  The slowest single file sets the wall floor,
+# not the sum of all files.
+TEST_FILES        := $(sort $(wildcard test/ghostel-*-test.el))
+TEST_BASES        := $(notdir $(basename $(TEST_FILES)))
+TEST_STAMPS_DIR   := .build/tests
+TEST_ELISP_STAMPS  := $(patsubst %,$(TEST_STAMPS_DIR)/elisp-%.ok,$(TEST_BASES))
+TEST_NATIVE_STAMPS := $(patsubst %,$(TEST_STAMPS_DIR)/native-%.ok,$(TEST_BASES))
 
-test-native: build $(ELC)
-	$(EMACS) --batch -Q -L lisp -l ert -l test/ghostel-test.el -f ghostel-test-run-native
+test: $(TEST_ELISP_STAMPS)
+
+test-native: $(TEST_NATIVE_STAMPS)
+
+# Pass `-O target' (output-sync, GNU make 4+) for clean interleaving:
+#   make -j$(nproc) -O target test
+$(TEST_STAMPS_DIR):
+	@mkdir -p $@
+
+$(TEST_STAMPS_DIR)/elisp-%.ok: test/%.el test/ghostel-test-helpers.el $(ELC) | $(TEST_STAMPS_DIR)
+	@printf '  ELISP   %s\n' $*
+	@$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp -L test \
+		-l ert -l test/ghostel-test-helpers.el -l $< \
+		--eval "(ert-run-tests-batch-and-exit '(not (tag native)))"
+	@touch $@
+
+$(TEST_STAMPS_DIR)/native-%.ok: test/%.el test/ghostel-test-helpers.el $(ELC) $(MODULE) | $(TEST_STAMPS_DIR)
+	@printf '  NATIVE  %s\n' $*
+	@$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp -L test \
+		-l ert -l test/ghostel-test-helpers.el -l $< \
+		--eval "(ert-run-tests-batch-and-exit '(tag native))"
+	@touch $@
 
 test-all: test test-zig test-native
 
 test-evil: build $(ELC) | $(EVIL_DIR)
-	$(EMACS) --batch -Q -L "$(EVIL_DIR)" -L lisp -L extensions/evil-ghostel \
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L "$(EVIL_DIR)" -L lisp -L extensions/evil-ghostel \
 		-l ert -l test/evil-ghostel-test.el -f evil-ghostel-test-run
 
 byte-compile: $(ELC)
@@ -51,20 +99,21 @@ byte-compile: $(ELC)
 lint: byte-compile package-lint checkdoc docquotes
 
 package-lint:
-	$(EMACS) --batch -Q \
+	$(EMACS) --batch $(EMACSFLAGS) -Q \
 		--eval "(package-initialize)" \
 		--eval "(require 'package-lint)" \
 		-f package-lint-batch-and-exit \
 		lisp/ghostel.el extensions/evil-ghostel/evil-ghostel.el
 
 checkdoc:
-	$(EMACS) --batch -Q \
+	$(EMACS) --batch $(EMACSFLAGS) -Q \
 		--eval "(require 'checkdoc)" \
 		--eval "(let ((sentence-end-double-space nil) \
 		              (checkdoc-proper-noun-list nil) \
 		              (checkdoc-verb-check-experimental-flag nil) \
 		              (ok t)) \
-		  (dolist (f '(\"lisp/ghostel.el\" \"lisp/ghostel-debug.el\" \"lisp/ghostel-compile.el\" \"lisp/ghostel-eshell.el\" \"extensions/evil-ghostel/evil-ghostel.el\" \"test/ghostel-test.el\")) \
+		  (dolist (f (append '(\"lisp/ghostel.el\" \"lisp/ghostel-debug.el\" \"lisp/ghostel-compile.el\" \"lisp/ghostel-eshell.el\" \"extensions/evil-ghostel/evil-ghostel.el\" \"test/ghostel-test-helpers.el\") \
+		                     (file-expand-wildcards \"test/ghostel-*-test.el\"))) \
 		    (ignore-errors (kill-buffer \"*Warnings*\")) \
 		    (let ((inhibit-message t)) \
 		      (checkdoc-file f)) \
@@ -79,7 +128,7 @@ checkdoc:
 # underscores like INSIDE_EMACS — env-var and macro-style names that
 # melpazoid's stricter [A-Z]+ regex skips.
 docquotes:
-	$(EMACS) --batch -Q \
+	$(EMACS) --batch $(EMACSFLAGS) -Q \
 		--eval "(let ((ok t)) \
 		  (dolist (f '(\"lisp/ghostel.el\" \"lisp/ghostel-debug.el\" \"lisp/ghostel-compile.el\" \"lisp/ghostel-eshell.el\" \"extensions/evil-ghostel/evil-ghostel.el\")) \
 		    (with-temp-buffer \
@@ -122,13 +171,13 @@ bench-e2e:
 	bash bench/run-bench.sh --e2e
 
 bench-tui-partial:
-	$(EMACS) --batch -Q -L lisp -l bench/ghostel-bench.el \
+	$(EMACS) --batch $(EMACSFLAGS) -Q -L lisp -l bench/ghostel-bench.el \
 		--eval '(progn (setq ghostel-bench-include-vterm nil ghostel-bench-include-eat nil ghostel-bench-include-term nil) (ghostel-bench--load-backends) (ghostel-bench--run-tui-partial-scenarios))'
 
 clean:
 	rm -f ghostel-module.dylib ghostel-module.so
 	rm -f $(ELC)
-	rm -rf zig-out .zig-cache
+	rm -rf zig-out .zig-cache .build
 
 # Maintainer-only: regenerate the bundled compiled terminfo from
 # `etc/terminfo/xterm-ghostty.terminfo'.  Run after bumping libghostty

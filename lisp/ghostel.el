@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.26.0
+;; Version: 0.27.0
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1") (compat "30.1.0.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -106,8 +106,20 @@
                                  (getenv "COMSPEC")
                                  "cmd.exe")
                            (or (getenv "SHELL") "/bin/sh"))
-  "Shell program to run in the terminal."
-  :type 'string)
+  "Shell program to run in the terminal.
+
+Either a string (just the executable path) or a list whose first
+element is the executable path and whose remaining elements are
+arguments passed to that executable.  For example:
+
+  (setq ghostel-shell \\='(\"/bin/zsh\" \"--login\"))
+
+On macOS, ghostel additionally wraps the shell via `login(1)' by
+default so the shell starts as a login shell (matching Apple's
+Terminal.app and Ghostty), which sources `~/.zprofile' /
+`~/.bash_profile' as users expect.  See `ghostel-macos-login-shell'."
+  :type '(choice (string :tag "Executable path")
+                 (repeat :tag "Executable + arguments" string)))
 
 (defcustom ghostel-term "xterm-ghostty"
   "Value of the TERM environment variable for ghostel processes.
@@ -356,13 +368,30 @@ The default, `ghostel--set-title-default', renames the buffer to
   "Kill the buffer when the shell process exits."
   :type 'boolean)
 
+(defcustom ghostel-query-before-killing 'auto
+  "Whether to confirm before killing a live ghostel buffer or exiting Emacs.
+
+The value controls the process query-on-exit flag (see
+`set-process-query-on-exit-flag'), which Emacs honours both when
+killing the buffer and when exiting Emacs while the buffer is live.
+
+t      Always query while the shell process is alive.
+nil    Never query.
+auto   Query only while a shell command is running.  Requires OSC 133 shell
+       integration: at a prompt the flag is nil, and it flips to t between
+       the OSC 133 C (command start) and D (command finish) markers."
+  :type '(choice (const :tag "Always" t)
+                 (const :tag "Never" nil)
+                 (const :tag "While a command is running" auto)))
+
 (defcustom ghostel-exit-functions nil
   "Hook run when the terminal process exits.
 Each function is called with two arguments: the buffer and the
 exit event string."
   :type 'hook)
 
-(defcustom ghostel-command-finish-functions nil
+(defcustom ghostel-command-finish-functions
+  '(ghostel--query-before-killing-on-cmd-finish)
   "Hook run when a shell command finishes (OSC 133 D marker).
 Each function is called with two arguments: the buffer and the
 exit status (an integer, or nil if the shell did not report one).
@@ -380,7 +409,8 @@ non-nil, in which case the error is re-signalled so the debugger
 can fire (standard `with-demoted-errors' semantics)."
   :type 'hook)
 
-(defcustom ghostel-command-start-functions nil
+(defcustom ghostel-command-start-functions
+  '(ghostel--query-before-killing-on-cmd-start)
   "Hook run when a shell command starts running (OSC 133 C marker).
 Each function is called with one argument: the buffer.
 
@@ -615,6 +645,31 @@ nil        - do nothing; the user must install the module manually."
 When non-nil, ghostel modifies the shell invocation to automatically
 load shell integration scripts without requiring changes to the user's
 shell configuration files.  Supports bash, zsh, and fish."
+  :type 'boolean)
+
+(defcustom ghostel-macos-login-shell (eq system-type 'darwin)
+  "Wrap shell invocations on macOS so the shell starts as a login shell.
+
+When non-nil and `system-type' is `darwin', ghostel wraps the shell
+spawned by `ghostel--start-process' with `/usr/bin/login -flp $USER'
+followed by a tiny `/bin/bash --noprofile --norc -c \"exec -l <shell>
+[args]\"' shim.  This mirrors Apple's Terminal.app and Ghostty so that
+per-user login files (`~/.zprofile', `~/.bash_profile') are sourced as
+users expect on macOS.
+
+When `~/.hushlogin' exists, `-q' is passed to `login(1)' to suppress
+its banner.  The wrap preserves the calling environment via `login -p',
+so ghostel's shell-integration env (ZDOTDIR, ENV, XDG_DATA_DIRS,
+EMACS_GHOSTEL_PATH, INSIDE_EMACS) reaches the final shell.  Note that
+login(1) ALWAYS resets HOME, SHELL, LOGNAME, USER, and MAIL from the
+passwd entry — overrides for these in `ghostel-environment' do not
+survive the wrap.
+
+This wrap is only applied for the interactive shell spawned by
+`ghostel'.  It is not applied for `ghostel-exec' (the arbitrary-
+command entry point), for remote (TRAMP) sessions, or on non-Darwin
+platforms.  Set to nil to opt out and get a plain (non-login)
+interactive shell."
   :type 'boolean)
 
 (defcustom ghostel-tramp-shell-integration nil
@@ -929,7 +984,7 @@ Used when `cursor-in-non-selected-windows' resolves to box.")
 
 ;;; Automatic download and compilation of native module
 
-(defconst ghostel--minimum-module-version "0.26.0"
+(defconst ghostel--minimum-module-version "0.27.0"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -4497,6 +4552,24 @@ is non-nil so the debugger fires for hook authors who want it."
        (apply fn args))
      nil)))
 
+(defun ghostel--query-before-killing-on-cmd-start (buf)
+  "Flip the process query-on-exit flag on for BUF while a command runs.
+Active only when `ghostel-query-before-killing' is `auto'.
+Hung off `ghostel-command-start-functions'."
+  (when (eq ghostel-query-before-killing 'auto)
+    (let ((proc (buffer-local-value 'ghostel--process buf)))
+      (when (process-live-p proc)
+        (set-process-query-on-exit-flag proc t)))))
+
+(defun ghostel--query-before-killing-on-cmd-finish (buf _exit)
+  "Clear the process query-on-exit flag on BUF when the command finishes.
+Active only when `ghostel-query-before-killing' is `auto'.
+Hung off `ghostel-command-finish-functions'."
+  (when (eq ghostel-query-before-killing 'auto)
+    (let ((proc (buffer-local-value 'ghostel--process buf)))
+      (when (process-live-p proc)
+        (set-process-query-on-exit-flag proc nil)))))
+
 (defun ghostel--prompt-input-start ()
   "From the start of a `ghostel-prompt' region, move past the prefix.
 If `ghostel-input' begins on the same line, point lands at its
@@ -5557,17 +5630,67 @@ METHOD is a TRAMP method string or t for the default."
           (or shell second))
       first)))
 
+(defun ghostel--shell-program-and-args (spec)
+  "Split a `ghostel-shell'-style SPEC into (PROGRAM . ARGS).
+SPEC may be a string (just the program path) or a list whose first
+element is the program path and the remaining elements are arguments."
+  (cond
+   ((stringp spec) (cons spec nil))
+   ((and (consp spec) (stringp (car spec)))
+    (cons (car spec) (cdr spec)))
+   (t (error "Invalid ghostel-shell value: %S" spec))))
+
 (defun ghostel--get-shell ()
-  "Get the shell to run, respecting TRAMP remote connections.
+  "Get the shell program to run, respecting TRAMP remote connections.
 When `default-directory' is a remote TRAMP path, consult
-`ghostel-tramp-shells' for the appropriate shell."
+`ghostel-tramp-shells' for the appropriate shell.  Returns the
+executable path as a string.  When `ghostel-shell' is a list,
+only its first element (the program) is returned; use
+`ghostel--resolve-shell-spec' to also obtain the extra arguments."
+  (let ((value
+         (if (file-remote-p default-directory)
+             (with-parsed-tramp-file-name default-directory nil
+               (or (ghostel--tramp-get-shell method)
+                   (ghostel--tramp-get-shell t)
+                   (with-connection-local-variables shell-file-name)
+                   ghostel-shell))
+           ghostel-shell)))
+    (car (ghostel--shell-program-and-args value))))
+
+(defun ghostel--resolve-shell-spec ()
+  "Return (PROGRAM . EXTRA-ARGS) for the shell to spawn.
+For local sessions, splits `ghostel-shell' (string or list).
+For remote (TRAMP) sessions, defers to `ghostel--get-shell',
+which always returns a string — no extra args."
   (if (file-remote-p default-directory)
-      (with-parsed-tramp-file-name default-directory nil
-        (or (ghostel--tramp-get-shell method)
-            (ghostel--tramp-get-shell t)
-            (with-connection-local-variables shell-file-name)
-            ghostel-shell))
-    ghostel-shell))
+      (cons (ghostel--get-shell) nil)
+    (ghostel--shell-program-and-args ghostel-shell)))
+
+(defun ghostel--macos-login-wrap (program args)
+  "Wrap PROGRAM/ARGS via `/usr/bin/login' to produce a macOS login shell.
+Returns (LOGIN-PROGRAM . LOGIN-ARGS).  Mirrors Ghostty's wrap:
+
+  /usr/bin/login [-q] -flp USER \\
+    /bin/bash --noprofile --norc -c \"exec -l PROGRAM [args]\"
+
+`-q' is added when `~/.hushlogin' exists so login(1) suppresses
+its banner.  The bash builtin `exec -l' prepends `-' to argv[0]
+of the final shell, which is what makes it a login shell.
+PROGRAM and ARGS are shell-quoted into the `-c' command."
+  (let* ((user (user-login-name))
+         (hush (file-exists-p (expand-file-name "~/.hushlogin")))
+         (quoted (mapconcat #'shell-quote-argument
+                            (cons program args) " "))
+         (cmd (concat "exec -l " quoted))
+         ;; Quote from Ghostty source:
+         ;; We use "bash" instead of other shells that ship with macOS because
+         ;; as of macOS Sonoma, we found with a microbenchmark that bash can
+         ;; exec into the desired command ~2x faster than zsh.
+         (login-args (append (and hush '("-q"))
+                             (list "-flp" user
+                                   "/bin/bash" "--noprofile" "--norc"
+                                   "-c" cmd))))
+    (cons "/usr/bin/login" login-args)))
 
 (defun ghostel--read-local-file (path)
   "Return the contents of local file PATH as a string."
@@ -5963,7 +6086,12 @@ matches the PTY window size, and stores the process in
       ;; Set the PTY's actual window size (ioctl TIOCSWINSZ) so that
       ;; the program's line editor (readline/ZLE) can render properly.
       (set-process-window-size proc height width)
-      (set-process-query-on-exit-flag proc nil)
+      ;; For `auto', start nil — we spawn at a fresh prompt.  The
+      ;; OSC 133 C/D handlers flip the flag while a command runs.
+      (set-process-query-on-exit-flag
+       proc (if (eq ghostel-query-before-killing 'auto)
+                nil
+              ghostel-query-before-killing))
       (process-put proc 'adjust-window-size-function
                    #'ghostel--window-adjust-process-window-size)
       proc)))
@@ -5981,7 +6109,9 @@ on the remote host."
   (let* ((height (max 1 ghostel--term-rows))
          (width (max 1 ghostel--term-cols))
          (remote-p (file-remote-p default-directory))
-         (shell (ghostel--get-shell))
+         (shell-spec (ghostel--resolve-shell-spec))
+         (shell (car shell-spec))
+         (extra-shell-args (cdr shell-spec))
          (ghostel-dir (ghostel--resource-root))
          ;; Detect shell type when integration is enabled.
          ;; For remote, also check ghostel-tramp-shell-integration.
@@ -6039,12 +6169,13 @@ on the remote host."
                            (format "XDG_DATA_DIRS=%s:%s" integ-dir xdg)
                            (format "GHOSTEL_SHELL_INTEGRATION_XDG_DIR=%s"
                                    integ-dir))))))))))
-         (shell-args (cond
-                      (remote-integration
-                       (plist-get remote-integration :args))
-                      ((and (eq shell-type 'bash) integration-env)
-                       (list "--posix"))
-                      (t nil)))
+         (integration-args (cond
+                            (remote-integration
+                             (plist-get remote-integration :args))
+                            ((and (eq shell-type 'bash) integration-env)
+                             (list "--posix"))
+                            (t nil)))
+         (shell-args (append extra-shell-args integration-args))
          (stty-flags (if remote-integration
                          (plist-get remote-integration :stty)
                        ghostel--default-stty))
@@ -6054,8 +6185,15 @@ on the remote host."
                      integration-env))
          (proc (if (eq system-type 'windows-nt)
                    (ghostel--conpty-proxy-make-process width height extra-env)
-                 (ghostel--spawn-pty shell shell-args height width
-                                     stty-flags extra-env remote-p))))
+                 (let* ((spawn-spec (if (and ghostel-macos-login-shell
+                                             (not remote-p)
+                                             (eq system-type 'darwin))
+                                        (ghostel--macos-login-wrap shell shell-args)
+                                      (cons shell shell-args)))
+                        (spawn-program (car spawn-spec))
+                        (spawn-args (cdr spawn-spec)))
+                   (ghostel--spawn-pty spawn-program spawn-args height width
+                                       stty-flags extra-env remote-p)))))
     (when remote-integration
       (ghostel--cleanup-temp-paths
        (plist-get remote-integration :temp-files)

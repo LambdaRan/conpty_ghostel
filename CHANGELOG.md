@@ -4,6 +4,66 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-05-18
+
+### Added
+- `ghostel-query-before-killing` defcustom controls whether Emacs
+  asks for confirmation before killing a live ghostel buffer or
+  exiting Emacs while one is running.  Defaults to `auto`: quiet
+  at the shell prompt, queries while a command is running (via
+  OSC 133 C/D markers).  Set to `t` for always-on confirmation,
+  `nil` to restore the previous never-query behavior.
+  Closes [#288](https://github.com/dakra/ghostel/issues/288).
+- `ghostel-macos-login-shell` defcustom (default `t` on Darwin)
+  wraps the shell via `/usr/bin/login -flp $USER` so `~/.zprofile`
+  and `~/.bash_profile` are sourced, matching Terminal.app and
+  Ghostty.  Skipped for TRAMP, non-Darwin, and `ghostel-exec`.
+  `ghostel-shell` now also accepts a list form (program + args)
+  so users can pass extra flags like `'("/bin/zsh" "--login")` on
+  any platform.
+  Fixes [#285](https://github.com/dakra/ghostel/issues/285).
+- `ghostel-prompt-regexp` defcustom provides a prompt-detection
+  fallback for `ghostel-input-start-point` and
+  `ghostel-beginning-of-input-or-line` when OSC 133 shell
+  integration isn't available (raw zsh, Python REPL, sqlite3,
+  ssh into unprovisioned hosts).  Default recognizes `$ # % > >>>`
+  and themed prompts (`λ ❯ ➜ →`).  OSC 133 still wins when
+  present.
+- Public cursor-state API for integrations:
+  `ghostel-input-start-point`, `ghostel-cursor-point`, and
+  `ghostel-point-on-cursor-row-p`.  Pure state reads — safe to
+  call from any input mode.
+
+### Fixed
+- Bash's OSC 7 cwd report now uses the real kernel hostname via
+  `${var@P}` on `\H` (bash 4.4+) instead of `$HOSTNAME`.  Toolbox
+  and container runtimes export `$HOSTNAME` with a value that
+  disagrees with `gethostname(2)`, so Emacs's `(system-name)` saw
+  a mismatch and TRAMP fired on every `cd`.  Falls back to
+  `$HOSTNAME` on bash <4.4.
+  Fixes [#276](https://github.com/dakra/ghostel/issues/276).
+- OSC 7 is now emitted *after* any user-supplied `PROMPT_COMMAND`
+  / `precmd_functions` entries, so competing emitters (e.g.
+  Fedora's `/etc/profile.d/vte.sh`) can no longer overwrite
+  ghostel's cwd report and cause buffers to be misclassified as
+  remote.
+- Auto-composition is now disabled on TTY frames to fix the
+  off-by-one column drift caused by emoji + VS-16 grapheme
+  clusters (e.g. 🗂️) — Emacs's `char-width` reports 1 while
+  VS-16-honoring terminals paint 2 columns, desyncing the TTY
+  screen cache.  GUI frames are untouched.
+  Fixes [#274](https://github.com/dakra/ghostel/issues/274).
+- Glyphs that occupy a narrow cell but have an empty cell after
+  them are now promoted to wide on render, so emoji and other
+  ambiguous-width sequences land in the right column even when
+  upstream width tables disagree with the terminal.
+
+### Changed
+- Internal Zig refactor of `adjustGlyphs` and `putTextProperty`;
+  no user-visible change beyond the width promotion above.
+- Removed dead debug entry points (`fnDebugState`, `fnDebugFeed`)
+  and unused render state fields.
+
 ## [0.26.0] — 2026-05-13
 
 ### Added
