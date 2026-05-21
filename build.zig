@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
     const is_release = optimize != .Debug;
     const target_os = target.result.os.tag;
     const emacs_module_dir = resolveEmacsModuleDir(b);
+    const ghostty_dep = b.dependency("ghostty", .{
+        .target = target,
+        .optimize = ghostty_optimize,
+        .@"emit-lib-vt" = true,
+    });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/module.zig"),
@@ -25,28 +30,10 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = if (is_release) true else null,
     });
     mod.addSystemIncludePath(emacs_module_dir);
-
-    if (target_os == .windows) {
-        // Windows: Zig 0.15 dependency system cannot build ghostty correctly
-        // (subprocess doesn't forward emit-lib-vt option, artifact lookup fails).
-        // Link against pre-built libraries from vendor/ghostty/zig-out/ instead.
-        // Run build.cmd to build vendor/ghostty first.
-        mod.addIncludePath(b.path("vendor/ghostty/zig-out/include"));
-        mod.addObjectFile(b.path("vendor/ghostty/zig-out/lib/ghostty-vt-static.lib"));
-        mod.addObjectFile(b.path("vendor/ghostty/zig-out/lib/simdutf.lib"));
-        mod.addObjectFile(b.path("vendor/ghostty/zig-out/lib/highway.lib"));
-        mod.addObjectFile(b.path("vendor/ghostty/zig-out/lib/utfcpp.lib"));
-    } else {
-        // Unix: use Zig dependency system (works correctly on Linux/macOS).
-        const ghostty_dep = b.dependency("ghostty", .{
-            .target = target,
-            .optimize = ghostty_optimize,
-            .@"emit-lib-vt" = true,
-        });
-        const ghostty_lib = ghostty_dep.artifact("ghostty-vt-static");
-        mod.addIncludePath(ghostty_lib.getEmittedIncludeTree());
-        mod.linkLibrary(ghostty_lib);
-    }
+    mod.addImport(
+        "ghostty-vt",
+        ghostty_dep.module("ghostty-vt"),
+    );
 
     // stb_image for PNG decoding (kitty graphics)
     mod.addIncludePath(b.path("vendor/stb"));
@@ -111,6 +98,10 @@ pub fn build(b: *std.Build) void {
     });
     png_test_mod.addIncludePath(b.path("vendor/stb"));
     png_test_mod.addCSourceFile(.{ .file = b.path("src/stb_image.c") });
+    png_test_mod.addImport(
+        "ghostty-vt",
+        ghostty_dep.module("ghostty-vt"),
+    );
     const png_tests = b.addTest(.{ .root_module = png_test_mod });
     test_step.dependOn(&b.addRunArtifact(png_tests).step);
 }

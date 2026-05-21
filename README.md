@@ -811,6 +811,7 @@ inside a light Emacs):
 | `ghostel-tramp-default-method`   | `nil`                | TRAMP method for new remote paths from OSC 7 (nil uses `tramp-default-method`) |
 | `ghostel-tramp-shell-integration` | `nil`               | Auto-inject shell integration for remote TRAMP sessions  |
 | `ghostel-buffer-name`            | `"*ghostel*"`        | Default buffer name                                      |
+| `ghostel-project-buffer-scope`   | `both`               | How `ghostel-project-{next,previous,list-buffers}` decide project membership: `default-directory`, `identity`, or `both` |
 | `ghostel-max-scrollback`         | `5MB`                | Maximum scrollback size in bytes (materialized into the Emacs buffer; ~5,000 rows on 80-col terminals) |
 | `ghostel-timer-delay`            | `0.033`              | Base redraw delay in seconds (~30fps)                    |
 | `ghostel-adaptive-fps`           | `t`                  | Adaptive frame rate (shorter delay after idle, stop timer when idle) |
@@ -882,6 +883,12 @@ When `evil-ghostel-mode` is active:
 | `M-x ghostel`                  | Open a new terminal (create new buffer with prefix arg) |
 | `M-x ghostel-project`          | Open a terminal in the current project root (create new buffer with prefix arg)  |
 | `M-x ghostel-other`            | Switch to next terminal or create one        |
+| `M-x ghostel-next`             | Cycle to next ghostel buffer (sorted by name, wraps) |
+| `M-x ghostel-previous`         | Cycle to previous ghostel buffer             |
+| `M-x ghostel-list-buffers`     | Pick a ghostel buffer via `read-buffer`      |
+| `M-x ghostel-project-next`     | Cycle to next ghostel buffer in current project |
+| `M-x ghostel-project-previous` | Cycle to previous ghostel buffer in current project |
+| `M-x ghostel-project-list-buffers` | Pick a project-scoped ghostel buffer     |
 | `M-x ghostel-clear`            | Clear screen and scrollback                  |
 | `M-x ghostel-clear-scrollback` | Clear scrollback only                        |
 | `M-x ghostel-semi-char-mode`   | Switch to semi-char input mode (default)     |
@@ -1350,10 +1357,9 @@ For a detailed architectural comparison, see [design.org](design.org).
 ghostel.el          Elisp: keymap, process management, mode, commands
 src/module.zig      Entry point: emacs_module_init, function registration
 src/terminal.zig    Terminal struct wrapping ghostty handles
-src/render.zig      RenderState -> Emacs buffer with styled text
+src/Renderer.zig    RenderState -> Emacs buffer with styled text
 src/input.zig       Key and mouse encoding via ghostty encoders
 src/emacs.zig       Zig wrapper for the Emacs module C API
-src/ghostty.zig     Re-exports and constants for the ghostty C API
 ```
 
 ## License

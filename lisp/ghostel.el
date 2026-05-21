@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.27.0
+;; Version: 0.28.0
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1") (compat "30.1.0.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -36,9 +36,15 @@
 ;;
 ;; Usage:
 ;;
-;;   M-x ghostel          Open a new terminal
-;;   M-x ghostel-project  Open a terminal in the current project root
-;;   M-x ghostel-other    Switch to next terminal or create one
+;;   M-x ghostel               Open a new terminal
+;;   M-x ghostel-project       Open a terminal in the current project root
+;;   M-x ghostel-other         Switch to next terminal or create one
+;;   M-x ghostel-next / ghostel-previous
+;;                             Cycle through all ghostel buffers
+;;   M-x ghostel-list-buffers  Pick a ghostel buffer to switch to
+;;   M-x ghostel-project-next / ghostel-project-previous /
+;;       ghostel-project-list-buffers
+;;                             Same, scoped to the current project
 ;;
 ;; Key bindings in the terminal buffer:
 ;;
@@ -355,6 +361,24 @@ aggressive partial screen updates, but may use more CPU."
 (defcustom ghostel-buffer-name "*ghostel*"
   "Default buffer name for ghostel terminals."
   :type 'string)
+
+(defcustom ghostel-project-buffer-scope 'both
+  "How `ghostel-project-next', `-previous', and `-list-buffers' scope buffers.
+Controls which ghostel buffers are considered part of the current
+project:
+- `default-directory': match each buffer's `default-directory'
+  against the current project root.  Follows shell `cd'.
+  A terminal that walked out of the project is excluded; a plain
+  `ghostel' buffer that cd'd into the project is included.
+- `identity': match each buffer's `ghostel--buffer-identity'
+  against the value `project-prefixed-buffer-name' would produce
+  for the current project.  Stable across `cd', but only finds
+  buffers originally created via `ghostel-project'.
+- `both' (default): union of the two - `default-directory' first,
+  then identity-matched buffers not already covered."
+  :type '(choice (const :tag "Match by buffer default-directory" default-directory)
+                 (const :tag "Match by creation-time project identity" identity)
+                 (const :tag "Both (union)" both)))
 
 (defcustom ghostel-set-title-function #'ghostel--set-title-default
   "Function called when the terminal reports a new title (OSC 2).
@@ -984,7 +1008,7 @@ Used when `cursor-in-non-selected-windows' resolves to box.")
 
 ;;; Automatic download and compilation of native module
 
-(defconst ghostel--minimum-module-version "0.27.0"
+(defconst ghostel--minimum-module-version "0.28.0"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -1505,6 +1529,9 @@ Matches Ghostty 1.2.0's `bold-color' configuration."
 
 (defvar-local ghostel--rendered-font nil
   "The font last used for rendering. Internally used by native code.")
+
+(defvar ghostel--query-font-cache nil
+  "Dynamically bound cache for `query-font' during one native redraw.")
 
 (defvar-local ghostel--input-mode 'semi-char
   "Current input mode.
@@ -6244,6 +6271,14 @@ frame after idle to improve interactive responsiveness."
                             #'ghostel--delayed-redraw
                             (current-buffer))))))
 
+(defun ghostel--query-font-cached (font)
+  "Return `query-font' metrics for FONT, caching during native redraw.
+When `ghostel--query-font-cache' is nil, call `query-font' directly."
+  (if ghostel--query-font-cache
+      (or (gethash font ghostel--query-font-cache)
+          (puthash font (query-font font) ghostel--query-font-cache))
+    (query-font font)))
+
 (defconst ghostel--line-context-lines 3
   "Number of lines (including the target) used as a disambiguation key.
 `ghostel--line-key' captures this many consecutive lines starting at a
@@ -6569,10 +6604,14 @@ new output arrives."
                        (ghostel--line-mode-snapshot)))
                  (inhibit-read-only t)
                  (inhibit-redisplay t)
-                 (inhibit-modification-hooks t))
+                 (inhibit-modification-hooks t)
+                 ;; Raise GC threshold to defer GC during redraw.
+                 (gc-cons-threshold (min most-positive-fixnum
+                                         (* gc-cons-threshold 3))))
             (when render-win
-              (with-selected-window render-win
-                (ghostel--redraw ghostel--term ghostel-full-redraw)))
+              (let ((ghostel--query-font-cache (make-hash-table :test 'eq)))
+                (with-selected-window render-win
+                  (ghostel--redraw ghostel--term ghostel-full-redraw))))
             (let ((line-restored
                    (and line-snapshot
                         (ghostel--line-mode-restore line-snapshot))))
@@ -6987,6 +7026,146 @@ Returns the buffer."
         (pop-to-buffer (car others) (append display-buffer--same-window-action
                                             '((category . comint))))
       (ghostel))))
+
+(defun ghostel--all-buffers ()
+  "Return all live `ghostel-mode' buffers, sorted alphabetically by name.
+Sorted (not `buffer-list' order) so cycle commands advance through
+the same sequence regardless of recent buffer-switch history."
+  (sort (cl-remove-if-not
+         (lambda (b) (with-current-buffer b (derived-mode-p 'ghostel-mode)))
+         (buffer-list))
+        (lambda (a b) (string< (buffer-name a) (buffer-name b)))))
+
+(defun ghostel--project-buffers ()
+  "Return ghostel buffers belonging to the current project, sorted by name.
+Scoping is controlled by `ghostel-project-buffer-scope'.  Signals
+`user-error' if there is no current project.
+
+Buffers whose `default-directory' is remote are skipped in the
+`default-directory' scope branch — querying `project-current'
+against a TRAMP path would walk the remote filesystem
+synchronously on every cycle."
+  (let* ((proj (project-current t))
+         (root (project-root proj))
+         (identity-prefix
+          (let ((ghostel-buffer-name
+                 (project-prefixed-buffer-name
+                  (string-trim ghostel-buffer-name "*" "*"))))
+            ghostel-buffer-name))
+         (scope ghostel-project-buffer-scope)
+         (all (ghostel--all-buffers))
+         (by-dir
+          (and (memq scope '(default-directory both))
+               (cl-remove-if-not
+                (lambda (b)
+                  (let ((bd (buffer-local-value 'default-directory b)))
+                    (and bd
+                         (not (file-remote-p bd))
+                         (ignore-errors
+                           (let ((bp (project-current nil bd)))
+                             (and bp (equal (project-root bp) root)))))))
+                all)))
+         (by-id
+          (and (memq scope '(identity both))
+               (cl-remove-if-not
+                (lambda (b)
+                  (equal (buffer-local-value 'ghostel--buffer-identity b)
+                         identity-prefix))
+                all))))
+    (sort (cl-delete-duplicates (append by-dir by-id) :test #'eq)
+          (lambda (a b) (string< (buffer-name a) (buffer-name b))))))
+
+(defun ghostel--cycle (bufs direction empty-msg single-msg)
+  "Pop to the BUFS entry DIRECTION steps from current; wraps around.
+DIRECTION is +1 or -1.  Signals `user-error' with EMPTY-MSG when
+BUFS is empty.  Shows SINGLE-MSG when BUFS contains only the
+current buffer.  If the current buffer is not in BUFS, jump to
+the first or last entry depending on DIRECTION."
+  (cond
+   ((null bufs)
+    (user-error "%s" empty-msg))
+   ((and (= (length bufs) 1) (eq (car bufs) (current-buffer)))
+    (message "%s" single-msg))
+   (t
+    (let* ((current (current-buffer))
+           (idx (cl-position current bufs))
+           (n (length bufs))
+           (next (cond
+                  ((null idx) (if (> direction 0) (car bufs) (car (last bufs))))
+                  (t (nth (mod (+ idx direction) n) bufs)))))
+      (pop-to-buffer next (append display-buffer--same-window-action
+                                  '((category . comint))))))))
+
+;;;###autoload
+(defun ghostel-next ()
+  "Switch to the next ghostel buffer (sorted by name, wraps around)."
+  (interactive)
+  (ghostel--cycle (ghostel--all-buffers) +1
+                  "No ghostel buffers"
+                  "Only one ghostel buffer"))
+
+;;;###autoload
+(defun ghostel-previous ()
+  "Switch to the previous ghostel buffer (sorted by name, wraps around)."
+  (interactive)
+  (ghostel--cycle (ghostel--all-buffers) -1
+                  "No ghostel buffers"
+                  "Only one ghostel buffer"))
+
+;;;###autoload
+(defun ghostel-project-next ()
+  "Switch to the next ghostel buffer in the current project (wraps around).
+Project membership is determined by `ghostel-project-buffer-scope'."
+  (interactive)
+  (ghostel--cycle (ghostel--project-buffers) +1
+                  "No ghostel buffers in this project"
+                  "Only one ghostel buffer in this project"))
+
+;;;###autoload
+(defun ghostel-project-previous ()
+  "Switch to the previous ghostel buffer in the current project (wraps around).
+Project membership is determined by `ghostel-project-buffer-scope'."
+  (interactive)
+  (ghostel--cycle (ghostel--project-buffers) -1
+                  "No ghostel buffers in this project"
+                  "Only one ghostel buffer in this project"))
+
+(defun ghostel--read-buffer (prompt bufs)
+  "Prompt with PROMPT for one of BUFS via `read-buffer'.
+Default candidate is the buffer `ghostel-next' would land on, so RET
+matches the forward-cycle direction.  Returns the chosen buffer or
+signals `user-error' if BUFS is empty."
+  (when (null bufs)
+    (user-error "No ghostel buffers"))
+  (let* ((names (mapcar #'buffer-name bufs))
+         (current (current-buffer))
+         (idx (cl-position current bufs))
+         (default (cond
+                   ((null idx) (car names))
+                   (t (nth (mod (1+ idx) (length bufs)) names))))
+         (chosen (read-buffer prompt default t
+                              (lambda (cand)
+                                (let ((name (if (consp cand) (car cand) cand)))
+                                  (member name names))))))
+    (get-buffer chosen)))
+
+;;;###autoload
+(defun ghostel-list-buffers ()
+  "Pick a ghostel buffer to switch to via `read-buffer'."
+  (interactive)
+  (pop-to-buffer (ghostel--read-buffer "Ghostel buffer: " (ghostel--all-buffers))
+                 (append display-buffer--same-window-action
+                         '((category . comint)))))
+
+;;;###autoload
+(defun ghostel-project-list-buffers ()
+  "Pick a ghostel buffer in the current project via `read-buffer'.
+Project membership is determined by `ghostel-project-buffer-scope'."
+  (interactive)
+  (pop-to-buffer (ghostel--read-buffer "Project ghostel buffer: "
+                                       (ghostel--project-buffers))
+                 (append display-buffer--same-window-action
+                         '((category . comint)))))
 
 (provide 'ghostel)
 
