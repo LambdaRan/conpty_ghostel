@@ -6229,7 +6229,10 @@ on the remote host."
     (when (eq system-type 'windows-nt)
       ;; ConPTY process: raw binary I/O, no PTY window-size ioctl
       (set-process-coding-system proc 'binary 'binary)
-      (set-process-query-on-exit-flag proc nil)
+      (set-process-query-on-exit-flag
+       proc (if (eq ghostel-query-before-killing 'auto)
+                nil
+              ghostel-query-before-killing))
       (process-put proc 'adjust-window-size-function
                    #'ghostel--window-adjust-process-window-size))
     proc))

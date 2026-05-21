@@ -12,14 +12,6 @@ Ghostel 是嵌入 Emacs 的终端模拟器，基于 libghostty-vt 驱动。本�
 |---|---|
 | `E:\lambda\selfcode\conpty_ghostel` | ghostel 源码（本仓库） |
 | `E:\lambda\selfcode\conpty_proxy` | conpty_proxy.exe 源码（独立项目） |
-| `C:\emacs-lambda` | Emacs 配置目录 |
-| `C:\emacs-lambda\site-lisp\extensions\ghostel` | ghostel 安装目录（需手动同步构建产物） |
-
-构建后需将以下文件同步到安装目录：
-- `lisp/ghostel.el`、`lisp/ghostel-compile.el`、`lisp/ghostel-eshell.el`、`lisp/ghostel-debug.el`
-- `extensions/evil-ghostel/evil-ghostel.el`
-- `ghostel-module.dll`（构建产物在仓库根目录）
-- `etc/terminfo/`、`etc/shell/`
 
 ## 构建命令
 
@@ -91,10 +83,12 @@ libghostty-vt 由 Zig 包管理器获取（见 `build.zig.zon`）。`vendor/ghos
 
 - `ghostel--conpty-proxy-make-process` — 通过外部 `conpty_proxy.exe` 生成 shell（替代 Unix PTY）
 - `ghostel--conpty-proxy-resize` — 通过 `conpty_proxy.exe resize` 调整大小（替代 Unix ioctl）
-- `module.zig` CRLF 分支 — Windows 路径跳过 CRLF 规范化（ConPTY 处理行规则）
+- `module.zig` CRLF 分支 — 流式 CRLF 规范化是幂等的，所有平台安全运行；无需 Windows comptime 守卫
 - `build.cmd` — 使用 GNU ABI (`-Dtarget=native-native-gnu`) 避免 MSVC libcpmt 冲突；手动从 zig-cache 复制 simdutf.lib + highway.lib
 
 ## 上游同步工作流
+
+> **严格按步骤执行：** 步骤 1→2→3→4→5 必须逐项完成，不得跳过或合并。每一步完成后才能进入下一步。步骤 3 的每个检查项必须全部打勾确认。
 
 每次上游发布新版本时执行以下步骤：
 
@@ -123,7 +117,7 @@ git merge upstream/main --no-edit
 | 审查点 | 涉及文件 | 检查方法 |
 |---|---|---|
 | `module.zig` 注册区域 | `src/module.zig:34-178` | `diff upstream/main...HEAD -- src/module.zig` 确认 ConPTY 函数未被覆盖 |
-| CRLF 处理路径 | `src/module.zig` 中 `fnWriteInput` | 检查 `windows-nt` 条件分支逻辑是否完整 |
+| CRLF 处理路径 | `src/module.zig` 中 `fnWriteInput` | 流式 CRLF 规范化（插入缺失的 `\r`）是幂等的，所有平台安全运行；无需 Windows `comptime` 守卫 |
 | Emacs API 调用方式 | `src/emacs.zig` | 上游重构可能改变调用签名（如 `callN` → `f`）——确保 fork 代码跟上 |
 | Elisp 进程管理 | `lisp/ghostel.el` `ghostel--start-process` | 对比 `ghostel--spawn-pty` 确保 ConPTY 路径环境变量、buffer 设置同步 |
 | 构建脚本 | `build.zig` / `build.zig.zon` | 确认 GNU ABI 目标、依赖版本、libghostty-vt 依赖声明未被覆盖 |
@@ -136,7 +130,7 @@ git merge upstream/main --no-edit
 - [ ] `ghostel--conpty-proxy-resize` 与 Unix `ioctl` resize 路径功能对等
 - [ ] `ghostel--conpty-resize` (Zig) 注册仍存在
 - [ ] `fnConptyResize` 实现完整（函数签名与注册声明一致）
-- [ ] CRLF 规范化跳过逻辑仍适用（`comptime builtin.os.tag == .windows`）
+- [ ] CRLF 规范化流式方法是幂等的，所有平台安全；无需 `comptime` 守卫
 - [ ] 上游新增的 OSC handler 在 ConPTY 路径下是否也需要处理
 - [ ] `version` 常量与上游版本号一致
 
@@ -162,14 +156,6 @@ MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
 
 ### 冲突解决
 - 文件 — 具体处理方式
-```
-
-### 步骤 6：同步到 Emacs（可选）
-
-```powershell
-Copy-Item E:\lambda\selfcode\conpty_ghostel\ghostel-module.dll C:\emacs-lambda\site-lisp\extensions\ghostel\
-Copy-Item E:\lambda\selfcode\conpty_ghostel\lisp\*.el C:\emacs-lambda\site-lisp\extensions\ghostel\lisp\
-Copy-Item E:\lambda\selfcode\conpty_ghostel\extensions\evil-ghostel\*.el C:\emacs-lambda\site-lisp\extensions\ghostel\extensions\evil-ghostel\
 ```
 
 ## 关键约定
