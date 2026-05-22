@@ -462,7 +462,20 @@ sets libghostty's recorded cwd.  Mirrors the bash race test."
       (ghostel--write-input term "\e]133;P;k=i\e\\")
       (let ((p-entry (assoc "P" markers)))
         (should p-entry)                                   ; 133;P with k=i detected
-        (should (equal "k=i" (cdr p-entry)))))))           ; param payload preserved
+        (should (equal "k=i" (cdr p-entry))))              ; param payload preserved
+
+      ;; 133;N (new_command) — spec'd as "A but with optional aid=" for
+      ;; shells that track concurrent commands.  Ghostel doesn't track
+      ;; commands by aid, so N is forwarded to elisp as A (same prompt
+      ;; navigation, same command-start/finish hooks).
+      (setq markers nil)
+      (ghostel--write-input term "\e]133;N\e\\")
+      (should (assoc "A" markers))                         ; 133;N surfaces as A
+      (setq markers nil)
+      (ghostel--write-input term "\e]133;N;aid=42\e\\")
+      (let ((a-entry (assoc "A" markers)))
+        (should a-entry)                                   ; 133;N with aid still A
+        (should (equal "aid=42" (cdr a-entry)))))))        ; aid options preserved
 
 (ert-deftest ghostel-test-osc133-text-properties ()
   "Test that prompt markers set ghostel-prompt text property."

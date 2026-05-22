@@ -6,7 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const emacs = @import("emacs.zig");
-const GhostelTerm = @import("terminal.zig");
+const GhostelTerm = @import("GhostelTerm.zig");
 const gt = @import("ghostty-vt");
 const input = @import("input.zig");
 const kitty_graphics = @import("kitty_graphics.zig");
@@ -15,9 +15,18 @@ const pty = @import("pty.zig");
 
 const c = emacs.c;
 
+/// In debug builds, all allocations go through DebugAllocator for corruption
+/// detection (double-free, use-after-free, overflow canaries).  A debug-only
+/// kill-emacs-hook explicitly deinits all live terminals before process exit so
+/// atexit can call deinit() on a clean slate.
+var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+var alloc: Allocator = std.heap.c_allocator;
+
 /// Module version — see src/version.zig.  Keep in sync with ghostel.el
 /// and build.zig.zon.
 const version = @import("version.zig").version;
+
+extern fn atexit(func: *const fn () callconv(.c) void) c_int;
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -29,10 +38,15 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
         return 1; // ABI mismatch
     }
 
-    const raw_env = runtime.get_environment.?(runtime);
-    const env = emacs.Env.init(raw_env);
+    if (builtin.mode == .Debug) {
+        alloc = debug_alloc.allocator();
+        _ = atexit(&debugAtExit);
+    }
 
-    emacs.initSymbols(env);
+    const raw_env = runtime.get_environment.?(runtime);
+    emacs.initModule(alloc, raw_env);
+
+    const env = emacs.Env.init(raw_env);
 
     // Register functions
     env.bindFunction("ghostel--new", 2, 5, &fnNew,
@@ -155,6 +169,19 @@ export fn emacs_module_init(runtime: *c.struct_emacs_runtime) callconv(.c) c_int
     return 0;
 }
 
+fn debugAtExit() callconv(.c) void {
+    if (debug_alloc.deinit() == .leak) {
+        std.debug.print("ghostel: memory leak detected at exit\n", .{});
+    }
+}
+
+fn terminalFinalize(ptr: ?*anyopaque) callconv(.c) void {
+    if (ptr) |p| {
+        const term: *GhostelTerm = @ptrCast(@alignCast(p));
+        term.deinit();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin version — required by Emacs >= 27
 // ---------------------------------------------------------------------------
@@ -211,7 +238,7 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
     effects.title_changed = &titleChangedCallback;
     effects.size = &sizeCallback;
 
-    const term = GhostelTerm.init(cols, rows, max_scrollback, effects) catch {
+    const term = GhostelTerm.init(alloc, cols, rows, max_scrollback, effects) catch {
         env.signalError("failed to create terminal", .{});
         return env.nil();
     };
@@ -231,7 +258,7 @@ fn fnNew(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*any
             env.logError("enableKittyGraphics failed: %s", .{@errorName(err)});
     }
 
-    return env.makeUserPtr(&GhostelTerm.emacsFinalize, term);
+    return env.makeUserPtr(terminalFinalize, term);
 }
 
 /// (ghostel--write-input TERM DATA)
@@ -245,10 +272,10 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // Extract string data — try stack buffer first, fall back to alloc
     var stack_buf: [65536]u8 = undefined;
     var heap_buf: ?[]const u8 = null;
-    defer if (heap_buf) |hb| std.heap.c_allocator.free(hb);
+    defer if (heap_buf) |hb| alloc.free(hb);
 
     const data = env.extractString(args[1], &stack_buf) orelse blk: {
-        heap_buf = env.extractStringAlloc(args[1], std.heap.c_allocator);
+        heap_buf = env.extractStringAlloc(args[1], alloc);
         break :blk heap_buf;
     };
 
@@ -266,14 +293,6 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
 
     const raw = data.?;
 
-    // Respond to OSC 4/10/11 color queries BEFORE feeding libghostty.
-    // libghostty will synchronously emit responses for other queries in
-    // the same write (e.g. CSI 6n cursor-position report) via the
-    // write_pty callback, and termenv-based programs read only the first
-    // response chunk — so the color reply must be on the wire first or
-    // the program discards our reply as noise.
-    extractOscColorQueries(env, term, raw);
-
     // Normalize CRLF by streaming directly into libghostty's parser.
     // Emacs PTYs lack ONLCR, so bare \n arrives without \r — insert
     // one before each bare \n by feeding the preceding segment verbatim
@@ -281,428 +300,111 @@ fn fnWriteInput(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?*
     // chunking (that's how the process filter already works), so no
     // scratch buffer, no allocation, no truncation fallback.
     //
+    // Skip normalization on the alternate screen.  Apps that use the
+    // alt screen (tmux, vim, less) send VT-correct sequences where bare
+    // \n is LF (cursor down, column preserved); normalizing to \r\n
+    // breaks their layout.
+    //
     // `prev_was_cr` is seeded from `term.last_input_was_cr` so a CRLF
     // pair split across two writes — chunk A ending with \r, chunk B
     // starting with \n — is not mis-normalized into \r\r\n.  The final
     // value is persisted back for the next call. An empty input
     // round-trips the flag unchanged.
-    var seg_start: usize = 0;
-    var prev_was_cr: bool = term.last_input_was_cr;
-    for (raw, 0..) |ch, i| {
-        if (ch == '\n' and !prev_was_cr) {
-            if (i > seg_start) term.vtWrite(raw[seg_start..i]);
-            term.vtWrite("\r\n");
-            seg_start = i + 1;
-            prev_was_cr = false;
-        } else {
-            prev_was_cr = (ch == '\r');
+    //
+    // All standard OSC sequences (4, 7, 9, 10, 11, 52, 133, 777) are
+    // intercepted by `GhostelHandler` inside the stream itself — no
+    // post-write byte scan is needed for them.
+    if (term.terminal.screens.active_key == .alternate) {
+        term.vtWrite(raw);
+        if (raw.len > 0) term.last_input_was_cr = raw[raw.len - 1] == '\r';
+    } else {
+        var seg_start: usize = 0;
+        var prev_was_cr: bool = term.last_input_was_cr;
+        for (raw, 0..) |ch, i| {
+            if (ch == '\n' and !prev_was_cr) {
+                if (i > seg_start) term.vtWrite(raw[seg_start..i]);
+                term.vtWrite("\r\n");
+                seg_start = i + 1;
+                prev_was_cr = false;
+            } else {
+                prev_was_cr = (ch == '\r');
+            }
         }
+        if (seg_start < raw.len) {
+            term.vtWrite(raw[seg_start..]);
+        }
+        term.last_input_was_cr = prev_was_cr;
     }
-    if (seg_start < raw.len) {
-        term.vtWrite(raw[seg_start..]);
-    }
-    term.last_input_was_cr = prev_was_cr;
 
-    // Scan for OSC sequences that libghostty-vt discards (7, 51, 52, 133).
-    // One pass, dispatched by code in document order.
-    dispatchPostWriteOscs(env, term, raw);
+    // OSC 51;E (ghostel's elisp-eval extension) is not a standard OSC,
+    // so ghostty's parser drops it without firing an action.  Scan the
+    // raw input for it ourselves.
+    dispatchOsc51(env, raw);
 
     return env.nil();
 }
 
 // ---------------------------------------------------------------------------
-// OSC sequence helpers
+// OSC 51 (ghostel extension) — elisp eval
 // ---------------------------------------------------------------------------
 
-/// An OSC sequence extracted by `OscIterator`.
-const OscEntry = struct {
-    /// Decimal OSC code (e.g. 4, 7, 10, 11, 51, 52, 133).
-    code: u32,
-    /// Payload bytes between the code's trailing `;` and the terminator.
-    payload: []const u8,
-    /// Terminator bytes (BEL or ESC \) — forwarded back on replies.
-    terminator: []const u8,
-};
+// TODO: Ghostty's parser is a whitelist state machine and if a 5 is
+//   followed by 1, the parser transitions to .invalid.
+//   Replace this with either an upstream fix or change to OSC52;E
+//   OSC 52 is the clipboard parser where only the "c, p, s, q, 0-7"
+//   kinds are used.
 
-/// Single-pass iterator over well-formed OSC sequences in a byte slice.
-/// Advances past `ESC ]`, parses the decimal code up to `;`, locates the
-/// BEL/ST terminator, and yields `(code, payload, terminator)`.
+/// Only OSC 51 (ghostel's elisp-eval extension) still needs a byte scan
+/// because it is not a standard OSC that ghostty's parser knows about.
 ///
-/// An OSC payload is bounded by a real terminator (BEL or ESC \) OR by
-/// the next OSC introducer (ESC ]).  Stopping at a following introducer
-/// handles malformed input where one OSC is missing its terminator
-/// before the next begins — otherwise the partial OSC would cannibalize
-/// the following OSC's bytes (including its terminator) as its own
-/// payload, producing a garbage dispatch AND starving the next OSC.
-/// On partial detection we advance past the current introducer and let
-/// iteration continue, so well-formed OSCs later in the same buffer
-/// still dispatch.
-const OscIterator = struct {
-    data: []const u8,
-    pos: usize = 0,
-
-    fn next(self: *OscIterator) ?OscEntry {
-        while (self.pos < self.data.len) {
-            const intro = std.mem.indexOfPos(u8, self.data, self.pos, "\x1b]") orelse {
-                self.pos = self.data.len;
-                return null;
-            };
-            const code_start = intro + 2;
-
-            // Decimal code up to the first `;`.
-            var code_end = code_start;
-            while (code_end < self.data.len and self.data[code_end] >= '0' and self.data[code_end] <= '9') {
-                code_end += 1;
+/// Dispatch each `ESC ] 51 ; E <payload> (BEL|ST)` in `data` to
+/// `ghostel--osc51-eval`.  Other OSC 51 sub-codes (used by other
+/// terminals for things unrelated to elisp eval) are ignored.
+///
+/// Single-pass scan: the `intermediate` introducer carries the literal
+/// "E" so we can match the full prefix in one `indexOfPos`.  Limitation:
+/// an OSC 51 split across two `ghostel--write-input` calls is dropped
+/// entirely — we keep no carry-over state between calls.  Unlike
+/// ghostty's `Parser`, which buffers an OSC body across chunks, this
+/// scanner only sees one `data` slice at a time.  Adding carry-over
+/// would require per-`GhostelTerm` state; not worth it until an
+/// OSC 51 chunk-spanning case actually shows up.
+fn dispatchOsc51(env: emacs.Env, data: []const u8) void {
+    const intro = "\x1b]51;E";
+    var pos: usize = 0;
+    while (pos + intro.len <= data.len) {
+        const start = std.mem.indexOfPos(u8, data, pos, intro) orelse return;
+        const payload_start = start + intro.len;
+        // Find BEL or ST terminator.  Stops at the next OSC introducer
+        // too: a missing terminator on the current OSC should not
+        // cannibalize the following one.
+        var end = payload_start;
+        var term_len: usize = 0;
+        while (end < data.len) : (end += 1) {
+            const ch = data[end];
+            if (ch == 0x07) {
+                term_len = 1;
+                break;
             }
-            if (code_end == code_start or code_end >= self.data.len or self.data[code_end] != ';') {
-                self.pos = code_start;
-                continue;
-            }
-            const payload_start = code_end + 1;
-
-            // Scan for a terminator (BEL or ESC \) or the next OSC
-            // introducer (ESC ]), whichever comes first. An intervening
-            // introducer means the current OSC is partial.
-            var end = payload_start;
-            var term_len: usize = 0;
-            while (end < self.data.len) : (end += 1) {
-                const ch = self.data[end];
-                if (ch == 0x07) {
-                    term_len = 1;
+            if (ch == 0x1b and end + 1 < data.len) {
+                const next_ch = data[end + 1];
+                if (next_ch == '\\') {
+                    term_len = 2;
                     break;
                 }
-                if (ch == 0x1b and end + 1 < self.data.len) {
-                    const next_ch = self.data[end + 1];
-                    if (next_ch == '\\') {
-                        term_len = 2;
-                        break;
-                    }
-                    if (next_ch == ']') {
-                        // Next introducer — current OSC is partial.
-                        break;
-                    }
-                }
+                if (next_ch == ']') break; // next OSC — current is partial
             }
-            if (term_len == 0) {
-                // Partial OSC: skip past the current introducer (which
-                // we already parsed) and resume scanning. If `end` is
-                // still `self.data.len` there were no more introducers,
-                // and the next indexOfPos call will terminate iteration.
-                self.pos = if (end > code_start) end else code_start;
-                continue;
-            }
-
-            self.pos = end + term_len;
-            const code = std.fmt.parseInt(u32, self.data[code_start..code_end], 10) catch continue;
-            return .{
-                .code = code,
-                .payload = self.data[payload_start..end],
-                .terminator = self.data[end .. end + term_len],
-            };
         }
-        return null;
-    }
-};
-
-/// Dispatch OSC 7 / 51 / 52 / 133 from `data` in document order.
-/// These are the post-vtWrite sequences that libghostty-vt discards,
-/// so ghostel has to scan for them itself.  All four used to scan the
-/// buffer independently; one unified pass is strictly less work for
-/// bulk output and preserves source-order dispatch.  (OSC 4/10/11
-/// color queries use the same iterator but run before vtWrite — see
-/// `extractOscColorQueries`.)
-///
-/// Runs AFTER `vtWrite` so libghostty has already seen the bytes —
-/// OSC 7 calls back into libghostty (`setPwd`) and the others call
-/// Elisp.
-fn dispatchPostWriteOscs(env: emacs.Env, term: *GhostelTerm, data: []const u8) void {
-    var it = OscIterator{ .data = data };
-    while (it.next()) |osc| {
-        switch (osc.code) {
-            // OSC 7: working directory as a file:// URL.
-            7 => {
-                if (osc.payload.len == 0) continue;
-                term.terminal.setPwd(osc.payload) catch |err|
-                    env.logError("setPwd failed: %s", .{@errorName(err)});
-            },
-            // OSC 51;E: whitelisted Elisp eval (ghostel extension).
-            51 => {
-                if (osc.payload.len < 2 or osc.payload[0] != 'E') continue;
-                _ = env.f("ghostel--osc51-eval", .{osc.payload[1..]});
-            },
-            // OSC 52: clipboard set.  Queries ("?") are ignored.
-            52 => {
-                const semi = std.mem.indexOfScalar(u8, osc.payload, ';') orelse continue;
-                const selection = osc.payload[0..semi];
-                const b64 = osc.payload[semi + 1 ..];
-                if (b64.len == 0) continue;
-                if (b64.len == 1 and b64[0] == '?') continue;
-                _ = env.f("ghostel--osc52-handle", .{ selection, b64 });
-            },
-            // OSC 133: semantic prompt markers (A/B/C/D/P).  P is
-            // "explicit prompt start" — same as A for navigation but
-            // without libghostty's fresh-line side effect, used by the
-            // zsh `zle-line-init' fallback when PROMPT-wrap was lost.
-            133 => {
-                if (osc.payload.len == 0) continue;
-                const marker_type = osc.payload[0];
-                if (marker_type != 'A' and marker_type != 'B' and marker_type != 'C' and marker_type != 'D' and marker_type != 'P') continue;
-                const has_param = osc.payload.len > 1 and osc.payload[1] == ';';
-                const param_data = if (has_param) osc.payload[2..] else &[_]u8{};
-                const type_str: [1]u8 = .{marker_type};
-                const param_val = if (has_param and param_data.len > 0)
-                    env.makeString(param_data)
-                else
-                    env.nil();
-                _ = env.f("ghostel--osc133-marker", .{ &type_str, param_val });
-            },
-            // OSC 9: iTerm2 desktop notification, with ConEmu sub-codes
-            // carved out (see `dispatchOsc9`).
-            9 => dispatchOsc9(env, term, osc.payload),
-            // OSC 777: rxvt "notify" extension — `notify;TITLE;BODY`.
-            777 => dispatchOsc777(env, osc.payload),
-            else => {},
+        if (term_len == 0) {
+            // Partial — skip past the introducer and resume.  If
+            // nothing matched, the next `indexOfPos` terminates.
+            pos = if (end > start) end else payload_start;
+            continue;
         }
-    }
-}
-
-/// Dispatch OSC 9.  The iTerm2 form is `9;<body>` with no title; ConEmu
-/// overloads the same code with `9;<subcode>[;...]` for unrelated things
-/// (progress, tab titles, env vars, etc.).  Ghostel implements two of the
-/// sub-codes — `9;4` progress reports (routed to `ghostel--osc-progress`)
-/// and `9;9` CWD reporting (routed through libghostty's `setPwd`, same as
-/// OSC 7).  Other recognised ConEmu sub-codes are silently dropped so
-/// stray control sequences don't pop spurious notifications.  Anything
-/// that isn't a valid ConEmu sub-code falls through to
-/// `ghostel--handle-notification` as an iTerm2 notification.  The
-/// validation rules here mirror ghostty-vt's osc9.zig so ghostel's
-/// drop/route/notify split stays consistent with upstream's parse.
-fn dispatchOsc9(env: emacs.Env, term: *GhostelTerm, payload: []const u8) void {
-    if (payload.len == 0) return;
-
-    const first = payload[0];
-    if (first >= '0' and first <= '9') {
-        // Parse the leading digit run.
-        var i: usize = 0;
-        while (i < payload.len and payload[i] >= '0' and payload[i] <= '9') : (i += 1) {}
-        const subcode_str = payload[0..i];
-        const rest = payload[i..];
-        const subcode = std.fmt.parseInt(u16, subcode_str, 10) catch {
-            dispatchOsc9Notification(env, payload);
-            return;
-        };
-
-        // OSC 9;4: progress report.  Valid forms start with `;<digit>`;
-        // anything else falls through to the iTerm2 notification path.
-        if (subcode == 4 and rest.len >= 2 and rest[0] == ';') {
-            if (dispatchOsc9Progress(env, rest[1..])) return;
+        if (end > payload_start) {
+            _ = env.f("ghostel--osc51-eval", .{data[payload_start..end]});
         }
-
-        // OSC 9;9: ConEmu CWD reporting — same payload shape as OSC 7,
-        // so we route it through `term.setPwd` (libghostty-vt discards
-        // OSC 9, so this is the one place it gets picked up).
-        if (subcode == 9 and rest.len >= 2 and rest[0] == ';') {
-            const path = rest[1..];
-            if (path.len > 0) {
-                term.terminal.setPwd(path) catch |err|
-                    env.logError("setPwd failed: %s", .{@errorName(err)});
-            }
-            return;
-        }
-
-        // Other recognised ConEmu sub-codes — silently dropped.  Each
-        // check mirrors ghostty-vt's parser closely enough that payloads
-        // it would reject fall through to the notification path below
-        // (with two deliberate divergences — 9;5 and 9;12, see below).
-        const is_conemu = switch (subcode) {
-            1, 2, 3, 6, 7, 8, 11 => rest.len >= 1 and rest[0] == ';',
-            // `9;5` (wait-input) and `9;12` (prompt start) take no
-            // arguments.  ghostty-vt happens to consume trailing bytes
-            // too, but matching that would swallow iTerm2 notifications
-            // whose body starts with "5" or "12" (e.g. "5 minutes left")
-            // — a realistic UX footgun — so we only treat these as
-            // ConEmu when nothing follows the subcode.
-            5, 12 => rest.len == 0,
-            // `9;10` (bare) or `9;10;0..3[...]` → ConEmu xterm
-            // emulation.  Anything else (`9;10;4`, `9;10;`, `9;10;abc`)
-            // is invalid per ghostty-vt and must notify.  Matches
-            // upstream's lax treatment of trailing bytes after a valid
-            // first arg digit (e.g. `9;10;01`, `9;10;3x` → emulation).
-            10 => rest.len == 0 or
-                (rest.len >= 2 and rest[0] == ';' and
-                    rest[1] >= '0' and rest[1] <= '3'),
-            else => false,
-        };
-        if (is_conemu) return;
-    }
-
-    // Unrecognised `9;<digit>...` payloads fall through as iTerm2
-    // notifications with the raw body (digit run included).  That's
-    // intentional: the iTerm2 form has no sub-code namespace, so the
-    // body is whatever follows the `9;`.
-    dispatchOsc9Notification(env, payload);
-}
-
-fn dispatchOsc9Notification(env: emacs.Env, body: []const u8) void {
-    _ = env.f("ghostel--handle-notification", .{ "", body });
-}
-
-/// Parse the payload that follows `9;4;` and dispatch to Elisp.  Returns
-/// true if a progress event was emitted.
-///
-/// State semantics mirror ghostty-vt's parser at the protocol level:
-///   - `set`  (1) defaults progress to 0 when unreported.
-///   - `error` (2) / `pause` (4) accept an optional progress value.
-///   - `remove` (0) / `indeterminate` (3) ignore any trailing progress.
-///
-/// Trailing-semicolon handling is slightly more forgiving than upstream:
-/// `9;4;1;` and `9;4;1;50;` are treated the same as `9;4;1` and
-/// `9;4;1;50`, whereas ghostty-vt's parseUnsigned returns null on the
-/// trailing `;`.  Matters only for exotic emitters.
-fn dispatchOsc9Progress(env: emacs.Env, data: []const u8) bool {
-    if (data.len == 0) return false;
-    const state_digit = data[0];
-    const state_str: []const u8 = switch (state_digit) {
-        '0' => "remove",
-        '1' => "set",
-        '2' => "error",
-        '3' => "indeterminate",
-        '4' => "pause",
-        else => return false,
-    };
-
-    // Default progress: `set` starts at 0; all other states start nil.
-    var progress_val = if (state_digit == '1') env.makeInteger(0) else env.nil();
-    const accepts_progress = state_digit != '0' and state_digit != '3';
-
-    if (accepts_progress and data.len >= 3 and data[1] == ';') {
-        var tail = data[2..];
-        // Trim trailing `;` so `9;4;0;` and similar don't fail to parse.
-        while (tail.len > 0 and tail[tail.len - 1] == ';') tail.len -= 1;
-        if (tail.len > 0) {
-            // u64 is wide enough to absorb garbage like `99999999999`
-            // without overflowing parseInt; the result is clamped to 100
-            // regardless.
-            if (std.fmt.parseInt(u64, tail, 10)) |n| {
-                const clamped: i64 = @intCast(@min(n, 100));
-                progress_val = env.makeInteger(clamped);
-            } else |_| {}
-        }
-    }
-
-    _ = env.f("ghostel--osc-progress", .{ state_str, progress_val });
-    return true;
-}
-
-/// Dispatch OSC 777: `notify;TITLE;BODY`.  Any other extension is ignored
-/// (rxvt defines `notify` as the only one we care about).
-fn dispatchOsc777(env: emacs.Env, payload: []const u8) void {
-    const first_semi = std.mem.indexOfScalar(u8, payload, ';') orelse return;
-    if (!std.mem.eql(u8, payload[0..first_semi], "notify")) return;
-    const after_ext = payload[first_semi + 1 ..];
-    // Title and body are separated by the next `;`.  If no separator,
-    // treat the whole remainder as body with empty title.
-    const second_semi = std.mem.indexOfScalar(u8, after_ext, ';');
-    const title = if (second_semi) |s| after_ext[0..s] else "";
-    const body = if (second_semi) |s| after_ext[s + 1 ..] else after_ext;
-    _ = env.f("ghostel--handle-notification", .{ title, body });
-}
-
-/// Send `OSC N;rgb:RRRR/GGGG/BBBB <term>` for a dynamic color (OSC 10/11).
-fn sendDynamicColorReply(
-    env: emacs.Env,
-    osc_num: u8,
-    color: gt.color.RGB,
-    term_bytes: []const u8,
-) void {
-    var buf: [64]u8 = undefined;
-    const written = std.fmt.bufPrint(
-        &buf,
-        "\x1b]{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}{s}",
-        .{
-            osc_num,
-            color.r,
-            color.r,
-            color.g,
-            color.g,
-            color.b,
-            color.b,
-            term_bytes,
-        },
-    ) catch return;
-    _ = env.f("ghostel--flush-output", .{written});
-}
-
-/// Send `OSC 4;INDEX;rgb:RRRR/GGGG/BBBB <term>` for a palette entry.
-fn sendPaletteColorReply(
-    env: emacs.Env,
-    index: u16,
-    color: gt.color.RGB,
-    term_bytes: []const u8,
-) void {
-    var buf: [64]u8 = undefined;
-    const written = std.fmt.bufPrint(
-        &buf,
-        "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}{s}",
-        .{
-            index,
-            color.r,
-            color.r,
-            color.g,
-            color.g,
-            color.b,
-            color.b,
-            term_bytes,
-        },
-    ) catch return;
-    _ = env.f("ghostel--flush-output", .{written});
-}
-
-/// Scan data for OSC 4/10/11 color queries and emit responses in source
-/// order.  libghostty applies OSC 4/10/11 **sets** internally but silently
-/// drops the query form (`?` value), so ghostel scans the raw input and
-/// replies itself.
-///
-/// Colors come from the terminal's currently effective state, which reflects
-/// sets applied by earlier write-input calls — but NOT sets that appear
-/// earlier in *this* input buffer, because this extractor runs before
-/// `vtWrite` so the color reply is on the wire before any reply libghostty
-/// generates itself (e.g. the CSI 6n cursor-position reply some programs
-/// send in the same write).  Termenv-based readers consume the first chunk
-/// off stdin, so ordering matters more than same-chunk freshness.
-///
-/// Only fully-terminated OSC sequences produce a reply: a query split
-/// across two process-output chunks is ignored until a later call carries
-/// the terminator.
-fn extractOscColorQueries(env: emacs.Env, term: *GhostelTerm, data: []const u8) void {
-    var it = OscIterator{ .data = data };
-    while (it.next()) |osc| {
-        switch (osc.code) {
-            10 => {
-                if (!std.mem.eql(u8, osc.payload, "?")) continue;
-                const fg = term.terminal.colors.foreground.get();
-                if (fg) |color| sendDynamicColorReply(env, 10, color, osc.terminator);
-            },
-            11 => {
-                if (!std.mem.eql(u8, osc.payload, "?")) continue;
-                const bg = term.terminal.colors.background.get();
-                if (bg) |color| sendDynamicColorReply(env, 11, color, osc.terminator);
-            },
-            4 => {
-                // Payload is a ';'-separated list of `index;value` pairs.
-                // Reply only to pairs whose value is literally "?".
-                var sub = std.mem.splitScalar(u8, osc.payload, ';');
-                while (sub.next()) |index_tok| {
-                    const value_tok = sub.next() orelse break;
-                    if (!std.mem.eql(u8, value_tok, "?")) continue;
-                    const idx = std.fmt.parseInt(u32, index_tok, 10) catch continue;
-                    if (idx >= 256) continue;
-                    const color = term.terminal.colors.palette.current[idx];
-                    sendPaletteColorReply(env, @intCast(idx), color, osc.terminator);
-                }
-            },
-            else => {},
-        }
+        pos = end + term_len;
     }
 }
 
@@ -781,7 +483,7 @@ fn fnRedraw(raw_env: ?*c.emacs_env, nargs: isize, args: [*c]c.emacs_value, _: ?*
         defer vt_log_env = null;
     }
 
-    term.renderer.redraw(env, term, force_full) catch |err| {
+    term.renderer.redraw(term.alloc, env, force_full) catch |err| {
         env.logStackTrace(@errorReturnTrace());
         env.signalError("Redraw failed: %s", .{@errorName(err)});
         return env.nil();
@@ -1074,7 +776,7 @@ fn fnCopyAllText(raw_env: ?*c.emacs_env, _: isize, args: [*c]c.emacs_value, _: ?
     };
 
     var formatter = gt.formatter.TerminalFormatter.init(&term.terminal, options);
-    var writer = std.io.Writer.Allocating.init(std.heap.c_allocator);
+    var writer = std.io.Writer.Allocating.init(alloc);
     defer writer.deinit();
     formatter.format(&writer.writer) catch {
         env.signalError("formatter failed", .{});
@@ -1241,7 +943,10 @@ fn titleChangedCallback(handler: *gt.TerminalStream.Handler) void {
 // zig log callback
 // ---------------------------------------------------------------------------
 
-pub const std_options: std.Options = .{ .logFn = logFn };
+pub const std_options: std.Options = .{
+    .logFn = logFn,
+    .log_level = if (builtin.mode == .Debug) .debug else .warn,
+};
 
 /// Global Emacs env stashed during any Elisp→Zig call where logging is
 /// active.  Only valid on the main thread while a Zig function is
@@ -1262,6 +967,8 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    std.log.defaultLog(message_level, scope, format, args);
+
     if (!vt_log_active) return;
     const env = vt_log_env orelse return;
     const level_str: []const u8 = switch (message_level) {

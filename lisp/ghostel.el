@@ -282,6 +282,14 @@ or backing scale factor."
   :type '(choice (const :tag "Auto-detect from display DPI" auto)
                  (number :tag "Explicit ratio")))
 
+(defcustom ghostel-glyph-scale-floor 0.0
+  "Minimum scale for glyphs whose font metrics don't fit the cell.
+0.0 (default) preserves strict grid alignment.  1.0 disables
+shrinking entirely so CJK and other fallback glyphs render at
+natural size, potentially making rows slightly taller and cells slightly wider."
+  :type '(float 0.0 1.0)
+  :local t)
+
 (defcustom ghostel-kitty-graphics-storage-limit (* 320 1024 1024)  ; 320 MiB
   "Kitty graphics image storage cap, in bytes, per terminal.
 
@@ -5377,18 +5385,21 @@ the rest of Emacs (e.g. a dark terminal inside a light Emacs)."
 
 (defun ghostel--face-hex-color (face attr)
   "Extract hex color string from FACE's ATTR (:foreground or :background).
-Falls back to \"#000000\" if the color cannot be resolved."
+Falls back to white (for :foreground) or black (for :background)."
   (or (let ((color (face-attribute face attr nil 'default)))
-        (when (and (stringp color) (not (string= color "unspecified")))
+        (when (and (stringp color)
+                   (not (member color '("unspecified"
+                                        "unspecified-fg"
+                                        "unspecified-bg"))))
           (let ((rgb (color-values color)))
             (if rgb
                 (apply #'format "#%02x%02x%02x"
                        (mapcar (lambda (c) (ash c -8)) rgb))
-              ;; Batch mode: color-values returns nil without a display.
-              ;; If the color is already "#RRGGBB", use it directly.
+              ;; Batch mode / TTY: color-values returns nil without a
+              ;; display.  If the color is already "#RRGGBB", use it.
               (and (string-prefix-p "#" color) (= (length color) 7)
                    color)))))
-      "#000000"))
+      (if (eq attr :foreground) "#ffffff" "#000000")))
 
 (defun ghostel--apply-palette (term)
   "Apply colors from `ghostel-color-palette' faces and default fg/bg to TERM."

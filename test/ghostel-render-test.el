@@ -311,6 +311,24 @@ through without cross-call munging.)"
                  (string-prefix-p "#" color)
                  (= (length color) 7)))))
 
+(ert-deftest ghostel-test-face-hex-color-tty-unspecified ()
+  "TTY sentinel colors must not collapse fg and bg to the same hex (#297).
+On a Linux framebuffer the `default' face reports \"unspecified-fg\" and
+\"unspecified-bg\".  If `ghostel--face-hex-color' returned the same
+fallback for both, the buffer default face was remapped black-on-black
+and typed text was invisible."
+  (cl-letf (((symbol-function 'face-attribute)
+             (lambda (_face attr &optional _frame _inherit)
+               (pcase attr
+                 (:foreground "unspecified-fg")
+                 (:background "unspecified-bg")
+                 (_ 'unspecified)))))
+    (let ((fg (ghostel--face-hex-color 'ghostel-default :foreground))
+          (bg (ghostel--face-hex-color 'ghostel-default :background)))
+      (should (string-match-p "\\`#[0-9a-fA-F]\\{6\\}\\'" fg))
+      (should (string-match-p "\\`#[0-9a-fA-F]\\{6\\}\\'" bg))
+      (should-not (string= fg bg)))))
+
 (ert-deftest ghostel-test-hyperlinks ()
   "Test hyperlink keymap and helpers."
   :tags '(native)

@@ -157,7 +157,9 @@ the URI in the buffer."
       (ghostel--write-input term "\e]9;X\e\\")
       (should (equal '(("" . "X")) calls))
 
-      ;; Empty payload: no dispatch
+      ;; Empty payload is dropped at the handler — the elisp default
+      ;; notifier would just show the buffer name with an empty body,
+      ;; so there's nothing useful to dispatch.
       (setq calls nil)
       (ghostel--write-input term "\e]9;\e\\")
       (should (equal nil calls)))))
@@ -196,7 +198,15 @@ to the notification path — see `ghostel-test-osc9-invalid-conemu-notifies'."
   "Malformed ConEmu payloads fall through to notification.
 Mirrors ghostty-vt's parser: e.g. `9;10;4' and `9;10;abc' are
 invalid emulation args and surface as notifications with the raw
-payload as body."
+payload as body.
+
+Note: `9;5' and `9;12' are accepted as ConEmu wait-input / mark
+prompt-start regardless of trailing bytes (ghostty's parser does
+not require the bare form).  That means a notification body that
+starts with `5 ' or `12 ' is now lost — pre-refactor we had a
+defensive carve-out that fell back to the iTerm2 path, but with
+the handler-based dispatch we trust ghostty's parser as the
+authority for OSC 9 disambiguation."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000))
         (calls nil))
@@ -213,18 +223,7 @@ payload as body."
 
       (setq calls nil)
       (ghostel--write-input term "\e]9;10;abc\e\\")
-      (should (equal '(("" . "10;abc")) calls))
-
-      ;; Realistic iTerm2 notifications whose body starts with "5" or
-      ;; "12" must not be swallowed by the ConEmu wait-input / prompt
-      ;; sub-codes (which only accept the bare form).
-      (setq calls nil)
-      (ghostel--write-input term "\e]9;5 minutes left\e\\")
-      (should (equal '(("" . "5 minutes left")) calls))
-
-      (setq calls nil)
-      (ghostel--write-input term "\e]9;12 monkeys\e\\")
-      (should (equal '(("" . "12 monkeys")) calls)))))
+      (should (equal '(("" . "10;abc")) calls)))))
 
 (ert-deftest ghostel-test-osc9-cwd-routing ()
   "OSC 9;9;PATH updates the terminal's working directory.
@@ -308,11 +307,13 @@ reported path and no notification fires."
     (ghostel--write-input term "\e]9;4;1;99999999999\e\\")
     (should (equal '((set 100)) calls))
 
-    ;; Non-numeric progress: value falls back to the state's default
-    ;; (0 for set, nil for error/pause).
+    ;; Non-numeric progress arrives as nil — ghostty's parser pre-fills
+    ;; progress=0 for state=.set, but `;<unparseable>` reaches the value
+    ;; branch and `parseUnsigned` failure writes nil over that pre-fill.
+    ;; (Bare `9;4;1` with no value at all still yields 0 — see above.)
     (setq calls nil)
     (ghostel--write-input term "\e]9;4;1;foo\e\\")
-    (should (equal '((set 0)) calls))
+    (should (equal '((set nil)) calls))
     (setq calls nil)
     (ghostel--write-input term "\e]9;4;2;foo\e\\")
     (should (equal '((error nil)) calls))))
@@ -353,10 +354,20 @@ reported path and no notification fires."
       (ghostel--write-input term "\e]777;notify;T;B\a")
       (should (equal '(("T" . "B")) calls))
 
-      ;; Empty title, empty body
+      ;; Empty title AND empty body is dropped at the handler — same
+      ;; rule as OSC 9 (the elisp default notifier has nothing useful
+      ;; to show).  Non-empty title or body still dispatches.
       (setq calls nil)
       (ghostel--write-input term "\e]777;notify;;\e\\")
-      (should (equal '(("" . "")) calls))
+      (should (equal nil calls))
+
+      (setq calls nil)
+      (ghostel--write-input term "\e]777;notify;T;\e\\")
+      (should (equal '(("T" . "")) calls))
+
+      (setq calls nil)
+      (ghostel--write-input term "\e]777;notify;;B\e\\")
+      (should (equal '(("" . "B")) calls))
 
       ;; Unknown extension is dropped
       (setq calls nil)
@@ -671,24 +682,25 @@ that motivated the face-cache fix on the progress callpath."
         (should (= 3 fmlu-calls))))))
 
 (ert-deftest ghostel-test-osc-partial-does-not-starve-later ()
-  "A partial OSC must not cannibalize or starve a following complete OSC.
-Input \"\\e]7;PARTIAL\\e]52;c;aGVsbG8=\\a\" would, under a naive
-single-pass scanner, let the OSC 7 payload absorb the OSC 52's BEL
-terminator — yielding a garbage PWD dispatch and no clipboard.  The
-iterator must treat the intervening \\e] as a partial-OSC boundary,
-skip the OSC 7, and still dispatch the OSC 52."
+  "A partial OSC must not cannibalize a following complete OSC.
+Input \"\\e]7;PARTIAL\\e]52;c;aGVsbG8=\\a\" used to be treated as
+two distinct OSCs by ghostel's own scanner: the partial OSC 7 was
+dropped and OSC 52 dispatched.  ghostty-vt's OSC parser treats the
+intervening \\e] as the end of the OSC 7 (truncating its payload to
+\"PARTIAL\") and then starts OSC 52 fresh — both dispatch, and the
+truncated OSC 7 lands as PWD = \"PARTIAL\".  This test pins the new
+behavior so a regression toward the old reject-partial logic would
+be caught."
   :tags '(native)
   (let ((term (ghostel--new 25 80 1000))
         (ghostel-enable-osc52 t)
-        (kill-ring nil)
-        (pwd-before (ghostel--get-pwd (ghostel--new 25 80 1000))))
+        (kill-ring nil))
     (ghostel--write-input term "\e]7;PARTIAL\e]52;c;aGVsbG8=\a")
     ;; OSC 52 dispatched: "hello" in kill-ring.
     (should kill-ring)
     (should (equal "hello" (car kill-ring)))
-    ;; OSC 7 NOT dispatched with the garbage payload "PARTIAL\e]52;c;aGVsbG8="
-    ;; — the PWD should still be whatever a fresh terminal reports (nil).
-    (should (equal pwd-before (ghostel--get-pwd term)))))
+    ;; OSC 7 dispatched with the truncated payload "PARTIAL".
+    (should (equal "PARTIAL" (ghostel--get-pwd term)))))
 
 (ert-deftest ghostel-test-osc-color-query ()
   "Test that OSC 4/10/11 color queries get responses."

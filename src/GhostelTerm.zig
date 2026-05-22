@@ -3,18 +3,25 @@
 /// Holds the resources for a single instance of a Ghostel terminal
 ///
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const emacs = @import("emacs.zig");
 const gt = @import("ghostty-vt");
+const GhostelHandler = @import("GhostelHandler.zig");
 const Renderer = @import("Renderer.zig");
 
 const Self = @This();
 
+/// Allocator used for all owned allocations; injected at init time.
+alloc: Allocator,
+
 /// The libghostty Terminal.
 terminal: gt.Terminal,
 
-/// The libghostty Stream
-stream: gt.TerminalStream,
+/// The libghostty Stream, wrapped in our `GhostelHandler` so we can
+/// intercept OSC actions (PWD, clipboard, notifications, color queries,
+/// semantic prompt) without re-parsing the bytes ourselves.
+stream: gt.Stream(GhostelHandler),
 
 /// True iff the last byte of the previous `fnWriteInput` input was
 /// `\r`. Carries the bare-LF detection state across write-input calls
@@ -34,7 +41,7 @@ renderer: Renderer,
 env: ?emacs.Env = null,
 
 /// Create a new terminal with the given dimensions and scrollback.
-pub fn init(cols: u16, rows: u16, max_scrollback: usize, effects: gt.TerminalStream.Handler.Effects) !*Self {
+pub fn init(alloc: Allocator, cols: u16, rows: u16, max_scrollback: usize, effects: gt.TerminalStream.Handler.Effects) !*Self {
     if (cols == 0 or rows == 0) return error.InvalidSize;
 
     const opts = gt.Terminal.Options{
@@ -47,32 +54,33 @@ pub fn init(cols: u16, rows: u16, max_scrollback: usize, effects: gt.TerminalStr
         },
     };
 
-    const term = try std.heap.c_allocator.create(Self);
-    errdefer std.heap.c_allocator.destroy(term);
+    const term = try alloc.create(Self);
+    errdefer alloc.destroy(term);
 
     term.* = Self{
-        .terminal = try .init(std.heap.c_allocator, opts),
+        .alloc = alloc,
+        .terminal = try .init(alloc, opts),
         .renderer = undefined,
         .stream = undefined,
     };
-    errdefer term.terminal.deinit(std.heap.c_allocator);
+    errdefer term.terminal.deinit(alloc);
 
-    var handler = term.terminal.vtHandler();
-    handler.effects = effects;
-    term.stream = .initAlloc(std.heap.c_allocator, handler);
+    var handler = GhostelHandler.init(&term.terminal);
+    handler.inner.effects = effects;
+    term.stream = .initAlloc(alloc, handler);
     errdefer term.stream.deinit();
 
-    term.renderer = try .init(&term.terminal);
+    term.renderer = try .init(alloc, &term.terminal);
 
     return term;
 }
 
 /// Free all ghostty resources.
 pub fn deinit(self: *Self) void {
-    self.renderer.deinit();
+    self.renderer.deinit(self.alloc);
     self.stream.deinit();
-    self.terminal.deinit(std.heap.c_allocator);
-    std.heap.c_allocator.destroy(self);
+    self.terminal.deinit(self.alloc);
+    self.alloc.destroy(self);
 }
 
 /// Set default foreground color.
@@ -135,12 +143,4 @@ pub fn vtWrite(self: *Self, data: []const u8) void {
 /// get promoted to scrollback due to vertical shrinking of the viewport.
 pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) void {
     self.renderer.resize(cols, rows, cell_w, cell_h);
-}
-
-/// Emacs finalizer — called when the user-ptr is garbage collected.
-pub fn emacsFinalize(ptr: ?*anyopaque) callconv(.c) void {
-    if (ptr) |p| {
-        const self: *Self = @ptrCast(@alignCast(p));
-        self.deinit();
-    }
 }
