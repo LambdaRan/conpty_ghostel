@@ -17,13 +17,26 @@ Ghostel 是嵌入 Emacs 的终端模拟器，基于 libghostty-vt 驱动。本�
 
 ### Windows
 
-在 MSYS2/Bash 环境下调用 `build.cmd` 需禁用路径转换：
+```bash
+build.cmd                  # Release 构建
+build.cmd debug            # Debug 构建
+build.cmd clean            # 清理所有构建产物
+```
+
+在 MSYS2/Bash 环境下调用需禁用路径转换：
 
 ```bash
 MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
 ```
 
 依赖：Zig 0.15.2+，Emacs 头文件从 `C:\Program Files\Emacs\` 自动检测（或设置 `EMACS_INCLUDE_DIR`）。
+
+#### Windows 构建注意事项
+
+- **GNU ABI**：必须使用 `-Dtarget=native-native-gnu` 以避免 MSVC libcpmt 链接冲突
+- **`ZIG_GLOBAL_CACHE_DIR`**：Zig 0.15 的依赖子进程在全局缓存与项目不在同一驱动器时 panic（`Run.zig:662`），`build.cmd` 自动将其固定到项目目录下
+- **`link_libcpp`**：`build.zig` 中 Windows 条件启用，simdutf/highway 需要 C++ 运行时
+- **`vendor/ghostty/`**：历史遗留目录，当前构建不再使用（Zig 依赖系统直接从 `build.zig.zon` 的 URL 获取）
 
 ### Unix
 ```
