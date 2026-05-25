@@ -5,6 +5,7 @@
 /// and registers all Elisp-callable functions.
 const std = @import("std");
 const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
 const emacs = @import("emacs.zig");
 const ComintFilter = @import("comint_filter.zig");
 const GhostelTerm = @import("GhostelTerm.zig");
@@ -137,7 +138,88 @@ const emacs_functions = [_]emacs.FunctionEntry{
             }
         },
     },
+    .{
+        .name = "ghostel--conpty-resize",
+        .arity = .{ 3, 3 },
+        .doc =
+        \\Resize the ConPTY pseudo-console by writing to the control named pipe.
+        \\
+        \\(ghostel--conpty-resize ID WIDTH HEIGHT)
+        ,
+        .impl = struct {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+                return fnConptyResize(env, args);
+            }
+        },
+    },
 };
+
+/// (ghostel--conpty-resize ID WIDTH HEIGHT)
+/// Resize the ConPTY pseudo-console by writing directly to the control
+/// named pipe, avoiding a process spawn on every resize.
+/// Returns t on success, nil on failure.
+fn fnConptyResize(env: emacs.Env, args: [*c]emacs.Value) emacs.Value {
+    if (comptime builtin.os.tag != .windows) {
+        return env.nil();
+    }
+
+    const HANDLE = *anyopaque;
+    const DWORD = u32;
+    const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+    const GENERIC_WRITE = 0x40000000;
+    const OPEN_EXISTING: DWORD = 3;
+
+    const kernel32 = struct {
+        extern "kernel32" fn CreateFileA(
+            lpFileName: [*:0]const u8,
+            dwDesiredAccess: DWORD,
+            dwShareMode: DWORD,
+            lpSecurityAttributes: ?*anyopaque,
+            dwCreationDisposition: DWORD,
+            dwFlagsAndAttributes: DWORD,
+            hTemplateFile: ?HANDLE,
+        ) callconv(.winapi) HANDLE;
+        extern "kernel32" fn WriteFile(
+            hFile: HANDLE,
+            lpBuffer: [*]const u8,
+            nNumberOfBytesToWrite: DWORD,
+            lpNumberOfBytesWritten: *DWORD,
+            lpOverlapped: ?*anyopaque,
+        ) callconv(.winapi) i32;
+        extern "kernel32" fn CloseHandle(
+            hObject: HANDLE,
+        ) callconv(.winapi) i32;
+    };
+
+    var id_buf: [64]u8 = undefined;
+    const id = env.extractString(args[0], &id_buf) orelse return env.nil();
+    const width: u16 = @intCast(env.extractInteger(args[1]));
+    const height: u16 = @intCast(env.extractInteger(args[2]));
+
+    var pipename_buf: [128]u8 = undefined;
+    const pipename = std.fmt.bufPrintZ(&pipename_buf, "\\\\.\\pipe\\conpty-proxy-ctrl-{s}", .{id}) catch return env.nil();
+
+    const pipe = kernel32.CreateFileA(
+        pipename,
+        GENERIC_WRITE,
+        0,
+        null,
+        OPEN_EXISTING,
+        0,
+        null,
+    );
+    if (pipe == INVALID_HANDLE_VALUE) {
+        return env.nil();
+    }
+    defer _ = kernel32.CloseHandle(pipe);
+
+    var msg_buf: [32]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "{d} {d}", .{ width, height }) catch return env.nil();
+
+    var written: DWORD = 0;
+    _ = kernel32.WriteFile(pipe, msg.ptr, @intCast(msg.len), &written, null);
+    return env.t();
+}
 
 // ---------------------------------------------------------------------------
 // zig log callback

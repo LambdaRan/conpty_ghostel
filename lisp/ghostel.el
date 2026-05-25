@@ -5599,8 +5599,11 @@ Search order: `ghostel-conpty-proxy-path', PATH, ghostel resource root."
                   (candidate (expand-file-name "conpty_proxy.exe" root)))
         (and (file-executable-p candidate) candidate))))
 
-(defun ghostel--conpty-proxy-make-process (width height &optional extra-env)
+(defun ghostel--conpty-proxy-make-process (shell shell-args width height
+                                                &optional extra-env)
   "Start a shell process via conpty-proxy for Windows.
+SHELL is the resolved shell program, SHELL-ARGS its argument list
+\(e.g. integration args like \"--posix\" for bash).
 WIDTH and HEIGHT are the terminal dimensions in characters.
 EXTRA-ENV is an optional list of environment variable strings
 \(e.g. shell integration env) prepended to `process-environment'."
@@ -5627,7 +5630,7 @@ EXTRA-ENV is an optional list of environment variable strings
                               "new" ,conpty-id
                               ,(number-to-string width)
                               ,(number-to-string height)
-                              ,ghostel-shell)
+                              ,shell ,@shell-args)
                    :filter #'ghostel--filter
                    :sentinel #'ghostel--sentinel)))
         (process-put proc 'conpty-id conpty-id)
@@ -6232,7 +6235,8 @@ on the remote host."
                        (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
                      integration-env))
          (proc (if (eq system-type 'windows-nt)
-                   (ghostel--conpty-proxy-make-process width height extra-env)
+                   (ghostel--conpty-proxy-make-process shell shell-args
+                                                       width height extra-env)
                  (let* ((spawn-spec (if (and ghostel-macos-login-shell
                                              (not remote-p)
                                              (eq system-type 'darwin))
