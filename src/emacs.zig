@@ -13,11 +13,19 @@ pub const c = @cImport({
     @cInclude("emacs-module.h");
 });
 
-/// Emacs value type alias for convenience.
 pub const Value = c.emacs_value;
+pub const RawEnv = ?*c.emacs_env;
+pub const FnArgs = [*c]Value;
+pub const FnData = ?*anyopaque;
+pub const UserPtr = ?*anyopaque;
+pub const Finalizer = fn (?*anyopaque) callconv(.c) void;
+pub const FuncallExit = enum(c_int) {
+    normal = 0,
+    signal = 1,
+    throw = 2,
+};
 
-const UserPtr = ?*anyopaque;
-const Finalizer = fn (?*anyopaque) callconv(.c) void;
+var alloc: Allocator = undefined;
 
 const DebugUserPtr = struct {
     ptr: UserPtr,
@@ -28,11 +36,15 @@ const DebugUserPtr = struct {
 /// explicitly free them before atexit fires. This allows us to check for
 /// memory leaks on exit.
 var debug_userptrs: std.ArrayList(DebugUserPtr) = .{};
-/// Set by the kill-emacs hook once all tracked userpts are freed; makes
-/// finalizers a no-op for any subsequent GC-driven callbacks.
-var debug_cleanup_done: bool = false;
 
-var alloc: Allocator = undefined;
+pub const FunctionEntry = struct {
+    name: [*:0]const u8,
+    arity: struct { i32, i32 },
+    doc: [*:0]const u8,
+    impl: type,
+};
+
+pub var current_env: ?Env = null;
 
 /// Emacs environment wrapper providing typed access to the module API.
 pub const Env = struct {
@@ -91,8 +103,13 @@ pub const Env = struct {
             if (debug_userptrs.append(alloc, .{ .ptr = ptr, .finalizer = &finalizer })) |_| {
                 const debugFinalizer = struct {
                     fn debugFinalize(p: ?*anyopaque) callconv(.c) void {
-                        if (debug_cleanup_done) return;
-                        finalizer(p);
+                        for (debug_userptrs.items, 0..) |item, i| {
+                            if (item.ptr == p) {
+                                finalizer(p);
+                                _ = debug_userptrs.orderedRemove(i);
+                                return;
+                            }
+                        }
                     }
                 }.debugFinalize;
                 return self.raw.make_user_ptr.?(self.raw, &debugFinalizer, ptr);
@@ -236,8 +253,8 @@ pub const Env = struct {
 
     // --- Non-local exit handling ---
 
-    pub fn nonLocalExitCheck(self: Env) c.enum_emacs_funcall_exit {
-        return self.raw.non_local_exit_check.?(self.raw);
+    pub fn nonLocalExitCheck(self: Env) FuncallExit {
+        return @enumFromInt(self.raw.non_local_exit_check.?(self.raw));
     }
 
     pub fn nonLocalExitClear(self: Env) void {
@@ -272,10 +289,28 @@ pub const Env = struct {
     }
 
     /// Register a named Elisp function backed by a C function.
-    pub fn bindFunction(self: Env, name: [*:0]const u8, min_arity: i32, max_arity: i32, func: *const fn (?*c.emacs_env, isize, [*c]c.emacs_value, ?*anyopaque) callconv(.c) c.emacs_value, docstring: [*:0]const u8) void {
-        const fun = self.makeFunction(min_arity, max_arity, func, docstring, null);
-        const name_sym = self.intern(name);
-        _ = self.funcall(sym.fset, &[_]Value{ name_sym, fun });
+    pub fn registerFunction(self: Env, entry: *const FunctionEntry) void {
+        const wrapped_fn = struct {
+            fn call(
+                raw_env: RawEnv,
+                nargs: isize,
+                args: FnArgs,
+                _: FnData,
+            ) callconv(.c) Value {
+                const env = Env.init(raw_env.?);
+                const prev_env = current_env;
+                current_env = env;
+                defer current_env = prev_env;
+                return entry.impl.call(env, nargs, args);
+            }
+        }.call;
+        const fun = self.makeFunction(entry.arity[0], entry.arity[1], &wrapped_fn, entry.doc, null);
+        _ = self.f("fset", .{ self.intern(entry.name), fun });
+    }
+
+    /// Register a named Elisp function backed by a C function.
+    pub fn registerFunctions(self: Env, entries: []const FunctionEntry) void {
+        inline for (entries) |*entry| self.registerFunction(entry);
     }
 
     /// Call (provide 'feature).
@@ -289,11 +324,7 @@ pub const Env = struct {
         return self.f("point", .{});
     }
 
-    pub fn gotoChar(self: Env, pos: Value) void {
-        _ = self.f("goto-char", .{pos});
-    }
-
-    pub fn gotoCharN(self: Env, pos: i64) void {
+    pub fn gotoChar(self: Env, pos: anytype) void {
         _ = self.f("goto-char", .{pos});
     }
 
@@ -301,7 +332,7 @@ pub const Env = struct {
         _ = self.f("insert", .{text});
     }
 
-    pub fn forwardLine(self: Env, n: i64) i64 {
+    pub fn forwardLine(self: Env, n: anytype) i64 {
         return self.extractInteger(self.f("forward-line", .{n}));
     }
 
@@ -341,8 +372,12 @@ pub const Env = struct {
         return self.f("set-marker", .{ marker, pos });
     }
 
-    pub fn deleteRegion(self: Env, start: Value, end: Value) void {
+    pub fn deleteRegion(self: Env, start: anytype, end: anytype) void {
         _ = self.f("delete-region", .{ start, end });
+    }
+
+    pub fn eobp(self: Env) bool {
+        return self.isNotNil(self.f("eobp", .{}));
     }
 
     pub fn putTextProperty(
@@ -427,11 +462,14 @@ pub const Env = struct {
 // ---------------------------------------------------------------------------
 
 const interned_symbols = [_][:0]const u8{
+    "eobp",
     ":background",
     ":color",
     ":error",
     ":font",
     ":foreground",
+    ":inverse-video",
+    ":overline",
     ":slant",
     ":strike-through",
     ":style",
@@ -481,11 +519,12 @@ const interned_symbols = [_][:0]const u8{
     "ghostel--osc52-handle",
     "ghostel--query-font-cached",
     "ghostel--rendered-font",
-    "ghostel-glyph-scale-floor",
     "ghostel--set-buffer-face",
     "ghostel--set-cursor-style",
     "ghostel--set-title",
     "ghostel--update-directory",
+    "ghostel-comint--update-dir",
+    "ghostel-glyph-scale-floor",
     "ghostel-input",
     "ghostel-link-map",
     "ghostel-prompt",
@@ -573,6 +612,5 @@ fn debugKillEmacsHook(_: ?*c.emacs_env, _: isize, _: [*c]c.emacs_value, _: ?*any
         user_ptr.finalizer(user_ptr.ptr);
     }
     debug_userptrs.deinit(alloc);
-    debug_cleanup_done = true;
     return sym.nil;
 }

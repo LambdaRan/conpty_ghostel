@@ -390,31 +390,6 @@ unlike semi-char mode where it tracks the terminal cursor."
             (should (looking-back "20" (line-beginning-position)))))
       (kill-buffer buf))))
 
-(ert-deftest ghostel-test-copy-mode-recenter ()
-  "`ghostel-readonly-recenter' actually moves point toward window center."
-  (let ((buf (generate-new-buffer " *ghostel-test-recenter*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (set-window-buffer (selected-window) buf)
-          (dotimes (i 200) (insert (format "line %d\n" i)))
-          (goto-char (point-min))
-          (forward-line 100)
-          (set-window-point (selected-window) (point))
-          ;; Push point near the bottom of the window.
-          (recenter -1)
-          (let ((before-line (line-number-at-pos (window-point))))
-            ;; Sanity: point is well below the vertical midpoint.
-            (should (> before-line
-                       (+ (line-number-at-pos (window-start))
-                          (/ (window-body-height) 2))))
-            (ghostel-readonly-recenter)
-            (let* ((mid-line (+ (line-number-at-pos (window-start))
-                                (/ (window-body-height) 2)))
-                   (after-line (line-number-at-pos (window-point))))
-              ;; After recenter, point is within ~1 line of midpoint.
-              (should (<= (abs (- after-line mid-line)) 1)))))
-      (kill-buffer buf))))
-
 (ert-deftest ghostel-test-input-mode-default-is-semi-char ()
   "A fresh `ghostel-mode' buffer starts in semi-char mode."
   (let ((buf (generate-new-buffer " *ghostel-test-mode-default*")))

@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.28.0
+;; Version: 0.29.0
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1") (compat "30.1.0.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -725,7 +725,7 @@ When nil, falls back to `tramp-default-method'."
                  string))
 
 (defcustom ghostel-keymap-exceptions
-  '("C-c" "C-x" "C-u" "C-h" "M-x" "M-o" "M-:" "C-\\")
+  '("C-c" "C-x" "C-u" "C-h" "M-x" "M-:" "C-\\")
   "Key sequences that should not be sent to the terminal.
 These keys pass through to Emacs instead."
   :type '(repeat string))
@@ -1016,7 +1016,7 @@ Used when `cursor-in-non-selected-windows' resolves to box.")
 
 ;;; Automatic download and compilation of native module
 
-(defconst ghostel--minimum-module-version "0.28.0"
+(defconst ghostel--minimum-module-version "0.29.0"
   "Minimum native module version required by this Elisp version.
 Bump this only when the Elisp code requires a newer native module
 \(e.g. new Zig-exported function or changed calling convention).")
@@ -1793,7 +1793,7 @@ When NO-EXCEPTIONS is non-nil, also bind the keys in
   (define-key map (kbd "DEL") #'ghostel--send-event)
   ;; Emacs reports S-TAB as <backtab>
   (define-key map (kbd "<backtab>") #'ghostel--send-event)
-  ;; Control keys — bind all C-<letter> to send ASCII control codes.
+  ;; Control keys - bind all C-<letter> to send ASCII control codes.
   ;; C-i = TAB and C-m = RET are equivalent to <tab>/<return> (bound above).
   ;; C-y is reserved for ghostel-yank in semi-char mode.
   ;; C-g is always handled by `ghostel-send-C-g' so the mark and
@@ -1808,13 +1808,24 @@ When NO-EXCEPTIONS is non-nil, also bind the keys in
                       (let ((code (- c 96)))
                         (lambda () (interactive)
                           (ghostel--send-string (string code)))))))))
-  ;; Meta and Control-Meta keys - bind all (C-)M-<letter> so they reach
-  ;; the terminal instead of running Emacs commands like forward-word.
+  ;; Meta keys - bind M-<printable ASCII> so the full set reaches the terminal.
+  ;; Skip ?\[ and ?O: those are escape-sequence prefixes (CSI / SS3)
+  ;; used by Emacs input decoding for arrow/function keys in TTY mode.
+  (dolist (c (number-sequence ?! ?~))
+    (unless (memq c '(?\[ ?O))
+      (let ((key-str (format "M-%c" c)))
+        (when (or no-exceptions
+                  (not (member key-str ghostel-keymap-exceptions)))
+          (ignore-errors
+            (define-key map (kbd key-str) #'ghostel--send-event))))))
+  ;; M-SPC: `(format "M-%c" ?\s)' yields "M- ", which `kbd' rejects.
+  (let ((key-str "M-SPC"))
+    (when (or no-exceptions
+              (not (member key-str ghostel-keymap-exceptions)))
+      (define-key map (kbd key-str) #'ghostel--send-event)))
+  ;; Control-Meta keys - C-M-<letter> only; C-M-<punct>/<digit> aren't
+  ;; widely supported by terminal apps.
   (dolist (c (number-sequence ?a ?z))
-    (let ((key-str (format "M-%c" c)))
-      (when (or no-exceptions
-                (not (member key-str ghostel-keymap-exceptions)))
-        (define-key map (kbd key-str) #'ghostel--send-event)))
     (let ((key-str (format "C-M-%c" c)))
       (when (or no-exceptions
                 (not (member key-str ghostel-keymap-exceptions)))
@@ -1971,7 +1982,6 @@ top so that \\`q', \\`C-g', or any self-insert key exits."
   "C-w"            #'ghostel-readonly-copy
   "M->"            #'ghostel-readonly-end-of-buffer
   "C-e"            #'ghostel-readonly-end-of-line
-  "C-l"            #'ghostel-readonly-recenter
   "RET"            #'ghostel-open-link-at-point
   "<return>"       #'ghostel-open-link-at-point)
 
@@ -2142,9 +2152,10 @@ Returns the sequence string, or nil for unknown keys."
            (<= ?a (aref key-name 0)) (<= (aref key-name 0) ?z)
            (> (logand mod-num 4) 0))        ; ctrl bit
       (string (- (aref key-name 0) 96)))    ; ctrl-a=1, ctrl-z=26
-     ;; Meta + single letter → ESC + char
+     ;; Meta + printable ASCII → ESC + char (legacy alt encoding)
      ((and (= (length key-name) 1)
-           (<= ?a (aref key-name 0)) (<= (aref key-name 0) ?z)
+           (let ((c (aref key-name 0)))
+             (and (>= c 32) (<= c 126)))
            (> (logand mod-num 2) 0))        ; alt/meta bit
       (format "\e%c" (aref key-name 0)))
      ;; Simple special keys (CSI u encoding for modified variants)
@@ -2518,11 +2529,6 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
   (interactive)
   (end-of-line)
   (skip-chars-backward " \t"))
-
-(defun ghostel-readonly-recenter ()
-  "Recenter the current line in the window."
-  (interactive)
-  (recenter))
 
 
 ;;; Mouse input
@@ -3038,16 +3044,20 @@ press anywhere else exits and forwards a CR to the terminal."
 (defun ghostel--filter-soft-wraps (text)
   "Remove newlines from TEXT that were inserted by soft line wrapping.
 These are newlines with the `ghostel-wrap' text property."
-  (let ((result "")
+  (let ((chunks nil)
+        (chunk-start 0)
         (pos 0)
         (len (length text)))
     (while (< pos len)
-      (if (and (eq (aref text pos) ?\n)
-               (get-text-property pos 'ghostel-wrap text))
-          (setq pos (1+ pos))
-        (setq result (concat result (substring text pos (1+ pos)))
-              pos (1+ pos))))
-    result))
+      (when (and (eq (aref text pos) ?\n)
+                 (get-text-property pos 'ghostel-wrap text))
+        (when (< chunk-start pos)
+          (push (substring text chunk-start pos) chunks))
+        (setq chunk-start (1+ pos)))
+      (setq pos (1+ pos)))
+    (when (< chunk-start len)
+      (push (substring text chunk-start len) chunks))
+    (string-join (nreverse chunks))))
 
 (defun ghostel--clean-copy-text (text)
   "Clean TEXT for copying: remove soft-wrap newlines, strip trailing whitespace."
@@ -6751,6 +6761,15 @@ PROCESS is the shell process, WINDOWS is the list of windows."
            ;; No change — skip entirely.
            ((and (eql height ghostel--term-rows)
                  (eql width ghostel--term-cols))
+            (setq size nil))
+           ;; Don't resize on minibuffer-induced rows-only change.
+           ;; E.g. fish clears and re-emits its prompt on every SIGWINCH;
+           ;; a `consult-buffer'/`M-x' cycle that grows then shrinks the body
+           ;; would otherwise produce two prompt repaints in quick succession.
+           ;; Skip the deferral on the alt screen TUIs.
+           ((and (active-minibuffer-window)
+                 (eql width ghostel--term-cols)
+                 (not (ghostel--alt-screen-p ghostel--term)))
             (setq size nil))
            ;; Real resize — update the terminal model and redraw.
            (t

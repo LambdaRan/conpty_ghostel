@@ -39,6 +39,17 @@
   ;; Unknown key
   (should (equal nil (ghostel--raw-key-sequence "xyzzy" ""))))        ; unknown
 
+(ert-deftest ghostel-test-raw-key-meta-printable ()
+  "Meta + any printable ASCII char encodes as ESC followed by that char.
+Covers punctuation, digits, uppercase, space, and lowercase letters."
+  (should (equal "\e." (ghostel--raw-key-sequence "." "meta")))
+  (should (equal "\e," (ghostel--raw-key-sequence "," "meta")))
+  (should (equal "\e1" (ghostel--raw-key-sequence "1" "meta")))
+  (should (equal "\eA" (ghostel--raw-key-sequence "A" "meta")))
+  (should (equal "\e " (ghostel--raw-key-sequence " " "meta")))
+  ;; Lowercase letters still work (existing behavior)
+  (should (equal "\eb" (ghostel--raw-key-sequence "b" "meta"))))
+
 (ert-deftest ghostel-test-modifier-number ()
   "Test modifier bitmask parsing."
   (should (equal 0 (ghostel--modifier-number "")))            ; no mods
@@ -79,6 +90,8 @@
         (sim (aref (kbd "M-<left>") 0)    "left"      "meta")
         (sim (aref (kbd "S-<f5>") 0)      "f5"        "shift")
         (sim (aref (kbd "C-S-<return>") 0) "return"   "ctrl,shift")
+        (sim (aref (kbd "M-.") 0)  "."  "meta")
+        (sim (aref (kbd "M-1") 0)  "1"  "meta")
         ;; backtab (Emacs's name for S-TAB)
         (sim (aref (kbd "<backtab>") 0)   "tab"       "shift")))))
 
@@ -422,15 +435,34 @@ by the input-mode refactor)."
               #'ghostel-send-C-g)))
 
 (ert-deftest ghostel-test-meta-key-bindings ()
-  "All non-exception M-<letter> keys should be bound in semi-char-mode-map."
-  (dolist (c (number-sequence ?a ?z))
-    (let* ((key-str (format "M-%c" c))
-           (key-vec (kbd key-str))
-           (binding (lookup-key ghostel-semi-char-mode-map key-vec)))
-      (unless (eq c ?y)  ; M-y is ghostel-yank-pop
-        (if (member key-str ghostel-keymap-exceptions)
-            (should-not (eq binding #'ghostel--send-event))
-          (should (eq binding #'ghostel--send-event))))))
+  "All non-exception M-<printable ASCII> keys should be bound in semi-char-mode.
+Covers digits (M-1..M-9), punctuation (M-., M-,, M-/, ...), uppercase, and
+lowercase letters.  Regression test for issue #314: only M-<a-z> was bound,
+so M-<punct>/M-<digit> fell through to Emacs commands like
+`xref-find-definitions'."
+  (dolist (c (number-sequence ?! ?~))
+    ;; ?y = ghostel-yank-pop; ?\[ and ?O are escape-sequence prefixes
+    ;; intentionally not bound (would clobber TTY input decoding).
+    (unless (memq c '(?y ?\[ ?O))
+      (let* ((key-str (format "M-%c" c))
+             (key-vec (ignore-errors (kbd key-str)))
+             (binding (and key-vec
+                           (lookup-key ghostel-semi-char-mode-map key-vec))))
+        (when key-vec
+          (if (member key-str ghostel-keymap-exceptions)
+              (should-not (eq binding #'ghostel--send-event))
+            (should (eq binding #'ghostel--send-event)))))))
+  ;; Explicit regression guards for the keys called out in issue #314.
+  (dolist (key-str '("M-." "M-," "M-/" "M-;" "M-1" "M-9" "M-!" "M-A" "M-Z"))
+    (should (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
+                #'ghostel--send-event)))
+  ;; M-SPC: source binds this explicitly because `(kbd "M- ")' won't parse.
+  (should (eq (lookup-key ghostel-semi-char-mode-map (kbd "M-SPC"))
+              #'ghostel--send-event))
+  ;; Default exceptions (M-x, M-o, M-:) must still fall through to Emacs.
+  (dolist (key-str '("M-x" "M-:"))
+    (should-not (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
+                    #'ghostel--send-event)))
   (should (eq (lookup-key ghostel-semi-char-mode-map (kbd "M-y")) #'ghostel-yank-pop))
   ;; M-DEL must be bound so TTY Alt-Backspace ([27 127]) routes through
   ;; ghostel--send-event instead of global backward-kill-word.
@@ -463,6 +495,19 @@ Regression test for issue #239: these byte sequences match readline
       (setq sent nil)
       (should (ghostel--encode-key term "v" "ctrl,meta" nil))
       (should (equal "\e\x16" sent)))))
+
+(ert-deftest ghostel-test-send-encoded-meta-period ()
+  "M-. sends ESC + period via raw fallback (legacy alt encoding)."
+  :tags '(native)
+  (let* ((term (ghostel--new 25 80 1000))
+         (sent nil))
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+              ((symbol-function 'process-send-string)
+               (lambda (_proc str) (setq sent str))))
+      (setq ghostel--term term
+            ghostel--process 'fake)
+      (ghostel--send-encoded "." "meta")
+      (should (equal "\e." sent)))))
 
 (ert-deftest ghostel-test-special-key-modifier-bindings ()
   "Modified special keys are bound unless in `ghostel-keymap-exceptions'.
@@ -531,6 +576,8 @@ but `this-command-keys-vector' retains the ESC prefix."
         (sim-tty (vector 27 ?b)   ?b  "b" "meta")
         (sim-tty (vector 27 ?f)   ?f  "f" "meta")
         (sim-tty (vector 27 ?d)   ?d  "d" "meta")
+        (sim-tty (vector 27 ?.)  ?.  "." "meta")
+        (sim-tty (vector 27 ?1)  ?1  "1" "meta")
         ;; M-DEL in TTY: ESC then 127 → backspace + meta
         (sim-tty (vector 27 127)  127 "backspace" "meta")
         ;; Already-meta event (shouldn't double-add meta)

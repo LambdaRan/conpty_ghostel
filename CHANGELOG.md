@@ -4,7 +4,98 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.28.0] — 2026-05-19
+## [0.29.0] — 2026-05-23
+
+### Added
+- `ghostel-comint-mode` (and `global-ghostel-comint-mode`)
+  replaces `ansi-color-process-output` with a full libghostty VT
+  parser as a comint preoutput filter.  Handles truecolor /
+  256-color SGR, italic / faint / strikethrough / overline, curly /
+  dotted / dashed / double underline (including colon-separator
+  forms), underline colour, OSC 8 hyperlinks (reusing
+  `ghostel-link-map` so clicks dispatch by URI scheme), OSC 7
+  working-directory reports, and silently consumes DCS / APC / SS3
+  without leaking bytes.  Unstyled runs inherit the comint
+  buffer's default face; inverse is emitted as `:inverse-video t`.
+  When `font-lock-mode` is on, the filter swaps `face` for
+  `font-lock-face` to survive font-lock's unfontify pass.
+  Ref [#278](https://github.com/dakra/ghostel/issues/278).
+- `ghostel-glyph-scale-floor` buffer-local defcustom (number,
+  0.0–1.0, default 0.0) clamps the computed glyph scale from
+  below.  At 0.0 the existing strict-grid behaviour is unchanged;
+  at 1.0 CJK and other fallback glyphs render at natural font
+  size at the cost of slightly taller rows.  Being buffer-local,
+  different ghostel buffers can use different settings.
+  Closes [#298](https://github.com/dakra/ghostel/issues/298).
+- Semi-char mode now forwards `M-<digit>`, `M-<punct>`, and
+  `M-<uppercase>` (plus `M-SPC`) to the terminal.  Previously the
+  `M-` loop only covered `?a..?z`, so `M-.`, `M-1`, `M-/`, `M-;`,
+  etc. fell through to Emacs global commands instead of reaching
+  the shell.  CSI/SS3 escape-sequence prefixes (`M-[`, `M-O`) are
+  still left to TTY input decoding.
+  Fixes [#314](https://github.com/dakra/ghostel/issues/314).
+
+### Fixed
+- `ghostel--filter-soft-wraps` was O(n²) due to one-character-at-
+  a-time string concatenation, causing multi-second freezes when
+  copying large selections (e.g. full scrollback) with `M-w` in
+  copy mode.  Replaced with a chunk-collection approach.
+- Skip rows-only resize while a minibuffer is active.  Fish (and
+  other shells with `fish_handle_reflow` on) repaints its prompt
+  on every SIGWINCH; a `consult-buffer` / `M-x` cycle grew then
+  shrank the body of the window showing the ghostel buffer,
+  producing two prompt repaints in quick succession.  The deferral
+  hits the no-change branch after the minibuffer closes.  Col
+  changes and non-minibuffer vertical resizes still propagate so
+  `$LINES` stays accurate.
+  Fixes [#268](https://github.com/dakra/ghostel/issues/268).
+- CRLF normalization is now skipped on the alternate screen.  Apps
+  like tmux, vim, and less emit VT-correct sequences where a bare
+  `\n` means LF; normalizing them to `\r\n` corrupted their
+  layout.  Detection covers all three alt-screen entry modes
+  (DECSET 47 / 1047 / 1049).
+- Default-styled text is no longer invisible on the Linux
+  framebuffer TTY.  `ghostel--face-hex-color` only recognised the
+  literal `"unspecified"` string as unset, so on a TTY frame where
+  the default face reports `"unspecified-fg"` / `"unspecified-bg"`
+  it fell through to a `"#000000"` fallback for both attributes,
+  collapsing fg and bg to black-on-black.  All three sentinel
+  strings are now recognised; the last-resort fallback splits into
+  white for `:foreground` and black for `:background`.
+  Fixes [#297](https://github.com/dakra/ghostel/issues/297).
+
+### Changed
+- Removed `ghostel-readonly-recenter` — no longer needed now that
+  scrollback is materialized into the buffer.
+  Fixes [#310](https://github.com/dakra/ghostel/issues/310).
+
+### Internal
+- Switched the Zig module from libghostty-vt's C API to the Zig
+  API.  OSC actions are now routed through a custom
+  `GhostelHandler` that wraps libghostty's standard terminal
+  handler and overrides the OSC arms (semantic_prompt,
+  color_operation, report_pwd, clipboard_contents,
+  show_desktop_notification, progress_report).  This deletes ~395
+  lines of parallel byte-scanning code in `module.zig` in favour
+  of reading ghostty's parsed Command values directly.  Only
+  OSC 51 still uses a bespoke scan since it is ghostel's
+  elisp-eval extension.
+- Style-to-face translation extracted into `src/style_face.zig`
+  and shared between the renderer and the `ghostel-comint` stream
+  filter so they stay in sync.
+- Debug builds use `DebugAllocator` for corruption and leak
+  detection; allocator is deinit'd on atexit and the false-positive
+  leak check was tightened.  Allocators are now injected via
+  Zig's best-practice pattern: terminal stores `alloc` at init,
+  `Renderer`/`RowContent` accept `alloc` parameters (unmanaged
+  pattern), and `module.zig` has a single top-level `alloc`
+  binding instead of scattered `c_allocator` references.
+- Zig refactors: `Terminal` renamed to `GhostelTerm` to avoid
+  confusion with ghostty's `Terminal` type; `Renderer` stores
+  `gt.Terminal`; the `force_full` argument is replaced by setting
+  the render state dirty; debug-mode userptr freeing is
+  generalized beyond `GhostelTerm`; Zig log output also goes to
+  stderr.
 
 ### Added
 - Multi-terminal navigation commands: `ghostel-next`,

@@ -21,6 +21,7 @@ process, keymap, and buffer.
 - [Commands](#commands)
   - [Compilation mode](#compilation-mode)
   - [Eshell integration](#eshell-integration)
+  - [Comint integration](#comint-integration)
 - [Running Tests](#running-tests)
 - [Performance](#performance)
 - [Ghostel vs vterm](#ghostel-vs-vterm)
@@ -1168,6 +1169,51 @@ The public primitive behind the mode is `ghostel-exec BUFFER PROGRAM
 &optional ARGS`, which launches an arbitrary program in a ghostel
 buffer with no shell integration applied.  Useful for building your
 own integrations.
+
+### Comint integration
+
+`ghostel-comint-mode` replaces comint's built-in
+`ansi-color-process-output` with a stream filter that runs every
+chunk of process output through libghostty-vt's VT parser.  In
+`M-x shell` (and any other comint-derived buffer — REPLs, etc.)
+output renders with the same SGR fidelity a real ghostel terminal
+would give it, plus OSC 8 hyperlinks and OSC 7 directory tracking.
+
+```elisp
+(require 'ghostel-comint)
+(add-hook 'shell-mode-hook #'ghostel-comint-mode)
+```
+
+Or, to enable it for every comint-derived buffer at once:
+
+```elisp
+(ghostel-comint-global-mode 1)
+```
+
+What you get over the stock filter (and xterm-color):
+
+| Feature                                                   | Stock `ansi-color` | xterm-color | `ghostel-comint` |
+|-----------------------------------------------------------|--------------------|-------------|------------------|
+| ANSI 8 / bright / 256 / truecolor                         | ✓                  | ✓           | ✓                |
+| Italic, bold, faint, strike-through, overline, inverse    | partial            | ✓           | ✓                |
+| Curly / double / dotted / dashed underline (`\e[4:3m`, …) |                    |             | ✓                |
+| Underline color (`\e[58;...m`)                            |                    |             | ✓                |
+| OSC 8 hyperlinks (`gh`, `git`, `ls --hyperlink=auto`)     |                    |             | ✓                |
+| OSC 7 working-directory updates                           |                    |             | ✓                |
+| DCS / APC / SS3 sequences consumed cleanly                |                    |             | ✓                |
+
+It's still a stream filter — *not* a full terminal.  Cursor-positioning
+escapes, alt-screen entry (`\e[?1049h`), and full-screen redraws are
+silently dropped: programs like `htop` or `less` won't render
+correctly under it.  Use `M-x ghostel` (a real terminal) for those.
+
+CR / BS / TAB pass through unchanged so comint's own
+`comint-carriage-motion` filter continues to handle progress bars,
+`read -s` prompts, etc.
+
+For best performance, xterm-color's advice to disable font-locking in
+shell buffers applies here too — see the docstring of
+`ghostel-comint-mode`.
 
 ## Running Tests
 
