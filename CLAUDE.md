@@ -36,7 +36,7 @@ MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
 - **GNU ABI**：必须使用 `-Dtarget=native-native-gnu` 以避免 MSVC libcpmt 链接冲突
 - **`ZIG_GLOBAL_CACHE_DIR`**：Zig 0.15 的依赖子进程在全局缓存与项目不在同一驱动器时 panic（`Run.zig:662`），`build.cmd` 自动将其固定到项目目录下
 - **`link_libcpp`**：`build.zig` 中 Windows 条件启用，simdutf/highway 需要 C++ 运行时
-- **`vendor/ghostty/`**：历史遗留目录，当前构建不再使用（Zig 依赖系统直接从 `build.zig.zon` 的 URL 获取）
+- **`vendor/ghostty/`**：Windows 构建通过 `build.zig.zon` 的 `.path` 依赖使用此目录（Zig 0.15 无法通过 URL 子进程正确解析依赖）。上游同步时需将 vendor/ghostty checkout 到 build.zig.zon 注释中记录的 commit
 
 ### Unix
 ```

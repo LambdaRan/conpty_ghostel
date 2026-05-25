@@ -57,9 +57,16 @@ exit /b 0
 
 :clean
 echo Cleaning build artifacts...
-if exist zig-out rmdir /s /q zig-out
-if exist .zig-cache rmdir /s /q .zig-cache
-if exist .zig-global-cache rmdir /s /q .zig-global-cache
+if exist zig-out rd /s /q zig-out
+if exist .zig-cache rd /s /q .zig-cache
+:: .zig-global-cache may contain paths with special chars (commas, plus)
+:: that cmd.exe rmdir can't handle. Use robocopy empty-dir trick to purge.
+if exist .zig-global-cache (
+    mkdir "%TEMP%\ghostel-empty" 2>nul
+    robocopy "%TEMP%\ghostel-empty" .zig-global-cache /purge >nul 2>&1
+    rd /s /q .zig-global-cache 2>nul
+    rd /q "%TEMP%\ghostel-empty" 2>nul
+)
 if exist ghostel-module.dll del ghostel-module.dll
 if exist ghostel-module.version del ghostel-module.version
 echo Done.
