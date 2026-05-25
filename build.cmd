@@ -19,49 +19,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Ensure vendor/ghostty exists
-if not exist vendor\ghostty\build.zig (
-    echo ERROR: vendor\ghostty not found.
-    echo   Run: git submodule update --init vendor\ghostty
-    exit /b 1
-)
-
-:: Use a global cache on the same drive to avoid cross-drive absolute path
-:: issues with Zig 0.15.2 (Run.zig:662 assertion).
+:: Zig 0.15.2 panics (Run.zig:662 assertion) when the global cache
+:: lives on a different drive than the project.  Pin it to the repo
+:: directory so all paths stay on the same drive letter.
 if "%ZIG_GLOBAL_CACHE_DIR%"=="" (
     set "ZIG_GLOBAL_CACHE_DIR=%~dp0.zig-global-cache"
 )
-
-:: Step 1: Build libghostty-vt (GNU ABI avoids MSVC libcpmt linking issues)
-echo [1/3] Building libghostty-vt...
-pushd vendor\ghostty
-zig build -Demit-lib-vt=true -Doptimize=%ZIG_OPT% -Dtarget=native-native-gnu
-if errorlevel 1 (
-    echo ERROR: Failed to build libghostty-vt.
-    popd
-    exit /b 1
-)
-popd
-echo       OK
-
-:: Step 2: Copy C++ dependency libraries from zig-cache to zig-out/lib
-echo [2/3] Copying dependency libraries...
-for %%L in (simdutf highway utfcpp) do (
-    set "FOUND="
-    for /f "delims=" %%f in ('dir /s /b vendor\ghostty\.zig-cache\%%L.lib 2^>nul') do (
-        if "!FOUND!"=="" set "FOUND=%%f"
-    )
-    if "!FOUND!"=="" (
-        echo ERROR: Could not find %%L.lib in vendor\ghostty\.zig-cache
-        exit /b 1
-    )
-    copy "!FOUND!" vendor\ghostty\zig-out\lib\%%L.lib >nul
-    if errorlevel 1 (
-        echo ERROR: Failed to copy %%L.lib
-        exit /b 1
-    )
-)
-echo       OK
 
 :: Detect Emacs include dir if not set
 if "%EMACS_INCLUDE_DIR%"=="" (
@@ -79,8 +42,8 @@ if "%EMACS_INCLUDE_DIR%"=="" (
     echo       Detected Emacs include: !EMACS_INCLUDE_DIR!
 )
 
-:: Step 3: Build ghostel-module.dll (GNU ABI)
-echo [3/3] Building ghostel-module.dll...
+:: Build ghostel-module.dll (GNU ABI avoids MSVC libcpmt linking issues)
+echo Building ghostel-module.dll...
 zig build -Doptimize=%ZIG_OPT% -Dtarget=native-native-gnu
 if errorlevel 1 (
     echo ERROR: Failed to build ghostel module.
@@ -96,8 +59,8 @@ exit /b 0
 echo Cleaning build artifacts...
 if exist zig-out rmdir /s /q zig-out
 if exist .zig-cache rmdir /s /q .zig-cache
+if exist .zig-global-cache rmdir /s /q .zig-global-cache
 if exist ghostel-module.dll del ghostel-module.dll
-if exist vendor\ghostty\zig-out rmdir /s /q vendor\ghostty\zig-out
-if exist vendor\ghostty\.zig-cache rmdir /s /q vendor\ghostty\.zig-cache
+if exist ghostel-module.version del ghostel-module.version
 echo Done.
 exit /b 0

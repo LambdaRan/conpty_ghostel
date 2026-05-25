@@ -100,7 +100,7 @@ libghostty-vt 由 Zig 包管理器获取（见 `build.zig.zon`），通过 `cons
 | `lisp/ghostel.el` | `ghostel--conpty-proxy-resize` | 通过 Zig `ghostel--conpty-resize` 调整大小（替代 Unix ioctl） |
 | `src/module.zig` | `ghostel--conpty-resize` / `fnConptyResize` | 写入命名管道 `\\.\pipe\conpty-proxy-ctrl-{id}` |
 | `src/GhostelTerm.zig` | `ghostel--write-input` | CRLF 规范化（流式插入缺失 `\r`），已是上游代码的一部分 |
-| `build.cmd` / `build.zig` | — | GNU ABI (`-Dtarget=native-native-gnu`)；`build.zig` 中条件启用 `link_libcpp` |
+| `build.cmd` / `build.zig` | — | GNU ABI (`-Dtarget=native-native-gnu`)；`build.zig` 中条件启用 `link_libcpp`；`ZIG_GLOBAL_CACHE_DIR` 必须在同一驱动器（Zig 0.15 bug） |
 
 ## 上游同步工作流
 
