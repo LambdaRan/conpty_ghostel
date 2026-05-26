@@ -99,17 +99,27 @@ fn handleReportPwd(self: *Self, v: gt.StreamAction.ReportPwd) void {
 }
 
 // ---------------------------------------------------------------------------
-// OSC 52 — clipboard contents
+// OSC 52 — clipboard contents (kind 'e' = ghostel's elisp-eval extension)
 // ---------------------------------------------------------------------------
 
-/// Forward clipboard SET requests to Elisp.  Queries ("?") and empty
-/// payloads carry no clipboard content, so they don't cross the FFI boundary.
+/// Route OSC 52 to Elisp.  `kind == 'e'` is ghostel's elisp-eval extension;
+/// the parser accepts any byte as `data[0]` and hands us the payload after the
+/// required `;` separator.  All other kinds are standard clipboard selectors
+/// (xterm: `c p q s 0-7`; kitty: `a`) and go to the clipboard handler.
+///
+/// Queries ("?") and empty payloads carry no useful content, so they
+/// don't cross the FFI boundary regardless of kind.
 fn handleClipboardContents(_: *Self, v: gt.StreamAction.ClipboardContents) void {
     if (v.data.len == 0) return;
     if (v.data.len == 1 and v.data[0] == '?') return;
     const e = emacs.current_env orelse return;
-    const kind_str: [1]u8 = .{v.kind};
-    _ = e.f("ghostel--osc52-handle", .{ &kind_str, v.data });
+    switch (v.kind) {
+        'e' => _ = e.f("ghostel--osc52-eval", .{v.data}),
+        else => {
+            const kind_str: [1]u8 = .{v.kind};
+            _ = e.f("ghostel--osc52-handle", .{ &kind_str, v.data });
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------

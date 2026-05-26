@@ -379,7 +379,7 @@ Mirrors the real zsh case where the directory still contains a
 
 (ert-deftest ghostel-test-flush-pending-output-preserves-buffer ()
   "Regression for #82: buffer switches in native callbacks do not leak out.
-A buffer switch performed by a synchronous native callback (as OSC 51;E
+A buffer switch performed by a synchronous native callback (as OSC 52;e
 dispatch does when it calls `find-file-other-window') must not leak out
 of `ghostel--flush-pending-output'.  Otherwise callers such as
 `ghostel--delayed-redraw' read `ghostel--term' from the wrong buffer and

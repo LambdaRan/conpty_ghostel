@@ -1174,6 +1174,99 @@ native URI lookup when Emacs invokes it for tooltip display or clicking."
     (should (commandp #'ghostel-next-hyperlink))
     (should (commandp #'ghostel-previous-hyperlink))))
 
+(ert-deftest ghostel-test-hyperlink-navigation-skips-shared-id ()
+  "Multiple help-echo runs sharing `ghostel-link-id' navigate as one logical link.
+Reproduces the wrapped-OSC8-in-a-box case from issue #125 at the elisp
+helper layer (no native module needed).  Layout puts two same-id runs
+back-to-back (no different-id link between them) so the dedup loop has
+to step past more than one run before landing on a different id."
+  ;; Buffer (1-indexed):
+  ;;   "AAA A1 BBB A2 CCC other DDD"
+  ;;        ^5..6  ^12..13  ^19..23
+  ;; A1 and A2 carry id "shared"; `other' carries id "other".
+  (let ((buf (generate-new-buffer " *hyperlink-shared-id*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (insert "AAA ")                ; 1..4
+          (let ((p (point)))             ; 5
+            (insert "A1")                ; 5..6
+            (put-text-property p (point) 'help-echo "https://shared")
+            (put-text-property p (point) 'ghostel-link-id "shared"))
+          (insert " BBB ")               ; 7..11
+          (let ((p (point)))             ; 12
+            (insert "A2")                ; 12..13
+            (put-text-property p (point) 'help-echo "https://shared")
+            (put-text-property p (point) 'ghostel-link-id "shared"))
+          (insert " CCC ")               ; 14..18
+          (let ((p (point)))             ; 19
+            (insert "other")             ; 19..23
+            (put-text-property p (point) 'help-echo "https://other")
+            (put-text-property p (point) 'ghostel-link-id "other"))
+          (insert " DDD")                ; 24..27
+
+          ;; Forward from inside A1: dedup loop must step PAST A2 (shared id)
+          ;; before landing on `other'.  This is the path that proves the
+          ;; loop actually iterates more than once.
+          (should (equal 19 (ghostel--find-next-link 5)))
+          ;; Forward from inside A2 also dedupes; lands on `other'.
+          (should (equal 19 (ghostel--find-next-link 12)))
+          ;; Outside any link, skip-id is nil → no dedup, lands on A1.
+          (should (equal 5 (ghostel--find-next-link (point-min))))
+          ;; Between A1 and A2 (no link), skip-id is nil → lands on A2.
+          (should (equal 12 (ghostel--find-next-link 8)))
+          ;; Forward from inside `other' has nothing left.
+          (should (null (ghostel--find-next-link 19)))
+
+          ;; Backward from inside A2: must step PAST A1 (shared id) → nil.
+          (should (null (ghostel--find-previous-link 12)))
+          ;; Backward from inside `other': lands on A1 (the URL's first chunk,
+          ;; not A2 the last chunk) by walking back over same-id runs.
+          (should (equal 5 (ghostel--find-previous-link 19)))
+          ;; Outside any link, skip-id is nil → lands on the last link.
+          (should (equal 19 (ghostel--find-previous-link (point-max)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-hyperlink-navigation-previous-lands-at-url-start ()
+  "`ghostel--find-previous-link' lands at the URL's first chunk, not its last.
+For a wrapped OSC 8 URL emitted as two chunks sharing `ghostel-link-id',
+backward navigation from below the URL should skip the second chunk and
+land on the start of the first chunk."
+  ;; Buffer:
+  ;;   "AAA U1 BBB U2 CCC DDD"
+  ;;        ^5..6 ^12..13
+  ;; U1 and U2 carry id "wrapped"; nothing else carries a link-id.
+  (let ((buf (generate-new-buffer " *hyperlink-url-start*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (insert "AAA ")                ; 1..4
+          (let ((p (point)))             ; 5
+            (insert "U1")
+            (put-text-property p (point) 'help-echo "https://wrapped")
+            (put-text-property p (point) 'ghostel-link-id "wrapped"))
+          (insert " BBB ")
+          (let ((p (point)))             ; 12
+            (insert "U2")
+            (put-text-property p (point) 'help-echo "https://wrapped")
+            (put-text-property p (point) 'ghostel-link-id "wrapped"))
+          (insert " CCC DDD")
+          ;; From past the URL, backward lands on U1 (not U2).
+          (should (equal 5 (ghostel--find-previous-link (point-max))))
+          ;; Forward still lands on U1 naturally (URL start).
+          (should (equal 5 (ghostel--find-next-link (point-min)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-hyperlink-navigation-shared-id-no-link-id-property ()
+  "Runs without `ghostel-link-id' (auto-detected URL, fileref) are never deduped.
+The dedup must only kick in when both ends carry a non-nil link id."
+  (with-temp-buffer
+    (insert "AAA URL1 BBB URL2 CCC")
+    ;; Plain-text URL detection sets only help-echo, no link-id.
+    (put-text-property 5 9 'help-echo "https://one")
+    (put-text-property 14 18 'help-echo "https://two")
+    ;; From inside URL1, URL2 is still found (no skip).
+    (should (equal 14 (ghostel--find-next-link 5)))
+    (should (equal 5 (ghostel--find-previous-link 14)))))
+
 (ert-deftest ghostel-test-hyperlink-navigation-wrap ()
   "Test that `ghostel--goto-hyperlink' wraps and errors cleanly."
   :tags '(native)
@@ -3041,7 +3134,7 @@ and requests a snap so the next redraw lands at the live viewport."
 
 (ert-deftest ghostel-test-redraw-syncs-window-point-to-cursor ()
   "Anchored redraw syncs `window-point' to the terminal cursor.
-When an OSC 51;E callback moved selection elsewhere and left the
+When an OSC 52;e callback moved selection elsewhere and left the
 ghostel window's `window-point' stale, the next redraw (which is
 anchored because the window is at the viewport) must update it."
   :tags '(native)
@@ -3065,7 +3158,7 @@ anchored because the window is at the viewport) must update it."
                         (forward-line -9)
                         (line-beginning-position))))
               (set-window-start (selected-window) vp t))
-            ;; Simulate OSC 51;E leaving window-point stale.
+            ;; Simulate OSC 52;e leaving window-point stale.
             (set-window-point (selected-window) (point-min))
             (setq ghostel--force-next-redraw t)
             (ghostel--delayed-redraw buf)
@@ -3453,6 +3546,57 @@ overlay property."
         (set-window-buffer (selected-window) orig-buf))
       (when (and overlay (overlayp overlay))
         (delete-overlay overlay))
+      (kill-buffer buf))))
+
+
+
+
+;;; Crash and internal-invariant regressions
+;;
+;; Tests for bugs that manifested as panics or internal state corruption
+;; rather than wrong visible output.  Grouped here so they don't dilute
+;; the feature-oriented sections above and have an obvious home for
+;; future additions.
+
+(ert-deftest ghostel-test-page-eviction-before-redraw ()
+  "Regression: page-serial underflow when initial active area scrolls off entirely.
+Scenario (from Hypothesis failure): 1×136 terminal, render once while
+empty (seeds pages_in_buffer with the initial blank page serial), then
+write 231 lines of 273 bytes each — each line wraps to 3 visual rows,
+so 693 total rows cross the libghostty page boundary and force the
+active row onto a fresh internal page.  The second redraw must be
+incremental (no force-full) so the buffer is not cleared: the renderer
+then has existing buffer content to replace rather than append, and
+without evicting stale pages_in_buffer entries before rendering it
+subtracts old_line_len from the newly-created page whose char_len is
+0, causing integer underflow at Renderer.zig:654."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-page-evict*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 1 136 16384))
+                 (inhibit-read-only t)
+                 ;; 273-byte lines wrap to 3 visual rows in a 136-col
+                 ;; terminal (136+136+1), so 231 lines = 693 rows
+                 ;; which exceeds the libghostty page capacity and
+                 ;; forces allocation of a new internal page.
+                 (line (concat (make-string 273 ?x) "\r\n")))
+            ;; Render once while empty — seeds pages_in_buffer with
+            ;; the initial (blank) page serial.
+            (ghostel--redraw term t)
+            ;; Write enough wrapped lines to push the active row onto
+            ;; a new libghostty page.
+            (dotimes (_ 231)
+              (ghostel--write-input term line))
+            ;; Incremental redraw (no force-full): the buffer retains
+            ;; the content from the first render, so the renderer takes
+            ;; the replace path.  Without the fix it underflows
+            ;; char_len, signalling an error from the native module.
+            (ghostel--redraw term)
+            ;; Sanity: the active row content is present in the buffer.
+            (should (string-match-p "x"
+                                    (buffer-substring-no-properties
+                                     (point-min) (point-max))))))
       (kill-buffer buf))))
 
 

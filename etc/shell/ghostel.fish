@@ -181,5 +181,5 @@ function ghostel_cmd
         set arg (string replace -a '"' '\\"' -- $arg)
         set payload "$payload\"$arg\" "
     end
-    printf '\e]51;E%s\e\\' "$payload"
+    printf '\e]52;e;%s\e\\' "$payload"
 end

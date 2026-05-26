@@ -306,5 +306,5 @@ ghostel_cmd() {
         payload="$payload\"$arg\" "
         shift
     done
-    printf '\e]51;E%s\e\\' "$payload"
+    printf '\e]52;e;%s\e\\' "$payload"
 }

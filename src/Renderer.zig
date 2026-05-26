@@ -5,6 +5,7 @@
 /// Emacs buffer.  See `redraw' below for the per-redraw algorithm
 /// (pin-based scrollback sync, dirty-row reuse).
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const emacs = @import("emacs.zig");
 const gt = @import("ghostty-vt");
@@ -12,6 +13,7 @@ const GhostelTerm = @import("GhostelTerm.zig");
 const style_face = @import("style_face.zig");
 
 pub const CellProps = style_face.CellProps;
+pub const LinkId = style_face.LinkId;
 const formatColor = style_face.formatColor;
 
 const Self = @This();
@@ -137,10 +139,22 @@ pub fn redraw(self: *Self, alloc: Allocator, env: emacs.Env, force_full_arg: boo
     // If the active screen changes, we reset scrollback
     const screen_changed = self.rendered_screen != self.term.screens.active;
 
-    if (force_full_arg or font_info_changed or cols_changed or screen_changed) {
+    // The active pin ends up at the top of the screen when the scrollback gets
+    // cleared rather than the top of the active area. If we don't have scrollback
+    // these are obviously the same.
+    const scrollback_cleared = self.rows_in_buffer > self.term.rows and
+        self.active_pin.eql(self.rendered_screen.pages.getTopLeft(.screen));
+
+    if (force_full_arg or
+        font_info_changed or
+        cols_changed or
+        screen_changed or
+        scrollback_cleared)
+    {
         try self.clear(alloc, env);
     }
 
+    self.evictScrollback(alloc, env);
     self.gotoActiveStart(env);
     try self.renderToEnd(alloc, env, self.active_pin.*);
 
@@ -149,10 +163,9 @@ pub fn redraw(self: *Self, alloc: Allocator, env: emacs.Env, force_full_arg: boo
     if (self.pending_resize != null) {
         try self.commitResize(alloc);
         self.gotoActiveStart(env);
-        try self.render(alloc, env, self.term.screens.active.pages.getTopLeft(.active), 0);
+        try self.render(alloc, env, self.term.screens.active.pages.getTopLeft(.active));
+        self.evictScrollback(alloc, env);
     }
-
-    self.evictScrollback(alloc, env);
 
     try self.renderCursor(env);
 
@@ -162,6 +175,8 @@ pub fn redraw(self: *Self, alloc: Allocator, env: emacs.Env, force_full_arg: boo
     }
 
     self.active_pin.* = self.rendered_screen.pages.getTopLeft(.active);
+
+    std.debug.assert(self.rows_in_buffer == self.term.screens.active.pages.total_rows);
 }
 
 /// Read the default font and rendering parameters from Emacs, compare
@@ -226,8 +241,31 @@ fn probeCoverage(env: emacs.Env, font: emacs.Value) u32 {
 
 const ViewportSize = struct { cols: u16, rows: u16, cell_w: u32, cell_h: u32 };
 
+/// Resolve a page-local hyperlink id to a `LinkId` that compares equal
+/// across pages for the same logical OSC 8 link.  `PageEntry.dupe`
+/// preserves `.explicit` byte strings verbatim and `.implicit` counters
+/// as-is, so byte- and numeric-equality both work cross-page.
+///
+/// The `.explicit` slice borrows from `page` memory and is invalidated
+/// by the next `render_state.update`; callers must copy it (e.g. via
+/// `env.makeString`) within the current `insertRow`.
+fn resolveLinkId(page: *const gt.page.Page, local_id: gt.size.HyperlinkCountInt) ?LinkId {
+    if (local_id == 0) return null;
+
+    const entry = page.hyperlink_set.get(page.memory, local_id);
+    return switch (entry.id) {
+        .explicit => |slice| .{ .explicit = slice.slice(page.memory) },
+        .implicit => |v| .{ .implicit = @intCast(v) },
+    };
+}
+
 /// Read the style for the current cell from the render state.
-fn readCellProps(self: *Self, cell: *const gt.RenderState.Cell) ?CellProps {
+fn createCellProps(
+    self: *Self,
+    page: *const gt.Page,
+    key: CellPropKey,
+    cell: *const gt.RenderState.Cell,
+) ?CellProps {
     var props: CellProps = .{};
 
     const style: gt.Style = if (cell.raw.hasStyling()) cell.style else .{};
@@ -247,7 +285,7 @@ fn readCellProps(self: *Self, cell: *const gt.RenderState.Cell) ?CellProps {
     props.overline = style.flags.overline;
     props.inverse = style.flags.inverse;
     props.underline_color = style.underlineColor(&self.render_state.colors.palette);
-    props.hyperlink = cell.raw.hyperlink;
+    props.link_id = resolveLinkId(page, key.hyperlink_id);
     props.semantic_content = cell.raw.semantic_content;
 
     return if (props.isDefault(
@@ -269,10 +307,19 @@ fn applyProps(env: emacs.Env, start: i64, end: i64, props: CellProps) !void {
         env.putTextProperty(start_val, end_val, "face", face);
     }
 
-    if (props.hyperlink) {
+    if (props.link_id) |id| {
         env.putTextProperty(start_val, end_val, "help-echo", s.@"ghostel--native-link-help-echo");
         env.putTextProperty(start_val, end_val, "mouse-face", s.highlight);
         env.putTextProperty(start_val, end_val, "keymap", env.symbolValue("ghostel-link-map"));
+
+        // Stored as a string (explicit) or integer (implicit), so elisp `equal' returns true
+        // only when both kind and value match. A user-supplied explicit id like "42" never
+        // collides with an implicit counter of 42.
+        const id_val: emacs.Value = switch (id) {
+            .explicit => |str| env.makeString(str),
+            .implicit => |n| env.makeInteger(@intCast(n)),
+        };
+        env.putTextProperty(start_val, end_val, "ghostel-link-id", id_val);
     }
 
     switch (props.semantic_content) {
@@ -289,13 +336,16 @@ const CellPropKey = packed struct {
     // TODO: Style ID type is not exported from ghostty-vt for some reason.
     //       We should file an issue.
     style_id: @FieldType(gt.page.Cell, "style_id"),
-    hyperlink: bool,
+    hyperlink_id: gt.size.HyperlinkCountInt,
     semantic_content: gt.page.Cell.SemanticContent,
 
-    fn fromCell(cell: gt.page.Cell) CellPropKey {
+    fn create(page: *const gt.Page, cell: *const gt.page.Cell) CellPropKey {
         return .{
             .style_id = cell.style_id,
-            .hyperlink = cell.hyperlink,
+            .hyperlink_id = if (cell.hyperlink)
+                page.lookupHyperlink(cell) orelse 0
+            else
+                0,
             .semantic_content = cell.semantic_content,
         };
     }
@@ -355,22 +405,22 @@ pub const RowContent = struct {
         var trim_byte_len: usize = 0;
         var trim_char_len: usize = 0;
 
+        const page = &row.pin.node.data;
         var current_prop_key: ?CellPropKey = null;
         var col: usize = 0;
         while (col < row.cells.len) : (col += 1) {
             const cell = row.cells.get(col);
+            const raw_cell = page.getRowAndCell(col, row.pin.y).cell;
             if (cell.raw.wide == .spacer_tail or cell.raw.wide == .spacer_head) continue;
 
             // We use a "key" that holds a minimum set of values that are cheap to
-            // read and compare to detect style run breaks. Only when we detect a
-            // break do we read the cell style, which is a more expensive operation
-            // in such a tight loop.
-            const prop_key = CellPropKey.fromCell(cell.raw);
+            // compare to detect style run breaks.
+            const prop_key = CellPropKey.create(&row.pin.node.data, raw_cell);
             if (prop_key != current_prop_key) {
                 try self.runs.append(alloc, .{
                     .start_char = self.char_len,
                     .end_char = self.char_len,
-                    .props = readCellProps(renderer, &cell),
+                    .props = createCellProps(renderer, page, prop_key, &cell),
                 });
                 current_prop_key = prop_key;
             }
@@ -378,23 +428,23 @@ pub const RowContent = struct {
             const byte_start = self.text.items.len;
             const char_start = self.char_len;
 
-            const codepoint: u21 = if (cell.raw.hasText()) cell.raw.codepoint() else ' ';
+            const codepoint: u21 = if (raw_cell.hasText()) raw_cell.codepoint() else ' ';
             try self.appendCodepoints(alloc, &[1]u21{codepoint});
-            if (cell.raw.hasGrapheme()) {
+            if (raw_cell.hasGrapheme()) {
                 try self.appendCodepoints(alloc, cell.grapheme);
             }
 
             // If this is a grapheme cluster, or if the char is not covered by
             // the default font, we register it as needing font glyph adjustment
             // to fit into the monospace grid.
-            if (cell.raw.hasGrapheme() or codepoint >= adjustment_threshold) {
+            if (raw_cell.hasGrapheme() or codepoint >= adjustment_threshold) {
                 try self.adjust_cells.append(alloc, .{
                     .col = @intCast(col),
                     .byte_start = @intCast(byte_start),
                     .byte_end = @intCast(self.text.items.len),
                     .char_start = @intCast(char_start),
                     .char_end = @intCast(self.char_len),
-                    .wide = cell.raw.wide == .wide,
+                    .wide = raw_cell.wide == .wide,
                 });
             }
 
@@ -402,7 +452,7 @@ pub const RowContent = struct {
             last_run.end_char = self.char_len;
 
             // We trim cells that neither have content nor styling
-            if (cell.raw.hasText() or last_run.props != null) {
+            if (raw_cell.hasText() or last_run.props != null) {
                 trim_byte_len = self.text.items.len;
                 trim_char_len = self.char_len;
             }
@@ -611,7 +661,6 @@ pub fn render(
     alloc: Allocator,
     env: emacs.Env,
     pin: gt.Pin,
-    skip: usize,
 ) !void {
     self.term.screens.active.pages.scroll(.{ .pin = pin });
     try self.render_state.update(alloc, self.term);
@@ -625,7 +674,12 @@ pub fn render(
             formatColor(self.render_state.colors.background, &bg_hex),
         });
 
-        var i: u16 = 0;
+        const skip = switch (pin.downOverflow(self.term.rows)) {
+            .overflow => |of| of.remaining - 1,
+            else => 0,
+        };
+
+        var i: usize = 0;
         const row_dirty = self.render_state.row_data.items(.dirty);
         while (i < self.render_state.rows) : ({
             // Clear per-row dirty flag
@@ -651,7 +705,7 @@ pub fn render(
                     const old_line_start = env.point();
                     const old_line_end = env.lineBeginningPosition2();
                     const old_line_len = env.extractInteger(old_line_end) - env.extractInteger(old_line_start);
-                    page.char_len -= @intCast(old_line_len);
+                    page.char_len -|= @intCast(old_line_len);
                     env.deleteRegion(old_line_start, old_line_end);
                 }
 
@@ -697,14 +751,9 @@ fn renderCursor(self: *Self, env: emacs.Env) !void {
 // Render all pages from start_pin through the end of the active area,
 // one viewport-sized chunk per page.
 fn renderToEnd(self: *Self, alloc: Allocator, env: emacs.Env, start_pin: gt.Pin) !void {
-    const pages = &self.term.screens.active.pages;
     var p: ?gt.Pin = start_pin;
     while (p) |pin| : (p = pin.down(self.term.rows)) {
-        var overflow: usize = 0;
-        if (pin.node == pages.pages.last) {
-            overflow = (pin.y + self.term.rows) -| pin.node.data.size.rows;
-        }
-        try self.render(alloc, env, pin, overflow);
+        try self.render(alloc, env, pin);
     }
 }
 
@@ -768,7 +817,7 @@ fn evictScrollback(self: *Self, alloc: Allocator, env: emacs.Env) void {
         const first_page: *MaterializedPage = @fieldParentPtr("node", n);
         if (first_page.serial == term_first_page.serial) break;
         evicted_chars += first_page.char_len;
-        self.rows_in_buffer -= first_page.rows;
+        self.rows_in_buffer -|= first_page.rows;
         _ = self.pages_in_buffer.popFirst();
         alloc.destroy(first_page);
     }
@@ -785,7 +834,7 @@ fn evictScrollback(self: *Self, alloc: Allocator, env: emacs.Env) void {
             const point = env.point();
             env.deleteRegion(1, point);
             const deleted_chars = env.extractInteger(point) - 1;
-            first_page.char_len -= @intCast(deleted_chars);
+            first_page.char_len -|= @intCast(deleted_chars);
             first_page.rows -= diff;
             self.rows_in_buffer -= diff;
         }

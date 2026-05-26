@@ -224,70 +224,6 @@ fn titleChangedCallback(handler: *gt.TerminalStream.Handler) void {
 }
 
 // ---------------------------------------------------------------------------
-// OSC 51 (ghostel extension) — elisp eval
-// ---------------------------------------------------------------------------
-
-// TODO: Ghostty's parser is a whitelist state machine and if a 5 is
-//   followed by 1, the parser transitions to .invalid.
-//   Replace this with either an upstream fix or change to OSC52;E
-//   OSC 52 is the clipboard parser where only the "c, p, s, q, 0-7"
-//   kinds are used.
-
-/// Only OSC 51 (ghostel's elisp-eval extension) still needs a byte scan
-/// because it is not a standard OSC that ghostty's parser knows about.
-///
-/// Dispatch each `ESC ] 51 ; E <payload> (BEL|ST)` in `data` to
-/// `ghostel--osc51-eval`.  Other OSC 51 sub-codes (used by other
-/// terminals for things unrelated to elisp eval) are ignored.
-///
-/// Single-pass scan: the `intermediate` introducer carries the literal
-/// "E" so we can match the full prefix in one `indexOfPos`.  Limitation:
-/// an OSC 51 split across two `ghostel--write-input` calls is dropped
-/// entirely — we keep no carry-over state between calls.  Unlike
-/// ghostty's `Parser`, which buffers an OSC body across chunks, this
-/// scanner only sees one `data` slice at a time.  Adding carry-over
-/// would require per-`GhostelTerm` state; not worth it until an
-/// OSC 51 chunk-spanning case actually shows up.
-fn dispatchOsc51(env: emacs.Env, data: []const u8) void {
-    const intro = "\x1b]51;E";
-    var pos: usize = 0;
-    while (pos + intro.len <= data.len) {
-        const start = std.mem.indexOfPos(u8, data, pos, intro) orelse return;
-        const payload_start = start + intro.len;
-        // Find BEL or ST terminator.  Stops at the next OSC introducer
-        // too: a missing terminator on the current OSC should not
-        // cannibalize the following one.
-        var end = payload_start;
-        var term_len: usize = 0;
-        while (end < data.len) : (end += 1) {
-            const ch = data[end];
-            if (ch == 0x07) {
-                term_len = 1;
-                break;
-            }
-            if (ch == 0x1b and end + 1 < data.len) {
-                const next_ch = data[end + 1];
-                if (next_ch == '\\') {
-                    term_len = 2;
-                    break;
-                }
-                if (next_ch == ']') break; // next OSC — current is partial
-            }
-        }
-        if (term_len == 0) {
-            // Partial — skip past the introducer and resume.  If
-            // nothing matched, the next `indexOfPos` terminates.
-            pos = if (end > start) end else payload_start;
-            continue;
-        }
-        if (end > payload_start) {
-            _ = env.f("ghostel--osc51-eval", .{data[payload_start..end]});
-        }
-        pos = end + term_len;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Exported Elisp functions — GhostelTerm operations
 // ---------------------------------------------------------------------------
 
@@ -414,7 +350,6 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                     }
                     term.last_input_was_cr = prev_was_cr;
                 }
-                dispatchOsc51(env, raw);
                 return env.nil();
             }
         },

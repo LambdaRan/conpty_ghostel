@@ -129,7 +129,7 @@ const Handler = struct {
             .overline = self.style.flags.overline,
             .inverse = self.style.flags.inverse,
             .underline_color = self.style.underlineColor(&self.palette),
-            .hyperlink = self.link_uri != null,
+            .link_id = if (self.link_uri != null) .{ .implicit = 0 } else null,
             // semantic_content stays default — comint has no notion of prompts here
         };
     }
@@ -139,7 +139,7 @@ const Handler = struct {
     /// current `link_uri` into `pending_link_uri` so the run sees the
     /// URI that was active when it started.
     fn switchProps(self: *Handler, props: style_face.CellProps) !void {
-        const new_link: ?[]u8 = if (props.hyperlink and self.link_uri != null)
+        const new_link: ?[]u8 = if (self.link_uri != null)
             try self.alloc.dupe(u8, self.link_uri.?)
         else
             null;
@@ -357,7 +357,7 @@ pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
         h.pending_link_uri = null;
         h.alloc.free(uri);
     }
-    h.pending_link_uri = if (h.pending_props.hyperlink and h.link_uri != null)
+    h.pending_link_uri = if (h.link_uri != null)
         try h.alloc.dupe(u8, h.link_uri.?)
     else
         null;

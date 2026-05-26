@@ -10,6 +10,15 @@ const emacs = @import("emacs.zig");
 const gt = @import("ghostty-vt");
 const FixedArrayList = @import("fixed_array_list.zig").FixedArrayList;
 
+/// Globally-stable identity for an OSC 8 hyperlink span.  `.explicit`
+/// holds the user-supplied `id=...`; `.implicit` is ghostty's auto-counter
+/// for links emitted without one.  Both survive page dupes, so equality
+/// is meaningful across the whole buffer.
+pub const LinkId = union(enum) {
+    explicit: []const u8,
+    implicit: u32,
+};
+
 /// Resolved style attributes for a run of cells.
 pub const CellProps = struct {
     fg: gt.color.RGB = .{},
@@ -28,7 +37,7 @@ pub const CellProps = struct {
     strikethrough: bool = false,
     overline: bool = false,
     inverse: bool = false,
-    hyperlink: bool = false,
+    link_id: ?LinkId = null,
     semantic_content: gt.page.Cell.SemanticContent = .output,
 
     /// True if these props match the default style for the given palette

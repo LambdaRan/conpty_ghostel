@@ -267,5 +267,5 @@ ghostel_cmd() {
         payload="$payload\"$(printf '%s' "$1" | sed -e 's|\\|\\\\|g' -e 's|"|\\"|g')\" "
         shift
     done
-    printf '\e]51;E%s\e\\' "$payload"
+    printf '\e]52;e;%s\e\\' "$payload"
 }

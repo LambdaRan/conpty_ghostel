@@ -4,6 +4,62 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-05-25
+
+### Changed
+- **Breaking:** `ghostel_cmd` (shell helper) now emits `OSC 52;e`
+  instead of `OSC 51;E`.  Libghostty parses OSC 51 into an action
+  the standard handler ignores, so the elisp-eval extension never
+  reached ghostel's callback through normal action dispatch — the
+  old code worked around this with a post-write byte scanner.  The
+  extension now rides on OSC 52 with a reserved `kind` byte (`e`),
+  which libghostty dispatches directly to ghostel's handler.
+  Scripts that hand-roll the legacy `\e]51;E…\e\\` sequence will
+  silently no-op; update to `\e]52;e;…\e\\` or call the bundled
+  `ghostel_cmd` helper.  The post-write byte scanner is gone; the
+  OSC 52 path is parsed by libghostty and now reassembles payloads
+  split across read boundaries (slow producers, SSH).
+- Rendering now tracks scroll position and row eviction via
+  libghostty's pin/page primitives instead of the previous
+  heuristic.  The old method had corner cases that triggered
+  unnecessary full rebuilds; the new path keeps incremental
+  updates correct across scrollback growth and eviction.
+
+### Fixed
+- `ghostel-next-hyperlink` / `ghostel-previous-hyperlink` now
+  dedupe by OSC 8 `id=`, so a single logical URL split across
+  multiple cell runs (e.g. a URL wrapped across rows inside an
+  ASCII box) is visited once instead of once per chunk.  As a
+  side effect, two adjacent cells pointing to different OSC 8
+  hyperlinks no longer merge into a single style run that
+  clobbered the second link's text properties.
+  Fixes [#125](https://github.com/dakra/ghostel/issues/125).
+- `M-<punct>` and `M-<digit>` keys (e.g. `M-.`, `M-/`, `M-;`,
+  `M-1`) no longer drop silently when libghostty's encoder
+  returns no output.  The raw fallback in
+  `ghostel--raw-key-sequence` previously only covered meta +
+  lowercase a–z; it now emits ESC + char for the full printable
+  ASCII range, matching legacy alt encoding (zsh/readline
+  `M-.` → insert-last-word, etc.).
+- Scrollback eviction no longer drops rows incorrectly when the
+  active pin lands at the top of the screen — found via
+  property-based testing.  Related viewport rendering paths were
+  hardened against over/underflow.
+
+### Internal
+- Property-based renderer testing via Hypothesis
+  (`test/hypothesis/`), with CI replay of captured failure cases
+  as regression tests.
+- Renderer hardening: debug assertions on `rows_in_buffer`,
+  over/underflow guards, consolidated renderer tests, CSI 3J
+  same-count refill regression test, fix for the debug
+  finalizer setup.
+- Emacs function registration refactored to be declarative with
+  the function body next to its metadata, and `link_id` folded
+  into `CellProps` so OSC 8 metadata lives in one place.
+- `EMACSFLAGS` now forwarded into the Hypothesis driver and
+  small development utilities added under `tools/`.
+
 ## [0.29.0] — 2026-05-23
 
 ### Added

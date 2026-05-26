@@ -380,7 +380,7 @@ history in **any** mode that has a read-only buffer (Emacs or copy).
 - **OSC 7** — directory tracking (`default-directory` follows the shell's cwd, TRAMP-aware for remote hosts)
 - **OSC 133** — semantic prompt markers, enabling prompt-to-prompt navigation with `C-c M-n` / `C-c M-p`
 - **OSC 2** — title tracking (buffer is renamed from the terminal title)
-- **OSC 51** — call whitelisted Emacs functions from shell scripts (see [Calling Elisp from the Shell](#calling-elisp-from-the-shell))
+- **OSC 52;e** — call whitelisted Emacs functions from shell scripts (see [Calling Elisp from the Shell](#calling-elisp-from-the-shell))
 - **OSC 52** — clipboard support (opt-in, for remote sessions)
 - `INSIDE_EMACS` and `EMACS_GHOSTEL_PATH` environment variables
 
@@ -691,8 +691,9 @@ ghostel_cmd find-file "/path/to/file"
 ghostel_cmd message "Hello from the shell"
 ```
 
-This uses OSC 51 escape sequences (the same protocol as vterm).  Only
-functions listed in `ghostel-eval-cmds` are allowed.
+This uses an OSC 52 escape sequence with a reserved `kind` byte
+(`\e]52;e;<payload>\e\\`) — a ghostel-private extension.
+Only functions listed in `ghostel-eval-cmds` are allowed.
 
 Default whitelisted commands:
 
@@ -824,7 +825,7 @@ inside a light Emacs):
 | `ghostel-kitty-graphics-storage-limit` | `320 MiB`      | Per-terminal cap on kitty graphics image storage.  Set to 0 to disable kitty graphics entirely (image transmissions are ignored, no storage allocated) |
 | `ghostel-kitty-graphics-mediums` | `nil`                | Opt-in image-loading mediums beyond the always-enabled inline base64.  A subset of `(file temp-file shared-mem)`.  Default `nil` keeps SSH sessions safe — the non-direct mediums let a remote program instruct ghostel to read arbitrary local paths or shared memory |
 | `ghostel-kill-buffer-on-exit`    | `t`                  | Kill buffer when shell exits                             |
-| `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 51 eval                    |
+| `ghostel-eval-cmds`              | `(see above)`        | Whitelisted functions for OSC 52;e eval                  |
 | `ghostel-enable-osc52`           | `nil`                | Allow apps to set clipboard via OSC 52                   |
 | `ghostel-notification-function`  | `ghostel-default-notify` | Handler for OSC 9 / OSC 777 desktop notifications (nil disables) |
 | `ghostel-progress-function`      | `ghostel-default-progress` | Handler for OSC 9;4 ConEmu progress reports (nil disables) |
