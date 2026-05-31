@@ -68,6 +68,29 @@ buffer eventually shows up."
                                  (ghostel--kitty-mediums-bits))))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-exec-preserves-identity-bookkeeping ()
+  "`ghostel-exec' does not clobber buffer identity bookkeeping vars."
+  (let ((buf (generate-new-buffer " *ghostel-exec-identity*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (ghostel-mode)
+            (setq-local ghostel--managed-buffer-name "managed")
+            (setq-local ghostel--buffer-identity "identity"))
+          (cl-letf (((symbol-function 'ghostel--load-module) #'ignore)
+                    ((symbol-function 'ghostel--new)
+                     (lambda (&rest _) 'fake-term))
+                    ((symbol-function 'ghostel--set-size-with-cell-dims) #'ignore)
+                    ((symbol-function 'ghostel--apply-palette) #'ignore)
+                    ((symbol-function 'ghostel--apply-bold-config) #'ignore)
+                    ((symbol-function 'ghostel--spawn-pty)
+                     (lambda (&rest _) 'fake-proc)))
+            (ghostel-exec buf "ls" nil)
+            (with-current-buffer buf
+              (should (equal ghostel--managed-buffer-name "managed"))
+              (should (equal ghostel--buffer-identity "identity")))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-eshell-visual-command-mode-toggles-advice ()
   "Enabling/disabling the mode adds/removes the `eshell-exec-visual' advice."
   (let ((was-on ghostel-eshell-visual-command-mode))

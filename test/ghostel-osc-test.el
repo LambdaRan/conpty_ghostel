@@ -15,105 +15,77 @@ After the refactor, render stores `ghostel--native-link-help-echo' as the
 `help-echo' text property so Emacs calls it lazily instead of embedding
 the URI in the buffer."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-osc8-render*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 5 80 1000))
-                 (ghostel--term term)
-                 (ghostel--term-rows 5)
-                 (inhibit-read-only t))
-            (ghostel--write-input term "\e]8;;https://example.com\e\\link text\e]8;;\e\\")
-            (ghostel--redraw term t)
-            (goto-char (point-min))
-            (let* ((end (search-forward "link text" nil t))
-                   (link-pos (- end (length "link text"))))
-              (should end)
-              (should (eq #'ghostel--native-link-help-echo  ; function symbol, not string URI
-                          (get-text-property link-pos 'help-echo)))
-              (should (keymapp (get-text-property link-pos 'keymap))))))
-      (kill-buffer buf))))
+  (ghostel-test--with-terminal-buffer (_buf term 5 80 1000)
+    (let ((inhibit-read-only t))
+      (ghostel--write-input term "\e]8;;https://example.com\e\\link text\e]8;;\e\\")
+      (ghostel--redraw term t)
+      (goto-char (point-min))
+      (let* ((end (search-forward "link text" nil t))
+             (link-pos (- end (length "link text"))))
+        (should end)
+        (should (eq #'ghostel--native-link-help-echo ; function symbol, not string URI
+                    (get-text-property link-pos 'help-echo)))
+        (should (keymapp (get-text-property link-pos 'keymap)))))))
 
 (ert-deftest ghostel-test-osc8-uri-at-pos-returns-uri ()
   "`ghostel--native-uri-at-pos' queries libghostty and returns the OSC8 URI."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-osc8-uri*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 5 80 1000))
-                 (ghostel--term term)
-                 (ghostel--term-rows 5)
-                 (inhibit-read-only t))
-            (ghostel--write-input term "\e]8;;https://example.com\e\\link text\e]8;;\e\\")
-            (ghostel--redraw term t)
-            (goto-char (point-min))
-            (let* ((end (search-forward "link text" nil t))
-                   (link-pos (- end (length "link text"))))
-              (should end)
-              (should (equal "https://example.com"
-                             (ghostel--native-uri-at-pos link-pos))))))
-      (kill-buffer buf))))
+  (ghostel-test--with-terminal-buffer (_buf term 5 80 1000)
+    (let ((inhibit-read-only t))
+      (ghostel--write-input term "\e]8;;https://example.com\e\\link text\e]8;;\e\\")
+      (ghostel--redraw term t)
+      (goto-char (point-min))
+      (let* ((end (search-forward "link text" nil t))
+             (link-pos (- end (length "link text"))))
+        (should end)
+        (should (equal "https://example.com"
+                       (ghostel--native-uri-at-pos link-pos)))))))
 
 (ert-deftest ghostel-test-osc8-uri-at-pos-nil-outside-link ()
   "`ghostel--native-uri-at-pos' returns nil or empty for a non-link cell."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-osc8-nolink*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 5 80 1000))
-                 (ghostel--term term)
-                 (ghostel--term-rows 5)
-                 (inhibit-read-only t))
-            (ghostel--write-input term "plain text")
-            (ghostel--redraw term t)
-            (goto-char (point-min))
-            (let ((uri (ghostel--native-uri-at-pos (point))))
-              (should (or (null uri) (string= "" uri))))))
-      (kill-buffer buf))))
+  (ghostel-test--with-terminal-buffer (_buf term 5 80 1000)
+    (let ((inhibit-read-only t))
+      (ghostel--write-input term "plain text")
+      (ghostel--redraw term t)
+      (goto-char (point-min))
+      (let ((uri (ghostel--native-uri-at-pos (point))))
+        (should (or (null uri) (string= "" uri)))))))
 
 (ert-deftest ghostel-test-osc8-shared-id-emits-link-id-property ()
   "OSC 8 chunks sharing `id=foo' carry equal `ghostel-link-id' text properties.
 Distinct ids and implicit (no-id) links each get unique values, so elisp
 `equal' can dedupe only the matching chunks."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-osc8-link-id*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 5 80 1000))
-                 (ghostel--term term)
-                 (ghostel--term-rows 5)
-                 (inhibit-read-only t))
-            (ghostel--write-input
-             term
-             (concat
-              "\e]8;id=A;https://shared.example\e\\foo\e]8;;\e\\ "
-              "\e]8;id=B;https://other.example\e\\bar\e]8;;\e\\ "
-              "\e]8;id=A;https://shared.example\e\\baz\e]8;;\e\\ "
-              "\e]8;;https://implicit.example\e\\qux\e]8;;\e\\ "
-              "\e]8;;https://implicit.example\e\\zot\e]8;;\e\\"))
-            (ghostel--redraw term t)
-            (goto-char (point-min))
-            (let ((foo (progn (search-forward "foo") (- (point) 3)))
-                  (bar (progn (search-forward "bar") (- (point) 3)))
-                  (baz (progn (search-forward "baz") (- (point) 3)))
-                  (qux (progn (search-forward "qux") (- (point) 3)))
-                  (zot (progn (search-forward "zot") (- (point) 3))))
-              ;; Same explicit id → equal property value.
-              (should (equal "A" (get-text-property foo 'ghostel-link-id)))
-              (should (equal "A" (get-text-property baz 'ghostel-link-id)))
-              (should (equal "B" (get-text-property bar 'ghostel-link-id)))
-              ;; Implicit links are integers; two separate OSC 8 sequences
-              ;; without `id=' get distinct counters (ghostty bumps the
-              ;; implicit counter on every startHyperlink), so they never
-              ;; equal each other and dedupe never kicks in for them.
-              (should (integerp (get-text-property qux 'ghostel-link-id)))
-              (should (integerp (get-text-property zot 'ghostel-link-id)))
-              (should-not (equal (get-text-property qux 'ghostel-link-id)
-                                 (get-text-property zot 'ghostel-link-id))))))
-      (kill-buffer buf))))
+  (ghostel-test--with-terminal-buffer (_buf term 5 80 1000)
+    (let ((inhibit-read-only t))
+      (ghostel--write-input
+       term
+       (concat
+        "\e]8;id=A;https://shared.example\e\\foo\e]8;;\e\\ "
+        "\e]8;id=B;https://other.example\e\\bar\e]8;;\e\\ "
+        "\e]8;id=A;https://shared.example\e\\baz\e]8;;\e\\ "
+        "\e]8;;https://implicit.example\e\\qux\e]8;;\e\\ "
+        "\e]8;;https://implicit.example\e\\zot\e]8;;\e\\"))
+      (ghostel--redraw term t)
+      (goto-char (point-min))
+      (let ((foo (progn (search-forward "foo") (- (point) 3)))
+            (bar (progn (search-forward "bar") (- (point) 3)))
+            (baz (progn (search-forward "baz") (- (point) 3)))
+            (qux (progn (search-forward "qux") (- (point) 3)))
+            (zot (progn (search-forward "zot") (- (point) 3))))
+        ;; Same explicit id → equal property value.
+        (should (equal "A" (get-text-property foo 'ghostel-link-id)))
+        (should (equal "A" (get-text-property baz 'ghostel-link-id)))
+        (should (equal "B" (get-text-property bar 'ghostel-link-id)))
+        ;; Implicit links are integers; two separate OSC 8 sequences
+        ;; without `id=' get distinct counters (ghostty bumps the
+        ;; implicit counter on every startHyperlink), so they never
+        ;; equal each other and dedupe never kicks in for them.
+        (should (integerp (get-text-property qux 'ghostel-link-id)))
+        (should (integerp (get-text-property zot 'ghostel-link-id)))
+        (should-not (equal (get-text-property qux 'ghostel-link-id)
+                           (get-text-property zot 'ghostel-link-id)))))))
 
 (ert-deftest ghostel-test-osc8-shared-id-navigation-dedupes ()
   "`ghostel-next/previous-hyperlink' stop once per OSC 8 id (issue #125).
@@ -121,71 +93,57 @@ Feeds the scenario from the issue: a single logical URL emitted as two
 OSC 8 chunks with `id=wrap', separated by intervening text on a new
 row.  Navigation should land on the link only once, not on each chunk."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-osc8-nav-dedupe*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 5 80 1000))
-                 (ghostel--term term)
-                 (ghostel--term-rows 5)
-                 (inhibit-read-only t))
-            (ghostel--write-input
-             term
-             (concat
-              "\e]8;id=wrap;https://wrapped.example\e\\http://exa\e]8;;\e\\\r\n"
-              "│ middle text │\r\n"
-              "\e]8;id=wrap;https://wrapped.example\e\\mple.com\e]8;;\e\\\r\n"
-              "\e]8;id=other;https://other.example\e\\next\e]8;;\e\\"))
-            (ghostel--redraw term t)
-            (goto-char (point-min))
-            (let ((chunk1 (progn (search-forward "http://exa") (- (point) 10)))
-                  (chunk2 (progn (search-forward "mple.com") (- (point) 8)))
-                  (other (progn (search-forward "next") (- (point) 4))))
-              ;; Same id on both chunks.
-              (should (equal "wrap" (get-text-property chunk1 'ghostel-link-id)))
-              (should (equal "wrap" (get-text-property chunk2 'ghostel-link-id)))
-              (should (equal "other" (get-text-property other 'ghostel-link-id)))
-              ;; From inside chunk1, forward skips chunk2 (same id), lands on `next'.
-              (should (equal other (ghostel--find-next-link chunk1)))
-              ;; From inside chunk2, forward also lands on `next' (no skip,
-              ;; since `other' has a different id).
-              (should (equal other (ghostel--find-next-link chunk2)))
-              ;; From inside chunk2, backward skips chunk1 (same id), no link left.
-              (should (null (ghostel--find-previous-link chunk2)))
-              ;; From inside `next', backward walks back over chunk2 (same id)
-              ;; and lands on chunk1, the URL's first chunk.
-              (should (equal chunk1 (ghostel--find-previous-link other))))))
-      (kill-buffer buf))))
+  (ghostel-test--with-terminal-buffer (_buf term 5 80 1000)
+    (let ((inhibit-read-only t))
+      (ghostel--write-input
+       term
+       (concat
+        "\e]8;id=wrap;https://wrapped.example\e\\http://exa\e]8;;\e\\\r\n"
+        "│ middle text │\r\n"
+        "\e]8;id=wrap;https://wrapped.example\e\\mple.com\e]8;;\e\\\r\n"
+        "\e]8;id=other;https://other.example\e\\next\e]8;;\e\\"))
+      (ghostel--redraw term t)
+      (goto-char (point-min))
+      (let ((chunk1 (progn (search-forward "http://exa") (- (point) 10)))
+            (chunk2 (progn (search-forward "mple.com") (- (point) 8)))
+            (other (progn (search-forward "next") (- (point) 4))))
+        ;; Same id on both chunks.
+        (should (equal "wrap" (get-text-property chunk1 'ghostel-link-id)))
+        (should (equal "wrap" (get-text-property chunk2 'ghostel-link-id)))
+        (should (equal "other" (get-text-property other 'ghostel-link-id)))
+        ;; From inside chunk1, forward skips chunk2 (same id), lands on `next'.
+        (should (equal other (ghostel--find-next-link chunk1)))
+        ;; From inside chunk2, forward also lands on `next' (no skip,
+        ;; since `other' has a different id).
+        (should (equal other (ghostel--find-next-link chunk2)))
+        ;; From inside chunk2, backward skips chunk1 (same id), no link left.
+        (should (null (ghostel--find-previous-link chunk2)))
+        ;; From inside `next', backward walks back over chunk2 (same id)
+        ;; and lands on chunk1, the URL's first chunk.
+        (should (equal chunk1 (ghostel--find-previous-link other)))))))
 
 (ert-deftest ghostel-test-osc8-uri-at-pos-two-links ()
   "`ghostel--native-uri-at-pos' returns the correct URI for each of two links."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-osc8-two*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 5 80 1000))
-                 (ghostel--term term)
-                 (ghostel--term-rows 5)
-                 (inhibit-read-only t))
-            (ghostel--write-input
-             term
-             (concat "\e]8;;https://first.example\e\\first\e]8;;\e\\"
-                     " and "
-                     "\e]8;;https://second.example\e\\second\e]8;;\e\\"))
-            (ghostel--redraw term t)
-            (goto-char (point-min))
-            (let* ((first-end (search-forward "first" nil t))
-                   (first-pos (- first-end (length "first")))
-                   (second-end (search-forward "second" nil t))
-                   (second-pos (- second-end (length "second"))))
-              (should first-end)
-              (should second-end)
-              (should (equal "https://first.example"
-                             (ghostel--native-uri-at-pos first-pos)))
-              (should (equal "https://second.example"
-                             (ghostel--native-uri-at-pos second-pos))))))
-      (kill-buffer buf))))
+  (ghostel-test--with-terminal-buffer (_buf term 5 80 1000)
+    (let ((inhibit-read-only t))
+      (ghostel--write-input
+       term
+       (concat "\e]8;;https://first.example\e\\first\e]8;;\e\\"
+               " and "
+               "\e]8;;https://second.example\e\\second\e]8;;\e\\"))
+      (ghostel--redraw term t)
+      (goto-char (point-min))
+      (let* ((first-end (search-forward "first" nil t))
+             (first-pos (- first-end (length "first")))
+             (second-end (search-forward "second" nil t))
+             (second-pos (- second-end (length "second"))))
+        (should first-end)
+        (should second-end)
+        (should (equal "https://first.example"
+                       (ghostel--native-uri-at-pos first-pos)))
+        (should (equal "https://second.example"
+                       (ghostel--native-uri-at-pos second-pos)))))))
 
 (ert-deftest ghostel-test-osc52 ()
   "Test OSC 52 clipboard handling."
@@ -866,32 +824,28 @@ be caught."
 Programs like `duf' read stdin with a short timeout and give up if
 the reply waits for the redraw timer."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-osc-flush*"))
-        (fake-proc (make-symbol "fake-proc"))
+  (let ((fake-proc (make-symbol "fake-proc"))
         (sent nil))
-    (unwind-protect
-        (with-current-buffer buf
-          (setq ghostel--term (ghostel--new 25 80 1000))
-          (setq ghostel--process fake-proc)
-          (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                    ((symbol-function 'process-live-p) (lambda (_) t))
-                    ((symbol-function 'ghostel--flush-output)
-                     (lambda (data) (setq sent (concat sent data))))
-                    ((symbol-function 'ghostel--invalidate) #'ignore))
-            ;; OSC 11 query arrives — reply must be produced before
-            ;; `ghostel--filter' returns, not on a later timer tick.
-            (ghostel--filter fake-proc "\e]11;?\e\\")
-            (should sent)
-            (should (string-match-p "\\`\e\\]11;rgb:" sent))
-            (should (equal nil ghostel--pending-output))
+    (ghostel-test--with-terminal-buffer (buf _term 25 80 1000)
+      (setq ghostel--process fake-proc)
+      (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                ((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'ghostel--flush-output)
+                 (lambda (data) (setq sent (concat sent data))))
+                ((symbol-function 'ghostel--invalidate) #'ignore))
+        ;; OSC 11 query arrives — reply must be produced before
+        ;; `ghostel--filter' returns, not on a later timer tick.
+        (ghostel--filter fake-proc "\e]11;?\e\\")
+        (should sent)
+        (should (string-match-p "\\`\e\\]11;rgb:" sent))
+        (should (equal nil ghostel--pending-output))
 
-            ;; A non-query OSC 11 set must NOT trigger the sync flush,
-            ;; so the data stays pending for the redraw timer.
-            (setq sent nil)
-            (ghostel--filter fake-proc "\e]11;rgb:11/22/33\e\\")
-            (should (equal nil sent))
-            (should ghostel--pending-output)))
-      (kill-buffer buf))))
+        ;; A non-query OSC 11 set must NOT trigger the sync flush,
+        ;; so the data stays pending for the redraw timer.
+        (setq sent nil)
+        (ghostel--filter fake-proc "\e]11;rgb:11/22/33\e\\")
+        (should (equal nil sent))
+        (should ghostel--pending-output)))))
 
 (ert-deftest ghostel-test-osc52-eval-filter-flush ()
   "The process filter must dispatch OSC 52;e synchronously.
@@ -900,43 +854,39 @@ after sending the OSC; a delayed dispatch (via the redraw timer)
 loses the race with `tempfile.TemporaryDirectory' cleanup, so
 `find-file' opens a file whose parent directory is already gone."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-osc52-flush*"))
-        (fake-proc (make-symbol "fake-proc"))
+  (let ((fake-proc (make-symbol "fake-proc"))
         (dispatched nil))
-    (unwind-protect
-        (with-current-buffer buf
-          (setq ghostel--term (ghostel--new 25 80 1000))
-          (setq ghostel--process fake-proc)
-          (let ((ghostel-eval-cmds
-                 `(("noop" ,(lambda (&rest args)
-                              (setq dispatched (cons 'noop args)))))))
-            (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                      ((symbol-function 'process-live-p) (lambda (_) t))
-                      ((symbol-function 'ghostel--invalidate) #'ignore))
-              ;; OSC 52;e must run before `ghostel--filter' returns.
-              (ghostel--filter fake-proc "\e]52;e;noop \"hi\"\e\\")
-              (should (equal '(noop "hi") dispatched))
-              (should (equal nil ghostel--pending-output))
+    (ghostel-test--with-terminal-buffer (buf _term 25 80 1000)
+      (setq ghostel--process fake-proc)
+      (let ((ghostel-eval-cmds
+             `(("noop" ,(lambda (&rest args)
+                          (setq dispatched (cons 'noop args)))))))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--invalidate) #'ignore))
+          ;; OSC 52;e must run before `ghostel--filter' returns.
+          (ghostel--filter fake-proc "\e]52;e;noop \"hi\"\e\\")
+          (should (equal '(noop "hi") dispatched))
+          (should (equal nil ghostel--pending-output))
 
-              ;; OSC 52;c (standard clipboard) must NOT trigger the sync
-              ;; flush — it's harmless to defer, unlike eval.
-              (setq dispatched nil)
-              (ghostel--filter fake-proc "\e]52;c;aGVsbG8=\e\\")
-              (should (equal nil dispatched))
-              (should ghostel--pending-output)
+          ;; OSC 52;c (standard clipboard) must NOT trigger the sync
+          ;; flush — it's harmless to defer, unlike eval.
+          (setq dispatched nil)
+          (ghostel--filter fake-proc "\e]52;c;aGVsbG8=\e\\")
+          (should (equal nil dispatched))
+          (should ghostel--pending-output)
 
-              ;; The OSC introducer can straddle a filter-call boundary
-              ;; (slow producers, SSH, tiny TCP segments).  The first
-              ;; chunk alone doesn't match — but the second chunk plus
-              ;; the carryover tail of the first must trigger dispatch.
-              (setq dispatched nil
-                    ghostel--pending-output nil)
-              (ghostel--filter fake-proc "prefix\e]52;")
-              (should (equal nil dispatched))
-              (ghostel--filter fake-proc "e;noop \"split\"\e\\")
-              (should (equal '(noop "split") dispatched))
-              (should (equal nil ghostel--pending-output)))))
-      (kill-buffer buf))))
+          ;; The OSC introducer can straddle a filter-call boundary
+          ;; (slow producers, SSH, tiny TCP segments).  The first
+          ;; chunk alone doesn't match — but the second chunk plus
+          ;; the carryover tail of the first must trigger dispatch.
+          (setq dispatched nil
+                ghostel--pending-output nil)
+          (ghostel--filter fake-proc "prefix\e]52;")
+          (should (equal nil dispatched))
+          (ghostel--filter fake-proc "e;noop \"split\"\e\\")
+          (should (equal '(noop "split") dispatched))
+          (should (equal nil ghostel--pending-output)))))))
 
 (ert-deftest ghostel-test-osc52-eval-filter-flush-after-introducer ()
   "Sync-flush survives the introducer landing alone at chunk end.
@@ -945,27 +895,23 @@ flush, pending cleared) and chunk 2 = body + ST (no `52;e;\\=', no
 carry).  Without the in-flight flag the eval defers to the redraw
 timer and `b4 prep --edit-cover\\=' can race its temp-dir cleanup."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-osc52-after-intro*"))
-        (fake-proc (make-symbol "fake-proc"))
+  (let ((fake-proc (make-symbol "fake-proc"))
         (dispatched nil))
-    (unwind-protect
-        (with-current-buffer buf
-          (setq ghostel--term (ghostel--new 25 80 1000))
-          (setq ghostel--process fake-proc)
-          (let ((ghostel-eval-cmds
-                 `(("noop" ,(lambda (&rest args)
-                              (setq dispatched (cons 'noop args)))))))
-            (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                      ((symbol-function 'process-live-p) (lambda (_) t))
-                      ((symbol-function 'ghostel--invalidate) #'ignore))
-              (ghostel--filter fake-proc "\e]52;e;")
-              (should ghostel--osc52-eval-in-flight)
-              (should-not dispatched)
-              (ghostel--filter fake-proc "\"noop\" \"post\"\e\\")
-              (should (equal '(noop "post") dispatched))
-              (should-not ghostel--osc52-eval-in-flight)
-              (should (equal nil ghostel--pending-output)))))
-      (kill-buffer buf))))
+    (ghostel-test--with-terminal-buffer (buf _term 25 80 1000)
+      (setq ghostel--process fake-proc)
+      (let ((ghostel-eval-cmds
+             `(("noop" ,(lambda (&rest args)
+                          (setq dispatched (cons 'noop args)))))))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--invalidate) #'ignore))
+          (ghostel--filter fake-proc "\e]52;e;")
+          (should ghostel--osc52-eval-in-flight)
+          (should-not dispatched)
+          (ghostel--filter fake-proc "\"noop\" \"post\"\e\\")
+          (should (equal '(noop "post") dispatched))
+          (should-not ghostel--osc52-eval-in-flight)
+          (should (equal nil ghostel--pending-output)))))))
 
 (ert-deftest ghostel-test-osc52-eval-filter-flush-mid-body ()
   "Sync-flush survives a body-split with the terminator in chunk 2.
@@ -973,26 +919,22 @@ Chunk 1 carries the introducer + partial body; chunk 2 finishes the
 body and the ST.  The in-flight flag keeps forcing flush on chunk 2
 even though chunk 2 itself contains no `52;e;\\=' substring."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-osc52-mid-body*"))
-        (fake-proc (make-symbol "fake-proc"))
+  (let ((fake-proc (make-symbol "fake-proc"))
         (dispatched nil))
-    (unwind-protect
-        (with-current-buffer buf
-          (setq ghostel--term (ghostel--new 25 80 1000))
-          (setq ghostel--process fake-proc)
-          (let ((ghostel-eval-cmds
-                 `(("noop" ,(lambda (&rest args)
-                              (setq dispatched (cons 'noop args)))))))
-            (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
-                      ((symbol-function 'process-live-p) (lambda (_) t))
-                      ((symbol-function 'ghostel--invalidate) #'ignore))
-              (ghostel--filter fake-proc "\e]52;e;\"noop\" \"sp")
-              (should ghostel--osc52-eval-in-flight)
-              (should-not dispatched)
-              (ghostel--filter fake-proc "lit\"\e\\")
-              (should (equal '(noop "split") dispatched))
-              (should-not ghostel--osc52-eval-in-flight))))
-      (kill-buffer buf))))
+    (ghostel-test--with-terminal-buffer (buf _term 25 80 1000)
+      (setq ghostel--process fake-proc)
+      (let ((ghostel-eval-cmds
+             `(("noop" ,(lambda (&rest args)
+                          (setq dispatched (cons 'noop args)))))))
+        (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
+                  ((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'ghostel--invalidate) #'ignore))
+          (ghostel--filter fake-proc "\e]52;e;\"noop\" \"sp")
+          (should ghostel--osc52-eval-in-flight)
+          (should-not dispatched)
+          (ghostel--filter fake-proc "lit\"\e\\")
+          (should (equal '(noop "split") dispatched))
+          (should-not ghostel--osc52-eval-in-flight))))))
 
 (ert-deftest ghostel-test-osc52-eval ()
   "Test that OSC 52;e dispatches to whitelisted functions."

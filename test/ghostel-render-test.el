@@ -210,27 +210,31 @@ state the normalizer would treat the leading \\n as bare and emit
 after \"first\\r\" + \"\\nsecond\", exactly as if the pair were sent in
 one call; a bug would leave it on row 2 or otherwise desynced."
   :tags '(native)
-  (let ((term (ghostel--new 25 80 1000))
-        (term-single (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "first\r")
-    (ghostel--write-input term "\nsecond")
-    (ghostel--write-input term-single "first\r\nsecond")
-    (should (equal (ghostel-test--cursor term)
-                   (ghostel-test--cursor term-single)))))
+  (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
+    (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
+      (ghostel--write-input term "first\r")
+      (ghostel--write-input term "\nsecond")
+      (ghostel--write-input term-single "first\r\nsecond")
+      (should (equal (with-current-buffer buf
+                       (ghostel-test--cursor term))
+                     (with-current-buffer buf-single
+                       (ghostel-test--cursor term-single)))))))
 
 (ert-deftest ghostel-test-crlf-split-with-empty-chunk ()
   "An empty write between \\r and \\n preserves the cross-call CR flag.
 Regression guard for a naive implementation that resets `last_input_was_cr'
 on every entry rather than only when input was consumed."
   :tags '(native)
-  (let ((term (ghostel--new 25 80 1000))
-        (term-single (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "first\r")
-    (ghostel--write-input term "")          ; empty chunk must not clear flag
-    (ghostel--write-input term "\nsecond")
-    (ghostel--write-input term-single "first\r\nsecond")
-    (should (equal (ghostel-test--cursor term)
-                   (ghostel-test--cursor term-single)))))
+  (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
+    (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
+      (ghostel--write-input term "first\r")
+      (ghostel--write-input term "")          ; empty chunk must not clear flag
+      (ghostel--write-input term "\nsecond")
+      (ghostel--write-input term-single "first\r\nsecond")
+      (should (equal (with-current-buffer buf
+                       (ghostel-test--cursor term))
+                     (with-current-buffer buf-single
+                       (ghostel-test--cursor term-single)))))))
 
 (ert-deftest ghostel-test-crlf-standalone-cr-then-crlf ()
   "A lone CR followed by a complete CRLF stays two logical line-endings.
@@ -241,13 +245,15 @@ call.  (Bare \\n comes from Emacs PTYs lacking ONLCR; bare \\r from
 programs that explicitly emit a carriage return — both must be passed
 through without cross-call munging.)"
   :tags '(native)
-  (let ((term (ghostel--new 25 80 1000))
-        (term-single (ghostel--new 25 80 1000)))
-    (ghostel--write-input term "a\r")
-    (ghostel--write-input term "\r\nb")
-    (ghostel--write-input term-single "a\r\r\nb")
-    (should (equal (ghostel-test--cursor term)
-                   (ghostel-test--cursor term-single)))))
+  (ghostel-test--with-terminal-buffer (buf term 25 80 1000)
+    (ghostel-test--with-terminal-buffer (buf-single term-single 25 80 1000)
+      (ghostel--write-input term "a\r")
+      (ghostel--write-input term "\r\nb")
+      (ghostel--write-input term-single "a\r\r\nb")
+      (should (equal (with-current-buffer buf
+                       (ghostel-test--cursor term))
+                     (with-current-buffer buf-single
+                       (ghostel-test--cursor term-single)))))))
 
 (ert-deftest ghostel-test-render-trims-trailing-whitespace ()
   "Rendered rows do not carry libghostty's full-width padding.
@@ -280,6 +286,47 @@ are retained — only unwritten padding cells are trimmed."
                                         (point-min) (point-max))
                                        "\n")))
               (should (equal "$ " (car lines))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-render-untrims-cursor-line-to-cursor-column ()
+  "A cursor past EOL keeps only enough blanks to place point there."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-cursor-untrim*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 3 20 100))
+                 (inhibit-read-only t))
+            (ghostel--write-input term "\e[H\e[2Jhi\e[1;11H")
+            (ghostel--redraw term t)
+            (should (equal '(10 . 0) ghostel--cursor-pos))
+            (goto-char ghostel--cursor-char-pos)
+            (should (= 10 (current-column)))
+            (let ((line (buffer-substring-no-properties
+                         (line-beginning-position)
+                         (line-end-position))))
+              (should (equal (concat "hi" (make-string 8 ?\s)) line)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-render-retrims-old-cursor-line-on-cursor-move ()
+  "Moving the cursor trims the old line and untrims the new one."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-cursor-retrim*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 3 20 100))
+                 (inhibit-read-only t))
+            (ghostel--write-input term "\e[H\e[2Jhi\e[1;11H")
+            (ghostel--redraw term t)
+            (ghostel--write-input term "\e[2;6H")
+            (ghostel--redraw term)
+            (should (equal '(5 . 1) ghostel--cursor-pos))
+            (let ((lines (split-string (buffer-substring-no-properties
+                                        (point-min) (point-max))
+                                       "\n")))
+              (should (equal "hi" (nth 0 lines)))
+              (should (equal (make-string 5 ?\s) (nth 1 lines))))
+            (goto-char ghostel--cursor-char-pos)
+            (should (= 5 (current-column)))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-soft-wrap-copy ()
@@ -1837,6 +1884,26 @@ and `forward-line' for clean ones.  Only the dirty row loses the sentinel."
 
 
 
+;;; Alt-screen rendering invariants
+
+(ert-deftest ghostel-test-alt-screen-overflow-line-count ()
+  "Overflowing an alt-screen scroll region does not grow the buffer."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-alt-overflow-lines*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 1000))
+                 (inhibit-read-only t))
+            (ghostel--write-input term "\e[?1049h")
+            (ghostel--write-input term "\e[1;3r")
+            (dotimes (i 10)
+              (ghostel--write-input term (format "ROW-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (should (= 5 (count-lines (point-min) (point-max))))))
+      (kill-buffer buf))))
+
+
+
 ;;; Resize rendering
 
 (ert-deftest ghostel-test-content-preserved-across-vertical-resizes ()
@@ -1893,6 +1960,40 @@ the written content; all remaining lines must be empty."
               (should (equal ""
                              (buffer-substring-no-properties
                               (line-beginning-position) (line-end-position)))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-alt-screen-vertical-shrink-line-count ()
+  "Shrinking the alt-screen viewport leaves exactly the new row count."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-alt-shrink-lines*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 80 1000))
+                 (inhibit-read-only t))
+            (ghostel--write-input term "\e[?1049h")
+            (dotimes (i 5)
+              (ghostel--write-input term (format "\e[%d;1HROW-%d" (1+ i) i)))
+            (ghostel--redraw term t)
+            (ghostel--set-size term 3 80)
+            (ghostel--redraw term)
+            (should (= 3 (count-lines (point-min) (point-max))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-alt-screen-vertical-grow-line-count ()
+  "Growing the alt-screen viewport leaves exactly the new row count."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-alt-grow-lines*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 3 80 1000))
+                 (inhibit-read-only t))
+            (ghostel--write-input term "\e[?1049h")
+            (dotimes (i 3)
+              (ghostel--write-input term (format "\e[%d;1HROW-%d" (1+ i) i)))
+            (ghostel--redraw term t)
+            (ghostel--set-size term 5 80)
+            (ghostel--redraw term)
+            (should (= 5 (count-lines (point-min) (point-max))))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-resize-no-blank-flash ()

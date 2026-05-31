@@ -8,6 +8,8 @@ export EMACSFLAGS
 XDG_CACHE_HOME ?= $(HOME)/.cache
 MELPAZOID_DIR  ?= $(XDG_CACHE_HOME)/melpazoid
 EVIL_DIR       ?= $(XDG_CACHE_HOME)/evil
+LINT_ELPA_DIR  ?= $(XDG_CACHE_HOME)/ghostel-lint-elpa
+LINT_DEPS_STAMP := $(LINT_ELPA_DIR)/.deps-installed
 
 ELC := lisp/ghostel.elc lisp/ghostel-debug.elc lisp/ghostel-compile.elc \
        lisp/ghostel-eshell.elc lisp/ghostel-comint.elc \
@@ -106,8 +108,22 @@ byte-compile: $(ELC)
 
 lint: byte-compile package-lint checkdoc docquotes
 
-package-lint:
+# `package-lint' needs two things present that aren't on any default load path:
+# the linter itself, and a resolvable `ghostel' package.
+# Provision both into an isolated `package-user-dir'
+# so `make package-lint' runs standalone.
+$(LINT_DEPS_STAMP):
 	$(EMACS) --batch $(EMACSFLAGS) -Q \
+		--eval "(setq package-user-dir \"$(LINT_ELPA_DIR)\")" \
+		--eval "(package-initialize)" \
+		--eval "(package-refresh-contents)" \
+		--eval "(package-install 'package-lint)" \
+		--eval "(package-install-file (expand-file-name \"lisp/ghostel.el\"))"
+	@touch $@
+
+package-lint: $(LINT_DEPS_STAMP)
+	$(EMACS) --batch $(EMACSFLAGS) -Q \
+		--eval "(setq package-user-dir \"$(LINT_ELPA_DIR)\")" \
 		--eval "(package-initialize)" \
 		--eval "(require 'package-lint)" \
 		-f package-lint-batch-and-exit \

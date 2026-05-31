@@ -39,50 +39,43 @@ and the snapshot/restore path in `ghostel--delayed-redraw' puts
 the input region back after each redraw so the user's typing is
 not clobbered."
   :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-line-live*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (set-window-buffer (selected-window) buf)
-          (ghostel-mode)
-          (setq ghostel--term (ghostel--new 5 80 1000))
-          (setq ghostel--term-rows 5)
-          (setq ghostel--process 'fake-proc)
-          ;; First prompt with OSC 133 A/B markers.
-          (ghostel--write-input ghostel--term
-                                "\e]133;A\e\\$ \e]133;B\e\\")
-          (let ((inhibit-read-only t))
-            (ghostel--redraw ghostel--term t))
-          (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
-                    ((symbol-function 'process-send-string) #'ignore)
-                    ((symbol-function 'ghostel--invalidate) #'ignore)
-                    ((symbol-function 'ghostel--scroll-bottom) #'ignore))
-            (ghostel-line-mode)
-            (should (eq ghostel--input-mode 'line))
-            (should (markerp ghostel--line-input-start))
-            ;; Type some input locally.
-            (insert "ls")
-            (should (equal (ghostel--line-mode-input-text) "ls"))
-            ;; Simulate the post-RET sequence: shell echoes the line,
-            ;; runs the command, prints output, then a new prompt
-            ;; with OSC 133 markers.  The redraw must preserve the
-            ;; user's input AND show the new output above the new
-            ;; prompt.
-            (ghostel--write-input ghostel--term
-                                  "ls\r\nfile1\r\n\e]133;A\e\\$ \e]133;B\e\\")
-            (ghostel--delayed-redraw buf)
-            ;; Input is still there.
-            (should (equal (ghostel--line-mode-input-text) "ls"))
-            ;; New output is in the buffer.
-            (let ((content (buffer-substring-no-properties
-                            (point-min) (point-max))))
-              (should (string-match-p "file1" content)))
-            ;; Marker now points at the NEW prompt-end, not the old
-            ;; one — find-prompt-end picks the last prompt char.
-            ;; Exit cleans up state.
-            (ghostel-semi-char-mode)
-            (should-not (text-property-any (point-min) (point-max)
-                                           'read-only t))))
-      (when (buffer-live-p buf) (kill-buffer buf)))))
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (set-window-buffer (selected-window) buf)
+    (setq ghostel--process 'fake-proc)
+    ;; First prompt with OSC 133 A/B markers.
+    (ghostel--write-input term "\e]133;A\e\\$ \e]133;B\e\\")
+    (let ((inhibit-read-only t))
+      (ghostel--redraw term t))
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
+              ((symbol-function 'process-send-string) #'ignore)
+              ((symbol-function 'ghostel--invalidate) #'ignore)
+              ((symbol-function 'ghostel--scroll-bottom) #'ignore))
+      (ghostel-line-mode)
+      (should (eq ghostel--input-mode 'line))
+      (should (markerp ghostel--line-input-start))
+      ;; Type some input locally.
+      (insert "ls")
+      (should (equal (ghostel--line-mode-input-text) "ls"))
+      ;; Simulate the post-RET sequence: shell echoes the line,
+      ;; runs the command, prints output, then a new prompt
+      ;; with OSC 133 markers.  The redraw must preserve the
+      ;; user's input AND show the new output above the new
+      ;; prompt.
+      (ghostel--write-input term
+                            "ls\r\nfile1\r\n\e]133;A\e\\$ \e]133;B\e\\")
+      (ghostel--delayed-redraw buf)
+      ;; Input is still there.
+      (should (equal (ghostel--line-mode-input-text) "ls"))
+      ;; New output is in the buffer.
+      (let ((content (buffer-substring-no-properties
+                      (point-min) (point-max))))
+        (should (string-match-p "file1" content)))
+      ;; Marker now points at the NEW prompt-end, not the old
+      ;; one — find-prompt-end picks the last prompt char.
+      ;; Exit cleans up state.
+      (ghostel-semi-char-mode)
+      (should-not (text-property-any (point-min) (point-max)
+                                     'read-only t)))))
 
 (ert-deftest ghostel-test-mouse-1-drag-no-tracking-line-mode-no-copy-mode ()
   "Drag-end in line mode does not enter copy mode.

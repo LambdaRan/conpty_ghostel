@@ -23,21 +23,19 @@ The buffer has evil-mode and evil-ghostel-mode active.
 The variable `term' is bound to the terminal handle.
 Requires the native module."
   (declare (indent 3) (debug t))
-  `(let ((term (ghostel--new ,rows ,cols 100)))
-     (ghostel--write-input term ,text)
-     (with-temp-buffer
-       (ghostel-mode)
-       (setq-local ghostel--term term)
-       ;; Production wires `ghostel--term-rows' via `ghostel--resize';
-       ;; tests that drive the module directly must set it themselves so
-       ;; viewport-aware helpers (e.g. `evil-ghostel--reset-cursor-point')
-       ;; can translate viewport rows into buffer lines.
-       (setq-local ghostel--term-rows ,rows)
-       (evil-local-mode 1)
-       (evil-ghostel-mode 1)
-       (let ((inhibit-read-only t))
-         (ghostel--redraw term t))
-       ,@body)))
+  `(let* ((ghostel-max-scrollback 100)
+          (buf (ghostel--create " *evil-ghostel-test*" nil ,rows ,cols))
+          (term (buffer-local-value 'ghostel--term buf)))
+     (unwind-protect
+         (with-current-buffer buf
+           (ghostel--write-input term ,text)
+           (evil-local-mode 1)
+           (evil-ghostel-mode 1)
+           (let ((inhibit-read-only t))
+             (ghostel--redraw term t))
+           ,@body)
+       (when (buffer-live-p buf)
+         (kill-buffer buf)))))
 
 (defmacro evil-ghostel-test--with-evil-buffer (&rest body)
   "Set up a ghostel buffer with evil-mode active (no native module).
@@ -290,37 +288,33 @@ Scrollback navigation must not be disturbed by output redraws."
 last `ghostel--term-rows' lines of the buffer).  With scrollback
 present, interpreting the row as an offset from `point-min' lands
 point in the scrollback region instead of the visible viewport."
-  (let ((term (ghostel--new 5 40 1000)))
-    ;; Overflow a 5-row viewport with 12 lines so 7 scroll off.  The
-    ;; final row ("last-11") is in the viewport; earlier rows live in
-    ;; scrollback above.
-    (dotimes (i 12)
-      (ghostel--write-input term (format "row-%02d\r\n" i)))
-    (ghostel--write-input term "last-11")
-    (with-temp-buffer
-      (ghostel-mode)
-      (setq-local ghostel--term term)
-      (setq-local ghostel--term-rows 5)
-      (evil-local-mode 1)
-      (evil-ghostel-mode 1)
-      (let ((inhibit-read-only t))
-        (ghostel--redraw term t))
-      ;; Walk point back into the scrollback region.
-      (goto-char (point-min))
-      (should (string-match-p "row-00" (buffer-substring-no-properties
-                                         (line-beginning-position)
-                                         (line-end-position))))
-      ;; Reset must snap point into the viewport, not to scrollback row N.
-      (evil-ghostel--reset-cursor-point)
-      ;; The landing line is the one that contains the terminal cursor —
-      ;; "last-11" (the last written row before the trailing cursor).
-      (let ((line-text (buffer-substring-no-properties
-                        (line-beginning-position)
-                        (line-end-position))))
-        (should (string-match-p "last-11" line-text)))
-      ;; And the landing column matches the terminal cursor column.
-      (should (= (car ghostel--cursor-pos)
-                 (current-column))))))
+  (evil-ghostel-test--with-buffer
+   5 40 ""
+   ;; Overflow a 5-row viewport with 12 lines so 7 scroll off.  The
+   ;; final row ("last-11") is in the viewport; earlier rows live in
+   ;; scrollback above.
+   (dotimes (i 12)
+     (ghostel--write-input term (format "row-%02d\r\n" i)))
+   (ghostel--write-input term "last-11")
+   (let ((inhibit-read-only t))
+     (ghostel--redraw term t))
+   ;; Walk point back into the scrollback region.
+   (goto-char (point-min))
+   (should (string-match-p "row-00" (buffer-substring-no-properties
+                                     (line-beginning-position)
+                                     (line-end-position))))
+   ;; Reset must snap point into the viewport,
+   ;; not to scrollback row N.
+   (evil-ghostel--reset-cursor-point)
+   ;; The landing line contains the terminal cursor:
+   ;; "last-11" (last written row before the trailing cursor).
+   (let ((line-text (buffer-substring-no-properties
+                     (line-beginning-position)
+                     (line-end-position))))
+     (should (string-match-p "last-11" line-text)))
+   ;; And the landing column matches the terminal cursor column.
+   (should (= (car ghostel--cursor-pos)
+              (current-column)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: cursor-to-point (arrow key sending)
@@ -380,38 +374,33 @@ point in the scrollback region instead of the visible viewport."
 buffer line N must be converted to viewport row N-scrollback before
 diffing — otherwise dy is wrong by exactly the scrollback line count
 and the helper sends arrows that move the cursor off the input."
-  (let ((term (ghostel--new 5 40 1000)))
-    ;; Push 7 rows into scrollback so the viewport shows rows 8..12 plus
-    ;; the trailing cursor row.
-    (dotimes (i 12)
-      (ghostel--write-input term (format "row-%02d\r\n" i)))
-    (ghostel--write-input term "tail")
-    (with-temp-buffer
-      (ghostel-mode)
-      (setq-local ghostel--term term)
-      (setq-local ghostel--term-rows 5)
-      (evil-local-mode 1)
-      (evil-ghostel-mode 1)
-      (let ((inhibit-read-only t))
-        (ghostel--redraw term t))
-      ;; Terminal cursor is on the last viewport row; move point to the
-      ;; first viewport row (one row above the cursor).
-      (let* ((tpos ghostel--cursor-pos)
-             (trow (cdr tpos))
-             (target-viewport-row (1- trow))
-             (scrollback (max 0 (- (count-lines (point-min) (point-max))
-                                   ghostel--term-rows))))
-        (goto-char (point-min))
-        (forward-line (+ scrollback target-viewport-row))
-        (move-to-column (car tpos))
-        (let ((keys-sent '()))
-          (cl-letf (((symbol-function 'ghostel--send-encoded)
-                     (lambda (key _mods &rest _)
-                       (push key keys-sent))))
-            (evil-ghostel--cursor-to-point))
-          ;; Exactly one UP, no horizontal motion (cols match).
-          (should (= 1 (length keys-sent)))
-          (should (equal "up" (car keys-sent))))))))
+  (evil-ghostel-test--with-buffer
+   5 40 ""
+   ;; Push 7 rows into scrollback so the viewport shows
+   ;; rows 8..12 plus the trailing cursor row.
+   (dotimes (i 12)
+     (ghostel--write-input term (format "row-%02d\r\n" i)))
+   (ghostel--write-input term "tail")
+   (let ((inhibit-read-only t))
+     (ghostel--redraw term t))
+   ;; Terminal cursor is on the last viewport row; move point to the
+   ;; first viewport row (one row above the cursor).
+   (let* ((tpos ghostel--cursor-pos)
+          (trow (cdr tpos))
+          (target-viewport-row (1- trow))
+          (line-count (count-lines (point-min) (point-max)))
+          (scrollback (max 0 (- line-count ghostel--term-rows))))
+     (goto-char (point-min))
+     (forward-line (+ scrollback target-viewport-row))
+     (move-to-column (car tpos))
+     (let ((keys-sent '()))
+       (cl-letf (((symbol-function 'ghostel--send-encoded)
+                  (lambda (key _mods &rest _)
+                    (push key keys-sent))))
+         (evil-ghostel--cursor-to-point))
+       ;; Exactly one UP, no horizontal motion (cols match).
+       (should (= 1 (length keys-sent)))
+       (should (equal "up" (car keys-sent)))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: redraw preserves point in normal state
@@ -963,6 +952,25 @@ position the cursor no longer holds."
      (setq evil-ghostel--shadow-cursor (cons 5 0))
      (evil-ghostel--passthrough-ctrl "a")
      (should-not evil-ghostel--shadow-cursor))))
+
+(ert-deftest evil-ghostel-test-ctrl-passthrough-sends-in-alt-screen ()
+  "Insert-state Ctrl passthrough remains active in alt-screen TUIs.
+`evil-ghostel--active-p' excludes alt-screen so normal-mode editing
+falls through there, but C-u/C-w/etc. must still go to the terminal
+instead of invoking Evil's insert-state editing commands."
+  (evil-ghostel-test--with-evil-buffer
+   (setq-local ghostel--term t)
+   (setq-local ghostel--input-mode 'semi-char)
+   (cl-letf (((symbol-function 'ghostel--mode-enabled)
+              (lambda (_term mode) (= mode 1049))))
+     (should-not (evil-ghostel--active-p))
+     (should (evil-ghostel--ctrl-passthrough-active-p))
+     (let (sent)
+       (cl-letf (((symbol-function 'ghostel--send-encoded)
+                  (lambda (key mods &rest _)
+                    (setq sent (cons key mods)))))
+         (evil-ghostel--passthrough-ctrl "u"))
+       (should (equal '("u" . "ctrl") sent))))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: insert-state entry skips vertical sync
@@ -1556,7 +1564,8 @@ sticks."
     evil-ghostel-test-delete-word-with-trailing-space
     evil-ghostel-test-change-partial-no-post-delete-sync
     evil-ghostel-test-insert-entry-same-viewport-row-with-scrollback
-    evil-ghostel-test-ctrl-passthrough-invalidates-shadow)
+    evil-ghostel-test-ctrl-passthrough-invalidates-shadow
+    evil-ghostel-test-ctrl-passthrough-sends-in-alt-screen)
   "Tests that require only Elisp (no native module).")
 
 (defun evil-ghostel-test-run-elisp ()
