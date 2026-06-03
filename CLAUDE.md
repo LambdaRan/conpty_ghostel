@@ -182,7 +182,7 @@ MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
 ## 关键约定
 
 - Elisp 公共 API 使用 `ghostel-` 前缀；内部使用 `ghostel--`（双横线）
-- Zig 函数注册使用 `emacs_functions` 表驱动模式（`[_]emacs.FunctionEntry`），每个表项的 `.impl` 字段是包含 `pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) emacs.Value` 方法的类型
+- Zig 函数注册使用 `emacs_functions` 表驱动模式（`[_]emacs.FunctionEntry`），每个表项的 `.impl` 字段是包含 `pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) !emacs.Value` 方法的类型
 - `test/ghostel-test.el` 中的测试分为纯 Elisp 和 native 两类；CI 在 Emacs 28.2、29.4 和 snapshot 上运行
 - Shell 集成脚本位于 `etc/shell/bootstrap/` (bash/zsh/fish) 和 `etc/shell/ghostel.{bash,zsh,fish}`（SSH terminfo）
 - 打包的 terminfo 在 `etc/terminfo/` 中
