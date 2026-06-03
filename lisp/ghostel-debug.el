@@ -203,7 +203,7 @@ will identify which detection arm misfired."
 (defun ghostel-debug-start ()
   "Start logging ghostel events to *ghostel-debug* buffer.
 Logs filter calls, key sends, resize events, redraw decisions
-\(including DEC 2026 skip/force), and `window-start' anchoring."
+\(including DEC 2026 skip/force), and window scroll state."
   (interactive)
   (setq ghostel-debug--log-buffer (get-buffer-create "*ghostel-debug*"))
   (with-current-buffer ghostel-debug--log-buffer
@@ -297,8 +297,7 @@ _PROC is ignored."
 
 (defun ghostel-debug--snapshot (buffer)
   "Return a plist of redraw-relevant state for BUFFER, or nil.
-Captures DEC 2026, force flag, buffer size, trailing-byte flag,
-point, `ghostel--term-rows', `ghostel--last-anchor-position',
+Captures DEC 2026, force flag, buffer size, cursor positions,
 computed viewport-start, and per-window ws/we/wp/body-height."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
@@ -308,12 +307,12 @@ computed viewport-start, and per-window ws/we/wp/body-height."
         (list :sync (and ghostel--term
                          (ghostel--mode-enabled ghostel--term 2026))
               :force ghostel--force-next-redraw
-              :snap ghostel--snap-requested
               :buf-size (buffer-size)
               :trailing-nl (eq cb ?\n)
               :point (point)
+              :cursor ghostel--cursor-pos
+              :cursor-char ghostel--cursor-char-pos
               :term-rows ghostel--term-rows
-              :anchor-pos ghostel--last-anchor-position
               :vs (ghostel--viewport-start)
               :wins (mapcar (lambda (w)
                               (list :w w
@@ -345,18 +344,18 @@ ORIG-FN is `ghostel--delayed-redraw', BUFFER is the target buffer."
           (if (and (plist-get before :sync) (not (plist-get before :force)))
               (insert (format "[%s] REDRAW: SKIPPED (DEC2026 active, force=nil)\n"
                               (format-time-string "%T.%3N")))
-            (insert (format "[%s] REDRAW: %.1fms force=%s→%s snap=%s→%s dec2026=%s buf=%d→%d trailNL=%s→%s pt=%d→%d rows=%s vs=%s→%s anchor=%s→%s\n"
+            (insert (format "[%s] REDRAW: %.1fms force=%s→%s dec2026=%s buf=%d→%d trailNL=%s→%s pt=%d→%d cursor=%S→%S cursor-char=%S→%S rows=%s vs=%s→%s\n"
                             (format-time-string "%T.%3N")
                             elapsed
                             (plist-get before :force) (plist-get after :force)
-                            (plist-get before :snap) (plist-get after :snap)
                             (plist-get before :sync)
                             (plist-get before :buf-size) (plist-get after :buf-size)
                             (plist-get before :trailing-nl) (plist-get after :trailing-nl)
                             (plist-get before :point) (plist-get after :point)
+                            (plist-get before :cursor) (plist-get after :cursor)
+                            (plist-get before :cursor-char) (plist-get after :cursor-char)
                             (plist-get after :term-rows)
-                            (plist-get before :vs) (plist-get after :vs)
-                            (plist-get before :anchor-pos) (plist-get after :anchor-pos)))
+                            (plist-get before :vs) (plist-get after :vs)))
             (insert (format "           wins-before: %s\n"
                             (ghostel-debug--fmt-wins (plist-get before :wins))))
             (insert (format "           wins-after:  %s\n"
@@ -655,7 +654,7 @@ omit it when the connection itself is the suspected fault."
             (insert "\n(not in a ghostel buffer — buffer/process/window/terminal sections skipped)\n")
           (let (buf-name maj-mode dir remote modes
                 proc cmd shell shell-integ tramp-integ detected
-                term term-rows term-cols force pending timer input-mode
+                term term-rows term-cols force timer input-mode
                 input-bytes input-timer
                 buf-size buf-lines pt dec2026 alt-scr
                 dln-on dln-style spawn-capture)
@@ -681,7 +680,6 @@ omit it when the connection itself is the suspected fault."
                     term-rows ghostel--term-rows
                     term-cols ghostel--term-cols
                     force ghostel--force-next-redraw
-                    pending (length ghostel--pending-output)
                     timer (and ghostel--redraw-timer t)
                     input-mode ghostel--input-mode
                     input-bytes (apply #'+ (mapcar #'length
@@ -785,7 +783,6 @@ omit it when the connection itself is the suspected fault."
                     (insert (format "Alt screen:          %s\n"
                                     (if alt-scr "yes" "no")))
                     (insert (format "Force next redraw:   %s\n" force))
-                    (insert (format "Pending output:      %d chunks\n" pending))
                     (insert (format "Redraw timer:        %s\n"
                                     (if timer "pending" "none")))
                     (insert (format "Coalesce buffer:     %d bytes  timer: %s\n"

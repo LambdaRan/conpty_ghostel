@@ -3,7 +3,7 @@
 ;;; Commentary:
 
 ;; Renderer-focused tests.  These cover the Emacs-buffer rendering boundary:
-;; cell/row rendering, faces, hyperlinks, scrollback materialization, clear
+;; cell/row rendering, faces, scrollback materialization, clear
 ;; operations, dirty-row reuse, resize rendering, delayed redraws, and window
 ;; anchoring.  Feature-specific tests that merely observe the terminal through
 ;; redraws live with their owning feature (for example shell integration, Evil,
@@ -63,6 +63,278 @@ either of which would snap every marker in the buffer to `point-min'."
               (ghostel--redraw term t)
               (should (= target (marker-position (mark-marker)))))))
       (kill-buffer buf))))
+
+(defun ghostel-test--token-position (token)
+  "Return the start position of TOKEN in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (search-forward token)
+    (match-beginning 0)))
+
+(defun ghostel-test--token-at-p (pos token)
+  "Return non-nil when TOKEN starts at POS in the current buffer."
+  (and pos
+       (<= (+ pos (length token)) (1+ (point-max)))
+       (equal token
+              (buffer-substring-no-properties pos (+ pos (length token))))))
+
+(defun ghostel-test--set-position-preservation-anchors (win)
+  "Set mark, WIN point, and WIN start on distinct semantic targets."
+  (let ((mark-pos (ghostel-test--token-position "MARK_TARGET"))
+        (point-pos (ghostel-test--token-position "POINT_TARGET"))
+        (start-pos (ghostel-test--token-position "START_TARGET")))
+    (set-marker (mark-marker) mark-pos)
+    (goto-char point-pos)
+    (set-window-point win point-pos)
+    (set-window-start win start-pos t)))
+
+(defun ghostel-test--assert-position-preservation (win)
+  "Assert mark, point, WIN point, and WIN start kept their targets."
+  (should (ghostel-test--token-at-p (marker-position (mark-marker))
+                                    "MARK_TARGET"))
+  (should (ghostel-test--token-at-p (point)
+                                    "POINT_TARGET"))
+  (should (ghostel-test--token-at-p (window-point win)
+                                    "POINT_TARGET"))
+  (should (ghostel-test--token-at-p (window-start win)
+                                    "START_TARGET")))
+
+(defmacro ghostel-test--with-position-preservation-case (spec &rest body)
+  "Run BODY in a displayed native terminal buffer.
+SPEC is (BUFFER TERM ROWS COLS SCROLLBACK WRITER).  WRITER is called
+with TERM and must write MARK_TARGET, POINT_TARGET, and START_TARGET."
+  (declare (indent 1))
+  (pcase-let ((`(,buffer ,term ,rows ,cols ,scrollback ,writer) spec))
+    `(let ((,buffer (generate-new-buffer " *ghostel-test-position-preservation*"))
+           (orig-buf (window-buffer (selected-window))))
+       (unwind-protect
+           (with-current-buffer ,buffer
+             (ghostel-mode)
+             (set-window-buffer (selected-window) ,buffer)
+             (let* ((,term (ghostel--new ,rows ,cols ,scrollback))
+                    (ghostel--term ,term)
+                    (ghostel--term-rows ,rows)
+                    (ghostel--term-cols ,cols)
+                    (inhibit-read-only t)
+                    (win (selected-window)))
+               (funcall ,writer ,term)
+               (ghostel--redraw ,term t)
+               (ghostel-test--set-position-preservation-anchors win)
+               ,@body
+               (ghostel-test--assert-position-preservation win)))
+         (when (buffer-live-p orig-buf)
+           (set-window-buffer (selected-window) orig-buf))
+         (kill-buffer ,buffer)))))
+
+(defun ghostel-test--write-position-preservation-lines (term count)
+  "Write COUNT hard-wrapped rows containing the position target tokens to TERM."
+  (dotimes (i count)
+    (ghostel--write-input
+     term
+     (cond
+      ((= i 3) "START_TARGET start-row\r\n")
+      ((= i 7) "mark row MARK_TARGET here\r\n")
+      ((= i 11) "point row POINT_TARGET here\r\n")
+      (t (format "row-%03d ordinary content\r\n" i))))))
+
+(defun ghostel-test--write-position-preservation-reflow-content (term)
+  "Write content to TERM whose target rows survive a width-changing reflow."
+  (ghostel--write-input term "START_TARGET stable start row\r\n")
+  (ghostel--write-input term
+                        (concat "long row before mark "
+                                (make-string 45 ?a)
+                                " MARK_TARGET "
+                                (make-string 45 ?b)
+                                " POINT_TARGET tail\r\n"))
+  (dotimes (i 8)
+    (ghostel--write-input term (format "after-%02d\r\n" i))))
+
+(defun ghostel-test--write-position-preservation-alt-screen (term rows)
+  "Write target tokens to TERM into ROWS of alt-screen content."
+  (ghostel--write-input term "\e[?1049h\e[H\e[2J")
+  (dotimes (i rows)
+    (ghostel--write-input
+     term
+     (format "\e[%d;1H%s" (1+ i)
+             (pcase i
+               (0 "START_TARGET alt-start")
+               (2 "MARK_TARGET alt-mark")
+               (4 "POINT_TARGET alt-point")
+               (_ (format "alt-row-%02d" i)))))))
+
+(ert-deftest ghostel-test-position-preservation-regular-redraw ()
+  "Incremental redraw preserves mark, point, and window start semantically."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 8 80 2000 (lambda (term)
+                         (ghostel-test--write-position-preservation-lines term 12)))
+   (ghostel--write-input term "\e[2;1Hdirty-row")
+   (ghostel--redraw term)))
+
+(ert-deftest ghostel-test-position-preservation-after-changed-length-line ()
+  "Positions after a changed-length dirty row stay at semantic targets."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 12 80 2000 (lambda (term)
+                          (ghostel--write-input term "short mutable row\r\n")
+                          (ghostel--write-input term "START_TARGET start-row\r\n")
+                          (ghostel--write-input term "mark row MARK_TARGET here\r\n")
+                          (ghostel--write-input term "point row POINT_TARGET here\r\n")
+                          (dotimes (i 4)
+                            (ghostel--write-input term
+                                                  (format "tail-%02d\r\n" i)))))
+   (let ((old-start (ghostel-test--token-position "START_TARGET"))
+         (old-mark (ghostel-test--token-position "MARK_TARGET"))
+         (old-point (ghostel-test--token-position "POINT_TARGET")))
+     (ghostel--write-input
+      term
+      "\e[1;1H\e[2Kthis mutable row is now much longer than before")
+     (ghostel--redraw term)
+     (should (/= old-start (ghostel-test--token-position "START_TARGET")))
+     (should (/= old-mark (ghostel-test--token-position "MARK_TARGET")))
+     (should (/= old-point (ghostel-test--token-position "POINT_TARGET"))))))
+
+(ert-deftest ghostel-test-position-preservation-on-changed-length-line-no-clamp ()
+  "Positions on a changed-length dirty row keep their row offsets."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 12 80 2000 (lambda (term)
+                          (ghostel--write-input
+                           term
+                           "short START_TARGET MARK_TARGET POINT_TARGET tail\r\n")
+                          (dotimes (i 7)
+                            (ghostel--write-input term
+                                                  (format "tail-%02d\r\n" i)))))
+   (let ((old-start (ghostel-test--token-position "START_TARGET"))
+         (old-mark (ghostel-test--token-position "MARK_TARGET"))
+         (old-point (ghostel-test--token-position "POINT_TARGET")))
+     (ghostel--write-input
+      term
+      "\e[1;1H\e[2Kshort START_TARGET MARK_TARGET POINT_TARGET longer suffix")
+     (ghostel--redraw term)
+     (should (= old-start (ghostel-test--token-position "START_TARGET")))
+     (should (= old-mark (ghostel-test--token-position "MARK_TARGET")))
+     (should (= old-point (ghostel-test--token-position "POINT_TARGET"))))))
+
+(ert-deftest ghostel-test-position-preservation-on-shortened-line-clamps ()
+  "Positions past a shortened dirty row clamp to that row's end."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-position-clamp*"))
+        (orig-buf (window-buffer (selected-window))))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (set-window-buffer (selected-window) buf)
+          (let* ((term (ghostel--new 12 80 2000))
+                 (ghostel--term term)
+                 (ghostel--term-rows 12)
+                 (ghostel--term-cols 80)
+                 (inhibit-read-only t)
+                 (win (selected-window)))
+            (ghostel--write-input
+             term
+             "prefix START_TARGET middle MARK_TARGET more POINT_TARGET tail\r\n")
+            (dotimes (i 7)
+              (ghostel--write-input term (format "tail-%02d\r\n" i)))
+            (ghostel--redraw term t)
+            (set-window-start win
+                              (ghostel-test--token-position "START_TARGET")
+                              t)
+            (set-marker (mark-marker)
+                        (ghostel-test--token-position "MARK_TARGET"))
+            (goto-char (ghostel-test--token-position "POINT_TARGET"))
+            (set-window-point win (point))
+            (ghostel--write-input term "\e[1;1H\e[2Kshort")
+            (ghostel--redraw term)
+            (let* ((line-end (save-excursion
+                               (goto-char (point-min))
+                               (line-end-position)))
+                   (row-boundary (1+ line-end)))
+              (should (equal "short"
+                             (buffer-substring-no-properties
+                              (point-min) line-end)))
+              (should (= row-boundary (window-start win)))
+              (should (= row-boundary (marker-position (mark-marker))))
+              (should (= row-boundary (point)))
+              (should (= row-boundary (window-point win))))))
+      (when (buffer-live-p orig-buf)
+        (set-window-buffer (selected-window) orig-buf))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-position-preservation-full-redraw ()
+  "Full redraw preserves mark, point, and window start semantically."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 8 80 2000 (lambda (term)
+                         (ghostel-test--write-position-preservation-lines term 12)))
+   (ghostel--redraw term t)))
+
+(ert-deftest ghostel-test-position-preservation-scrollback-row-added ()
+  "Adding a row with scrollback preserves semantic buffer positions."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 6 80 4000 (lambda (term)
+                         (ghostel-test--write-position-preservation-lines term 16)))
+   (ghostel--write-input term "new-row-after-anchors\r\n")
+   (ghostel--redraw term)))
+
+(ert-deftest ghostel-test-position-preservation-width-reflow ()
+  "Width-changing reflow preserves semantic buffer positions."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 8 80 4000 #'ghostel-test--write-position-preservation-reflow-content)
+   (ghostel--set-size term 8 40)
+   (setq ghostel--term-cols 40)
+   (ghostel--redraw term)))
+
+(ert-deftest ghostel-test-position-preservation-height-resize-no-scrollback ()
+  "Height resize on the primary screen preserves positions without scrollback."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 14 80 4000 (lambda (term)
+                          (ghostel-test--write-position-preservation-lines term 12)))
+   (ghostel--set-size term 16 80)
+   (setq ghostel--term-rows 16)
+   (ghostel--redraw term)))
+
+(ert-deftest ghostel-test-position-preservation-height-resize-with-scrollback ()
+  "Height resize on the primary screen preserves positions with scrollback."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 6 80 4000 (lambda (term)
+                         (ghostel-test--write-position-preservation-lines term 18)))
+   (ghostel--set-size term 9 80)
+   (setq ghostel--term-rows 9)
+   (ghostel--redraw term)))
+
+(ert-deftest ghostel-test-position-preservation-alt-screen-resize ()
+  "Alt-screen resize preserves mark, point, and window start semantically."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 6 80 4000 (lambda (term)
+                         (ghostel-test--write-position-preservation-alt-screen term 6)))
+   (ghostel--set-size term 8 80)
+   (setq ghostel--term-rows 8)
+   (ghostel--redraw term)))
+
+(ert-deftest ghostel-test-position-preservation-scrollback-eviction ()
+  "Scrollback eviction preserves positions for surviving content."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 6 80 4096 (lambda (term)
+                         (dotimes (i 140)
+                           (ghostel--write-input
+                            term
+                            (cond
+                             ((= i 105) "START_TARGET start-row\r\n")
+                             ((= i 115) "mark row MARK_TARGET here\r\n")
+                             ((= i 125) "point row POINT_TARGET here\r\n")
+                             (t (format "initial-%03d content\r\n" i)))))))
+   (let ((old-start (window-start win)))
+     (dotimes (i 60)
+       (ghostel--write-input term (format "later-%03d content\r\n" i)))
+     (ghostel--redraw term)
+     (should (< (point-min) old-start)))))
 
 
 
@@ -452,17 +724,13 @@ and typed text was invisible."
       (should-not (string= fg bg)))))
 
 (ert-deftest ghostel-test-sync-theme ()
-  "Test that ghostel-sync-theme reapplies palette and redraw post-processing."
+  "Test that ghostel-sync-theme reapplies palette and requests redraws."
   (let ((palette-calls nil)
-        (redraw-calls nil)
-        (post-process-calls 0))
+        (redraw-calls nil))
     (cl-letf (((symbol-function 'ghostel--apply-palette)
                (lambda (term) (push term palette-calls)))
-              ((symbol-function 'ghostel--redraw)
-               (lambda (term _) (push term redraw-calls)))
-              ((symbol-function 'ghostel--schedule-link-detection)
-               (lambda (&rest _args)
-                 (setq post-process-calls (1+ post-process-calls)))))
+              ((symbol-function 'ghostel--delayed-redraw)
+               (lambda (buf) (push buf redraw-calls))))
       (let ((buf (generate-new-buffer " *ghostel-test-theme*"))
             (other (generate-new-buffer " *ghostel-test-other*")))
         (unwind-protect
@@ -472,36 +740,29 @@ and typed text was invisible."
               (with-current-buffer buf
                 (ghostel-mode)
                 (setq ghostel--term 'fake-term)
-                (setq ghostel--input-mode 'semi-char)
-                (setq ghostel-enable-url-detection t))
-              (set-window-buffer (selected-window) buf)
+                (setq ghostel--input-mode 'semi-char))
               ;; `other' is not a ghostel buffer and should be ignored.
               (ghostel-sync-theme)
               (should (memq 'fake-term palette-calls))
-              (should (memq 'fake-term redraw-calls))
-              (should (= post-process-calls 1))
+              (should (memq buf redraw-calls))
 
-              ;; Verify copy mode (frozen) skips redraw
+              ;; Verify copy mode (frozen) skips redraw.
               (setq palette-calls nil
-                    redraw-calls nil
-                    post-process-calls 0)
+                    redraw-calls nil)
               (with-current-buffer buf
                 (setq ghostel--input-mode 'copy))
               (ghostel-sync-theme)
-              (should (memq 'fake-term palette-calls))    ; palette still applied in copy mode
-              (should-not (memq 'fake-term redraw-calls)) ; redraw skipped in copy mode
-              (should (= post-process-calls 0))
+              (should (memq 'fake-term palette-calls))
+              (should-not (memq buf redraw-calls))
 
-              ;; Verify emacs mode (unfrozen) still redraws
+              ;; Verify emacs mode (unfrozen) still redraws.
               (setq palette-calls nil
-                    redraw-calls nil
-                    post-process-calls 0)
+                    redraw-calls nil)
               (with-current-buffer buf
                 (setq ghostel--input-mode 'emacs))
               (ghostel-sync-theme)
               (should (memq 'fake-term palette-calls))
-              (should (memq 'fake-term redraw-calls))     ; redraw runs in emacs mode
-              (should (= post-process-calls 1)))
+              (should (memq buf redraw-calls)))
           (kill-buffer buf)
           (kill-buffer other))))))
 
@@ -566,823 +827,6 @@ and typed text was invisible."
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-input term "\e]2;My Title\e\\")
     (should (equal "My Title" (ghostel--get-title term)))))
-
-(ert-deftest ghostel-test-title-does-not-overwrite-manual-rename ()
-  "Test that title updates do not overwrite a manual buffer rename."
-  (let (buf)
-    (unwind-protect
-        (cl-letf (((symbol-function 'ghostel--new)
-                   (lambda (&rest _args) 'fake-term))
-                  ((symbol-function 'ghostel--set-size) #'ignore)
-                  ((symbol-function 'ghostel--apply-palette)
-                   (lambda (&rest _args) nil))
-                  ((symbol-function 'ghostel--start-process)
-                   (lambda () nil)))
-          (ghostel)
-          (setq buf (current-buffer))
-          (with-current-buffer buf
-            (should (equal "*ghostel*" (buffer-name)))
-            (should (equal "*ghostel*" ghostel--managed-buffer-name))
-            (ghostel--set-title "Title A")
-            (should (equal "*ghostel: Title A*" (buffer-name)))
-            (should (equal "*ghostel: Title A*" ghostel--managed-buffer-name))
-            (ghostel--set-title "Title A2")
-            (should (equal "*ghostel: Title A2*" (buffer-name)))
-            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))
-            (rename-buffer "ghostel manual title test" t)
-            (ghostel--set-title "Title B")
-            (should (equal "ghostel manual title test" (buffer-name)))
-            (should (equal "*ghostel: Title A2*" ghostel--managed-buffer-name))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-(ert-deftest ghostel-test-title-tracking-disabled ()
-  "Test that title updates are ignored when `ghostel-set-title-function' is nil."
-  (let (buf)
-    (unwind-protect
-        (cl-letf (((symbol-function 'ghostel--new)
-                   (lambda (&rest _args) 'fake-term))
-                  ((symbol-function 'ghostel--set-size) #'ignore)
-                  ((symbol-function 'ghostel--apply-palette)
-                   (lambda (&rest _args) nil))
-                  ((symbol-function 'ghostel--start-process)
-                   (lambda () nil)))
-          (let ((ghostel-set-title-function nil))
-            (ghostel)
-            (setq buf (current-buffer))
-            (with-current-buffer buf
-              (should (equal "*ghostel*" (buffer-name)))
-              (ghostel--set-title "Ignored Title")
-              (should (equal "*ghostel*" (buffer-name)))
-              (should (equal "*ghostel*" ghostel--managed-buffer-name)))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-
-
-;;; Hyperlinks and URL rendering
-
-(ert-deftest ghostel-test-hyperlinks ()
-  "Test hyperlink keymap and helpers."
-  :tags '(native)
-  (should (keymapp ghostel-link-map))                      ; ghostel-link-map is a keymap
-  (should (lookup-key ghostel-link-map [mouse-1]))         ; mouse-1 bound in link map
-  (should (lookup-key ghostel-link-map [mouse-2]))         ; mouse-2 bound in link map
-  ;; RET is intentionally NOT bound in the text-property link map: a
-  ;; binding there outranks the local map and hijacks RET away from the
-  ;; PTY when a typed substring is misdetected as a link.  The
-  ;; RET-follows-link affordance lives in the read-only and line-mode
-  ;; maps so it works in copy, Emacs, and line modes without
-  ;; intercepting RET in semi-char/char.
-  (should (null (lookup-key ghostel-link-map (kbd "RET"))))
-  (should (eq #'ghostel-open-link-at-point
-              (lookup-key ghostel-readonly-mode-map (kbd "RET"))))
-  (should (eq #'ghostel-open-link-at-point
-              (lookup-key ghostel-readonly-mode-map (kbd "<return>"))))
-  (should (eq #'ghostel-line-mode-send-or-open-link
-              (lookup-key ghostel-line-mode-map (kbd "RET"))))
-  (should (eq #'ghostel-line-mode-send-or-open-link
-              (lookup-key ghostel-line-mode-map (kbd "<return>"))))
-  (should (commandp #'ghostel-open-link-at-point))         ; open-link-at-point is interactive
-  (should (null (ghostel--open-link nil)))                 ; open-link returns nil for empty
-  (should (null (ghostel--open-link 42))))
-
-(ert-deftest ghostel-test-uri-at-pos-prefers-string-help-echo ()
-  "`ghostel--uri-at-pos' returns a string `help-echo' without calling native.
-Plain-text link detection stores URIs as strings; the native path must
-not be reached when the property is already a string."
-  (with-temp-buffer
-    (insert "click here")
-    (put-text-property 1 11 'help-echo "https://static.example.com")
-    (goto-char 5)
-    (let (native-called)
-      (cl-letf (((symbol-function 'ghostel--native-uri-at-pos)
-                 (lambda (_) (setq native-called t) "should-not-reach")))
-        (should (equal "https://static.example.com"
-                       (ghostel--uri-at-pos (point))))
-        (should-not native-called)))))
-
-(ert-deftest ghostel-test-uri-at-pos-calls-native-for-function-help-echo ()
-  "`ghostel--uri-at-pos' delegates to native when `help-echo' is a function.
-OSC8 links set `help-echo' to the symbol `ghostel--native-link-help-echo';
-`ghostel--uri-at-pos' must call `ghostel--native-uri-at-pos' in that case."
-  (with-temp-buffer
-    (insert "click here")
-    (put-text-property 1 11 'help-echo #'ghostel--native-link-help-echo)
-    (goto-char 5)
-    (cl-letf (((symbol-function 'ghostel--native-uri-at-pos)
-               (lambda (_pos) "native-uri")))
-      (should (equal "native-uri" (ghostel--uri-at-pos (point)))))))
-
-(ert-deftest ghostel-test-native-link-help-echo-calls-uri-at-pos ()
-  "`ghostel--native-link-help-echo' delegates to `ghostel--native-uri-at-pos'.
-The help-echo handler stored on OSC8 link text-properties must call the
-native URI lookup when Emacs invokes it for tooltip display or clicking."
-  (let ((buf (generate-new-buffer " *ghostel-test-echo-handler*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (progn
-          (set-window-buffer (selected-window) buf)
-          (with-current-buffer buf
-            (insert "test content")
-            (cl-letf (((symbol-function 'ghostel--native-uri-at-pos)
-                       (lambda (pos) (format "uri-at-%d" pos))))
-              (should (equal "uri-at-1"
-                             (ghostel--native-link-help-echo
-                              (selected-window) nil 1))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-url-detection ()
-  "Test automatic URL detection in plain text."
-  ;; Test buffers add a trailing newline so point lands on an empty line
-  ;; below the test content; the cursor-row skip in `ghostel--detect-urls'
-  ;; then leaves the test content untouched.
-  ;; Basic URL detection
-  (with-temp-buffer
-    (insert "Visit https://example.com for info\n")
-    (let ((ghostel-enable-url-detection t))
-      (ghostel--detect-urls))
-    (should (equal "https://example.com"                   ; url help-echo
-                   (get-text-property 7 'help-echo)))
-    (should (get-text-property 7 'mouse-face))             ; url mouse-face
-    (should (get-text-property 7 'keymap)))                ; url keymap
-  ;; Disabled detection
-  (with-temp-buffer
-    (insert "Visit https://example.com for info\n")
-    (let ((ghostel-enable-url-detection nil))
-      (ghostel--detect-urls))
-    (should (null (get-text-property 7 'help-echo))))      ; url detection disabled
-  ;; Skips existing OSC 8 links (help-echo is the native handler function symbol)
-  (with-temp-buffer
-    (insert "Visit https://other.com for info\n")
-    (put-text-property 7 26 'help-echo #'ghostel--native-link-help-echo)
-    (let ((ghostel-enable-url-detection t))
-      (ghostel--detect-urls))
-    (should (eq #'ghostel--native-link-help-echo           ; osc8 handler not overwritten
-                (get-text-property 7 'help-echo))))
-  ;; URL not ending in punctuation
-  (with-temp-buffer
-    (insert "See https://example.com/path.\n")
-    (let ((ghostel-enable-url-detection t))
-      (ghostel--detect-urls))
-    (should (equal "https://example.com/path"              ; url strips trailing dot
-                   (get-text-property 5 'help-echo))))
-  ;; File:line detection with absolute path
-  (let ((test-file (locate-library "ghostel")))
-    (with-temp-buffer
-      (insert (format "Error at %s:42 bad\n" test-file))
-      (let ((ghostel-enable-url-detection t))
-        (ghostel--detect-urls))
-      (let ((he (get-text-property 10 'help-echo)))
-        (should (and he (string-prefix-p "fileref:" he)))  ; file:line help-echo set
-        (should (and he (string-suffix-p ":42" he)))))     ; file:line contains line number
-    ;; File:line for non-existent file produces no link
-    (with-temp-buffer
-      (insert "Error at /no/such/file.el:10 bad\n")
-      (let ((ghostel-enable-url-detection t))
-        (ghostel--detect-urls))
-      (should (null (get-text-property 10 'help-echo))))   ; nonexistent file: no help-echo
-    ;; File detection disabled
-    (with-temp-buffer
-      (insert (format "Error at %s:42 bad\n" test-file))
-      (let ((ghostel-enable-url-detection t)
-            (ghostel-enable-file-detection nil))
-        (ghostel--detect-urls))
-      (should (null (get-text-property 10 'help-echo))))   ; file detection disabled
-    ;; ghostel--open-link dispatches fileref:
-    (let ((opened nil))
-      (cl-letf (((symbol-function 'find-file-other-window)
-                 (lambda (f) (setq opened f))))
-        (ghostel--open-link (format "fileref:%s:10" test-file)))
-      (should (equal test-file opened)))                   ; fileref opens correct file
-    ;; Helper: find the first fileref help-echo anywhere in the buffer.
-    (cl-flet ((find-fileref ()
-                (save-excursion
-                  (let ((pos (point-min)) found)
-                    (while (and (not found) pos (< pos (point-max)))
-                      (let ((he (get-text-property pos 'help-echo)))
-                        (when (and he (string-prefix-p "fileref:" he))
-                          (setq found he)))
-                      (setq pos (next-single-property-change
-                                 pos 'help-echo nil (point-max))))
-                    found))))
-      ;; Bare relative path (Rust/Go/TS compiler output)
-      (let ((dir (file-name-directory test-file))
-            (rel "ghostel.el"))
-        ;; Nonexistent bare relative path: no link
-        (with-temp-buffer
-          (setq default-directory dir)
-          (insert (format "   --> wrapped/%s:43\n" rel))
-          (let ((ghostel-enable-url-detection t))
-            (ghostel--detect-urls))
-          (should (null (find-fileref))))           ; nonexistent bare path skipped
-        ;; Existing bare relative path: linkified with line AND column preserved
-        (with-temp-buffer
-          (setq default-directory (file-name-directory (directory-file-name dir)))
-          (insert (format "  --> %s/%s:43:4\n"
-                          (file-name-nondirectory (directory-file-name dir))
-                          rel))
-          (let ((ghostel-enable-url-detection t))
-            (ghostel--detect-urls))
-          (let ((he (find-fileref)))
-            (should (and he (string-prefix-p "fileref:" he)))
-            (should (and he (string-suffix-p ":43:4" he)))))) ; col preserved
-      ;; Path embedded in punctuation (Python traceback style) must match
-      (with-temp-buffer
-        (insert (format "  at foo (%s:10:5)\n" test-file))
-        (let ((ghostel-enable-url-detection t))
-          (ghostel--detect-urls))
-        (let ((he (find-fileref)))
-          (should (and he (string-prefix-p "fileref:" he)))   ; paren-wrapped path matched
-          (should (and he (string-suffix-p ":10:5" he)))
-          ;; Trailing `)' must NOT be absorbed into the path
-          (should (and he (not (string-suffix-p ")" he))))))
-      ;; Wrapper chars (backtick, paren, bracket, brace, quotes) around a
-      ;; path-only reference must not bleed into the match.
-      (dolist (wrap '(("`" . "`") ("(" . ")") ("[" . "]") ("{" . "}")
-                      ("'" . "'") ("\"" . "\"")))
-        (with-temp-buffer
-          (insert (format "see %s%s%s here\n" (car wrap) test-file (cdr wrap)))
-          (let ((ghostel-enable-url-detection t))
-            (ghostel--detect-urls))
-          (let ((he (find-fileref)))
-            (should (and he (string-prefix-p "fileref:" he)))
-            (should (and he (string-suffix-p test-file he)))    ; no wrapper tail
-            (should (and he (not (string-suffix-p (cdr wrap) he)))))))
-      ;; Tilde-prefixed paths are detected and linkified.
-      (let* ((tilde-path "~/.emacs.d/init.el:42")
-             (tilde-file (expand-file-name ".emacs.d/init.el" (expand-file-name "~"))))
-        ;; Existing tilde path is linkified.
-        (with-temp-buffer
-          (insert (format "Error at %s bad\n" tilde-path))
-          (cl-letf (((symbol-function 'file-exists-p)
-                     (lambda (f) (equal f tilde-file))))
-            (let ((ghostel-enable-url-detection t))
-              (ghostel--detect-urls))
-            (let ((he (find-fileref)))
-              (should (and he (string-prefix-p "fileref:" he)))
-              (should (and he (string-suffix-p ":42" he)))))))
-      ;; Bare filename without a slash must NOT match (avoids FS stat storms)
-      (with-temp-buffer
-        (setq default-directory (file-name-directory test-file))
-        (insert "main.go:12:5: undefined: foo\n")
-        (let ((ghostel-enable-url-detection t))
-          (ghostel--detect-urls))
-        (should (null (find-fileref))))            ; bare filename skipped
-      ;; TRAMP `default-directory' disables file detection entirely — otherwise
-      ;; every candidate would trigger a remote stat per redraw.
-      (with-temp-buffer
-        (setq default-directory "/ssh:example.com:/tmp/")
-        (insert (format "see %s here\n" test-file))
-        (let ((ghostel-enable-url-detection t))
-          (ghostel--detect-urls))
-        (should (null (find-fileref))))            ; TRAMP → detection skipped
-      ;; Custom path regex can opt into broader matching (bare filenames)
-      (with-temp-buffer
-        (setq default-directory (file-name-directory test-file))
-        (insert "ghostel.el:42 here\n")
-        (let ((ghostel-enable-url-detection t)
-              (ghostel-file-detection-path-regex
-               "[[:alnum:]_.][^ \t\n\r:\"<>]*"))
-          (ghostel--detect-urls))
-        (should (find-fileref)))                   ; custom path regex opts in
-      ;; Path-only reference (no `:line' suffix): /absolute and ./relative
-      ;; both linkify when the file exists.
-      (with-temp-buffer
-        (insert (format "see %s here\n" test-file))
-        (let ((ghostel-enable-url-detection t))
-          (ghostel--detect-urls))
-        (let ((he (find-fileref)))
-          (should (and he (string-prefix-p "fileref:" he)))
-          (should (and he (not (string-match-p ":[0-9]+\\'" he)))))) ; no line
-      ;; Path-only reference for a nonexistent file is not linkified.
-      (with-temp-buffer
-        (insert "see /no/such/path/exists here\n")
-        (let ((ghostel-enable-url-detection t))
-          (ghostel--detect-urls))
-        (should (null (find-fileref))))
-      ;; ghostel--open-link with :line:col positions the cursor
-      (let ((opened nil) (col-arg nil))
-        (cl-letf (((symbol-function 'find-file-other-window)
-                   (lambda (f) (setq opened f)))
-                  ((symbol-function 'move-to-column)
-                   (lambda (c &optional _force) (setq col-arg c))))
-          (ghostel--open-link (format "fileref:%s:10:7" test-file)))
-        (should (equal test-file opened))
-        (should (equal 6 col-arg)))                  ; :col 7 → column 6 (0-indexed)
-      ;; ghostel--open-link with path-only fileref opens the file without
-      ;; moving point past `point-min'.
-      (let ((opened nil) (moved nil))
-        (cl-letf (((symbol-function 'find-file-other-window)
-                   (lambda (f) (setq opened f)))
-                  ((symbol-function 'forward-line)
-                   (lambda (&rest _) (setq moved t))))
-          (ghostel--open-link (format "fileref:%s" test-file)))
-        (should (equal test-file opened))
-        (should (null moved))))))
-
-(ert-deftest ghostel-test-detect-urls-skips-active-input ()
-  "Link detection rules around prompts and user input (issue #199).
-- `ghostel-prompt' (shell-generated decoration): never linkified.
-- The cursor's line (active typing): not linkified — in tty Emacs RET
-  on a linkified cell hijacks the keystroke, and the cursor-row skip
-  works for both OSC 133 shells and markerless REPLs (Gemini CLI etc).
-- Other lines (historical typed commands, output): linkified, so users
-  can follow paths in past commands and program output."
-  :tags '(native)
-  (let ((test-file (locate-library "ghostel")))
-    ;; History line → both file ref and URL linkified.  Active line
-    ;; (cursor's line) → both skipped, regardless of whether the cells
-    ;; carry `ghostel-input' or not.
-    (with-temp-buffer
-      (let ((default-directory (file-name-directory test-file)))
-        (insert (format "$ ls %s https://hist.example\n" test-file)) ; line 1: history
-        (insert (format "$ cat %s https://live.example" test-file))  ; line 2: active
-        (put-text-property (point-min) (point-max) 'ghostel-input t)
-        (goto-char (point-max))                                       ; cursor on line 2
-        (let ((ghostel-enable-url-detection t)
-              (ghostel-enable-file-detection t))
-          (ghostel--detect-urls))
-        (goto-char (point-min))
-        (search-forward test-file nil t)
-        (let ((he (get-text-property (match-beginning 0) 'help-echo)))
-          (should (and he (string-prefix-p "fileref:" he)))) ; history file → linked
-        (search-forward "https://hist.example")
-        (should (equal "https://hist.example"
-                       (get-text-property (match-beginning 0) 'help-echo))) ; history URL → linked
-        (search-forward test-file nil t)
-        (should (null (get-text-property (match-beginning 0) 'help-echo))) ; active file → skipped
-        (search-forward "https://live.example")
-        (should (null (get-text-property (match-beginning 0) 'help-echo))))) ; active URL → skipped
-    ;; Cursor-row skip is unconditional: a URL on the cursor's line is
-    ;; not linkified even when no `ghostel-input' marker covers it.  This
-    ;; is what protects RET in REPLs like Gemini CLI or raw shells that
-    ;; emit no OSC 133 sequences.  No trailing newline — cursor stays on
-    ;; the typed line.
-    (with-temp-buffer
-      (insert "out https://before.example mid https://typed.example tail")
-      (goto-char (point-max))                                           ; cursor on line 1
-      (let ((ghostel-enable-url-detection t)
-            (ghostel-enable-file-detection nil))
-        (ghostel--detect-urls))
-      (goto-char (point-min))
-      (search-forward "https://before.example")
-      (should (null (get-text-property (match-beginning 0) 'help-echo))) ; cursor row → skipped
-      (search-forward "https://typed.example")
-      (should (null (get-text-property (match-beginning 0) 'help-echo)))) ; cursor row → skipped
-    ;; No OSC 133 markers at all (e.g. Gemini CLI prompt or a raw shell):
-    ;; output on previous lines is still linkified, only the cursor row
-    ;; is protected.
-    (with-temp-buffer
-      (insert "history https://past.example\n") ; line 1: previous output
-      (insert "> https://typed.example tail")   ; line 2: REPL prompt with cursor
-      (goto-char (point-max))                   ; cursor on line 2
-      (let ((ghostel-enable-url-detection t)
-            (ghostel-enable-file-detection nil))
-        (ghostel--detect-urls))
-      (goto-char (point-min))
-      (search-forward "https://past.example")
-      (should (equal "https://past.example"
-                     (get-text-property (match-beginning 0) 'help-echo))) ; history → linked
-      (search-forward "https://typed.example")
-      (should (null (get-text-property (match-beginning 0) 'help-echo)))) ; cursor row → skipped
-    ;; `ghostel-prompt' (prompt prefix) is never linkified — neither on
-    ;; the active line nor in scrollback.  Path appears in the prompt's
-    ;; cwd display; output below is plain text and stays linkifiable.
-    (with-temp-buffer
-      (let ((default-directory (file-name-directory test-file)))
-        (insert (format "%s λ ls\n" test-file))           ; line 1: prompt prefix
-        (insert (format "%s\n" test-file))                ; line 2: output
-        (insert (format "%s λ " test-file))               ; line 3: live prompt
-        ;; Prompt rows carry `ghostel-prompt' on the prefix; output does not.
-        (save-excursion
-          (goto-char (point-min))
-          (let ((eol (line-end-position)))
-            (put-text-property (point-min) eol 'ghostel-prompt t))
-          (forward-line 2)
-          (put-text-property (point) (point-max) 'ghostel-prompt t))
-        (goto-char (point-max))
-        (let ((ghostel-enable-url-detection nil)
-              (ghostel-enable-file-detection t))
-          (ghostel--detect-urls))
-        (goto-char (point-min))
-        (search-forward test-file nil t)                  ; line 1: prompt prefix
-        (should (null (get-text-property (match-beginning 0) 'help-echo)))
-        (search-forward test-file nil t)                  ; line 2: output
-        (should (get-text-property (match-beginning 0) 'help-echo))
-        (search-forward test-file nil t)                  ; line 3: live prompt prefix
-        (should (null (get-text-property (match-beginning 0) 'help-echo)))))))
-
-(ert-deftest ghostel-test-delayed-redraw-defers-plain-link-detection ()
-  "Redraw-triggered plain-text link detection should run after redraw."
-  (let ((buf (generate-new-buffer " *ghostel-test-delayed-link*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let ((ghostel--term t)
-                (ghostel-enable-url-detection t)
-                (ghostel-enable-file-detection nil)
-                (scheduled-count 0)
-                timer-delay timer-repeat timer-fn timer-args)
-            ;; FIXME: `ghostel--redraw' is stubbed because `ghostel--term'
-            ;; here is the placeholder symbol `t', not a real native handle,
-            ;; so the real renderer would crash.  The test still observes the
-            ;; intended side effect (link-detection timer scheduling) via the
-            ;; `run-with-timer' mock below.  A cleaner rewrite would require
-            ;; spinning up a real terminal fixture.
-            (cl-letf (((symbol-function 'run-with-timer)
-                       (lambda (delay repeat fn &rest args)
-                         (setq scheduled-count (1+ scheduled-count)
-                               timer-delay delay
-                               timer-repeat repeat
-                               timer-fn fn
-                               timer-args args)
-                         'ghostel-test-link-timer))
-                      ((symbol-function 'ghostel--flush-pending-output) #'ignore)
-                      ((symbol-function 'ghostel--mode-enabled)
-                       (lambda (&rest _) nil))
-                      ((symbol-function 'ghostel--correct-mangled-scroll-positions)
-                       #'ignore)
-                      ((symbol-function 'ghostel--redraw) #'ignore)
-                      ((symbol-function 'ghostel--viewport-start)
-                       (lambda () nil))
-                      ((symbol-function 'get-buffer-window-list)
-                       (lambda (&rest _) nil)))
-              (let ((inhibit-read-only t))
-                (insert "see https://example.com here\n"))
-              (ghostel--delayed-redraw buf)
-              (goto-char (point-min))
-              (let* ((url "https://example.com")
-                     (url-end (search-forward url nil t))
-                     (url-beg (- url-end (length url))))
-                (should url-end)
-                (should (null (get-text-property url-beg 'help-echo)))
-                (should (= scheduled-count 1))
-                (should (numberp timer-delay))
-                (should (> timer-delay 0))
-                (should (null timer-repeat))
-                (should timer-fn)
-                ;; Move point off the URL line so the cursor-row skip in
-                ;; `ghostel--detect-urls' doesn't mask the URL when the
-                ;; queued detection runs.
-                (goto-char (point-max))
-                (apply timer-fn timer-args)
-                (should (equal url
-                               (get-text-property url-beg 'help-echo)))))))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-delayed-redraw-coalesces-plain-link-detection ()
-  "Multiple redraws before the timer fires should share one detection pass."
-  (let ((buf (generate-new-buffer " *ghostel-test-coalesced-link*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let ((ghostel--term t)
-                (ghostel-enable-url-detection t)
-                (ghostel-enable-file-detection nil)
-                (scheduled-count 0)
-                timer-repeat timer-fn timer-args)
-            (cl-letf (((symbol-function 'run-with-timer)
-                       (lambda (_delay repeat fn &rest args)
-                         (setq scheduled-count (1+ scheduled-count)
-                               timer-repeat repeat
-                               timer-fn fn
-                               timer-args args)
-                         'ghostel-test-link-timer))
-                      ((symbol-function 'ghostel--flush-pending-output) #'ignore)
-                      ((symbol-function 'ghostel--mode-enabled)
-                       (lambda (&rest _) nil))
-                      ((symbol-function 'ghostel--correct-mangled-scroll-positions)
-                       #'ignore)
-                      ((symbol-function 'ghostel--redraw) #'ignore)
-                      ((symbol-function 'ghostel--viewport-start)
-                       (lambda () nil))
-                      ((symbol-function 'get-buffer-window-list)
-                       (lambda (&rest _) nil)))
-              (let ((inhibit-read-only t))
-                (insert "first https://first.example\n"))
-              (ghostel--delayed-redraw buf)
-              (let ((inhibit-read-only t))
-                (goto-char (point-max))
-                (insert "second https://second.example\n"))
-              (ghostel--delayed-redraw buf)
-              (goto-char (point-min))
-              (let* ((first-url "https://first.example")
-                     (first-end (search-forward first-url nil t))
-                     (first-beg (- first-end (length first-url)))
-                     (second-url "https://second.example")
-                     (second-end (search-forward second-url nil t))
-                     (second-beg (- second-end (length second-url))))
-                (should first-end)
-                (should second-end)
-                (should (null (get-text-property first-beg 'help-echo)))
-                (should (null (get-text-property second-beg 'help-echo)))
-                (should (= scheduled-count 1))
-                (should (null timer-repeat))
-                (should timer-fn)
-                ;; Move point off the URL lines so the cursor-row skip in
-                ;; `ghostel--detect-urls' doesn't mask either URL when the
-                ;; queued detection runs.
-                (goto-char (point-max))
-                (apply timer-fn timer-args)
-                (should (equal first-url
-                               (get-text-property first-beg 'help-echo)))
-                (should (equal second-url
-                               (get-text-property second-beg 'help-echo)))))))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-detect-urls-allows-read-only-buffers ()
-  "Plain-text link detection should still work in read-only buffers."
-  (let* ((root (ghostel--resource-root))
-         (test-file (file-relative-name
-                     (expand-file-name "lisp/ghostel.el" root)
-                     root)))
-    (with-temp-buffer
-      (let ((default-directory root))
-        (insert (format "see %s:1 for details\n" test-file))
-        (setq buffer-read-only t)
-        (let ((ghostel-enable-url-detection nil)
-              (ghostel-enable-file-detection t))
-          (should (eq 'ok
-                      (ignore-errors
-                        (ghostel--detect-urls)
-                        'ok)))
-          (should (string-prefix-p
-                   "fileref:"
-                   (get-text-property 5 'help-echo))))))))
-
-(ert-deftest ghostel-test-zero-delay-runs-plain-link-detection-synchronously ()
-  "With delay set to 0, plain-link detection runs without scheduling a timer."
-  (let ((buf (generate-new-buffer " *ghostel-test-zero-delay-link*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (let ((ghostel-enable-url-detection t)
-                (ghostel-enable-file-detection nil)
-                (ghostel-plain-link-detection-delay 0)
-                (timer-scheduled nil)
-                (inhibit-read-only t))
-            (cl-letf (((symbol-function 'run-with-timer)
-                       (lambda (&rest _)
-                         (setq timer-scheduled t)
-                         'ghostel-test-zero-delay-timer)))
-              (insert "see https://example.com here\n")
-              (ghostel--queue-plain-link-detection (point-min) (point-max))
-              (should-not timer-scheduled)
-              (should-not ghostel--plain-link-detection-timer)
-              (goto-char (point-min))
-              (let* ((url "https://example.com")
-                     (url-end (search-forward url nil t))
-                     (url-beg (- url-end (length url))))
-                (should url-end)
-                (should (equal url
-                               (get-text-property url-beg 'help-echo)))))))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-sentinel-cancels-plain-link-detection-timer ()
-  "Process exit should cancel queued plain-text link detection timers."
-  (let ((buf (generate-new-buffer " *ghostel-test-sentinel-links*")))
-    (unwind-protect
-        (let ((proc (make-pipe-process :name "ghostel-test-sentinel-links"
-                                       :buffer buf
-                                       :noquery t)))
-          (with-current-buffer buf
-            (setq ghostel-kill-buffer-on-exit nil
-                  ghostel--plain-link-detection-timer
-                  (run-with-timer 60 nil #'ignore))
-            (ghostel--sentinel proc "finished\n")
-            (should-not ghostel--plain-link-detection-timer))
-          (when (process-live-p proc)
-            (delete-process proc)))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (when ghostel--plain-link-detection-timer
-            (cancel-timer ghostel--plain-link-detection-timer)))
-        (kill-buffer buf)))))
-
-(ert-deftest ghostel-test-hyperlink-navigation ()
-  "Test `ghostel-next-hyperlink' / `ghostel-previous-hyperlink' search."
-  :tags '(native)
-  ;; Buffer layout (1-indexed positions):
-  ;;   "AAA [LINK1] BBB [LINK2] CCC"
-  ;;    123 4      5 6 7      8 9...
-  (cl-flet ((setup ()
-              (let ((buf (generate-new-buffer " *hyperlink-nav-test*")))
-                (with-current-buffer buf
-                  (insert "AAA ")                    ; 1..4
-                  (let ((l1 (point)))                ; 5
-                    (insert "LINK1")                 ; 5..9
-                    (put-text-property l1 (point) 'help-echo "https://one"))
-                  (insert " BBB ")                   ; 10..14
-                  (let ((l2 (point)))                ; 15
-                    (insert "LINK2")                 ; 15..19
-                    (put-text-property l2 (point) 'help-echo "https://two"))
-                  (insert " CCC"))                   ; 20..23
-                buf)))
-    ;; Forward from before any link lands on first link.
-    (let ((buf (setup)))
-      (unwind-protect
-          (with-current-buffer buf
-            (should (equal 5 (ghostel--find-next-link (point-min))))
-            (should (equal 5 (ghostel--find-next-link 2)))
-            ;; From inside link1, skip to link2.
-            (should (equal 15 (ghostel--find-next-link 5)))
-            (should (equal 15 (ghostel--find-next-link 7)))
-            ;; From inside link2, nothing after.
-            (should (null (ghostel--find-next-link 15)))
-            (should (null (ghostel--find-next-link 17)))
-            (should (null (ghostel--find-next-link (point-max)))))
-        (kill-buffer buf)))
-    ;; Backward.
-    (let ((buf (setup)))
-      (unwind-protect
-          (with-current-buffer buf
-            (should (equal 15 (ghostel--find-previous-link (point-max))))
-            (should (equal 15 (ghostel--find-previous-link 22)))
-            ;; From inside link2, find link1.
-            (should (equal 5 (ghostel--find-previous-link 15)))
-            (should (equal 5 (ghostel--find-previous-link 17)))
-            ;; From inside link1, nothing before.
-            (should (null (ghostel--find-previous-link 5)))
-            (should (null (ghostel--find-previous-link 7)))
-            (should (null (ghostel--find-previous-link (point-min)))))
-        (kill-buffer buf)))
-    ;; Empty buffer: no links at all.
-    (with-temp-buffer
-      (should (null (ghostel--find-next-link (point-min))))
-      (should (null (ghostel--find-previous-link (point-max)))))
-    ;; Buffer with no links but some text.
-    (with-temp-buffer
-      (insert "just some text with no links")
-      (should (null (ghostel--find-next-link (point-min))))
-      (should (null (ghostel--find-previous-link (point-max)))))
-    ;; Commands are interactive.
-    (should (commandp #'ghostel-next-hyperlink))
-    (should (commandp #'ghostel-previous-hyperlink))))
-
-(ert-deftest ghostel-test-hyperlink-navigation-skips-shared-id ()
-  "Multiple help-echo runs sharing `ghostel-link-id' navigate as one logical link.
-Reproduces the wrapped-OSC8-in-a-box case from issue #125 at the elisp
-helper layer (no native module needed).  Layout puts two same-id runs
-back-to-back (no different-id link between them) so the dedup loop has
-to step past more than one run before landing on a different id."
-  ;; Buffer (1-indexed):
-  ;;   "AAA A1 BBB A2 CCC other DDD"
-  ;;        ^5..6  ^12..13  ^19..23
-  ;; A1 and A2 carry id "shared"; `other' carries id "other".
-  (let ((buf (generate-new-buffer " *hyperlink-shared-id*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (insert "AAA ")                ; 1..4
-          (let ((p (point)))             ; 5
-            (insert "A1")                ; 5..6
-            (put-text-property p (point) 'help-echo "https://shared")
-            (put-text-property p (point) 'ghostel-link-id "shared"))
-          (insert " BBB ")               ; 7..11
-          (let ((p (point)))             ; 12
-            (insert "A2")                ; 12..13
-            (put-text-property p (point) 'help-echo "https://shared")
-            (put-text-property p (point) 'ghostel-link-id "shared"))
-          (insert " CCC ")               ; 14..18
-          (let ((p (point)))             ; 19
-            (insert "other")             ; 19..23
-            (put-text-property p (point) 'help-echo "https://other")
-            (put-text-property p (point) 'ghostel-link-id "other"))
-          (insert " DDD")                ; 24..27
-
-          ;; Forward from inside A1: dedup loop must step PAST A2 (shared id)
-          ;; before landing on `other'.  This is the path that proves the
-          ;; loop actually iterates more than once.
-          (should (equal 19 (ghostel--find-next-link 5)))
-          ;; Forward from inside A2 also dedupes; lands on `other'.
-          (should (equal 19 (ghostel--find-next-link 12)))
-          ;; Outside any link, skip-id is nil → no dedup, lands on A1.
-          (should (equal 5 (ghostel--find-next-link (point-min))))
-          ;; Between A1 and A2 (no link), skip-id is nil → lands on A2.
-          (should (equal 12 (ghostel--find-next-link 8)))
-          ;; Forward from inside `other' has nothing left.
-          (should (null (ghostel--find-next-link 19)))
-
-          ;; Backward from inside A2: must step PAST A1 (shared id) → nil.
-          (should (null (ghostel--find-previous-link 12)))
-          ;; Backward from inside `other': lands on A1 (the URL's first chunk,
-          ;; not A2 the last chunk) by walking back over same-id runs.
-          (should (equal 5 (ghostel--find-previous-link 19)))
-          ;; Outside any link, skip-id is nil → lands on the last link.
-          (should (equal 19 (ghostel--find-previous-link (point-max)))))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-hyperlink-navigation-previous-lands-at-url-start ()
-  "`ghostel--find-previous-link' lands at the URL's first chunk, not its last.
-For a wrapped OSC 8 URL emitted as two chunks sharing `ghostel-link-id',
-backward navigation from below the URL should skip the second chunk and
-land on the start of the first chunk."
-  ;; Buffer:
-  ;;   "AAA U1 BBB U2 CCC DDD"
-  ;;        ^5..6 ^12..13
-  ;; U1 and U2 carry id "wrapped"; nothing else carries a link-id.
-  (let ((buf (generate-new-buffer " *hyperlink-url-start*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (insert "AAA ")                ; 1..4
-          (let ((p (point)))             ; 5
-            (insert "U1")
-            (put-text-property p (point) 'help-echo "https://wrapped")
-            (put-text-property p (point) 'ghostel-link-id "wrapped"))
-          (insert " BBB ")
-          (let ((p (point)))             ; 12
-            (insert "U2")
-            (put-text-property p (point) 'help-echo "https://wrapped")
-            (put-text-property p (point) 'ghostel-link-id "wrapped"))
-          (insert " CCC DDD")
-          ;; From past the URL, backward lands on U1 (not U2).
-          (should (equal 5 (ghostel--find-previous-link (point-max))))
-          ;; Forward still lands on U1 naturally (URL start).
-          (should (equal 5 (ghostel--find-next-link (point-min)))))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-hyperlink-navigation-shared-id-no-link-id-property ()
-  "Runs without `ghostel-link-id' (auto-detected URL, fileref) are never deduped.
-The dedup must only kick in when both ends carry a non-nil link id."
-  (with-temp-buffer
-    (insert "AAA URL1 BBB URL2 CCC")
-    ;; Plain-text URL detection sets only help-echo, no link-id.
-    (put-text-property 5 9 'help-echo "https://one")
-    (put-text-property 14 18 'help-echo "https://two")
-    ;; From inside URL1, URL2 is still found (no skip).
-    (should (equal 14 (ghostel--find-next-link 5)))
-    (should (equal 5 (ghostel--find-previous-link 14)))))
-
-(ert-deftest ghostel-test-hyperlink-navigation-wrap ()
-  "Test that `ghostel--goto-hyperlink' wraps and errors cleanly."
-  :tags '(native)
-  ;; Wrap: from past the last link, next jumps back to first.
-  (with-temp-buffer
-    (insert "AAA LINK1 BBB LINK2 CCC")
-    (put-text-property 5 10 'help-echo "https://one")
-    (put-text-property 15 20 'help-echo "https://two")
-    (goto-char (point-max))
-    ;; No link after point — wraps to link1.
-    (let ((inhibit-message t))
-      (ghostel--goto-hyperlink 'next))
-    (should (equal 5 (point)))
-    ;; At point-min, going backward wraps to the last link.
-    (goto-char (point-min))
-    (let ((inhibit-message t))
-      (ghostel--goto-hyperlink 'previous))
-    (should (equal 15 (point))))
-  ;; No links at all → user-error.
-  (with-temp-buffer
-    (insert "no links here at all")
-    (should-error (ghostel--goto-hyperlink 'next) :type 'user-error)
-    (should-error (ghostel--goto-hyperlink 'previous) :type 'user-error)))
-
-(ert-deftest ghostel-test-scrollback-preserves-url-properties ()
-  "Verify delayed plain-link properties survive scrollback promotion.
-When libghostty pushes a row into scrollback, the redraw promotes the
-existing buffer text instead of fetching a fresh copy from libghostty,
-so any text properties the row earned while it was the viewport stay
-attached."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-sb-url*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (set-window-buffer (selected-window) (current-buffer))
-          (ghostel-mode)
-          (let* ((term (ghostel--new 5 80 1000))
-                 (ghostel--term term)
-                 (ghostel--term-rows 5)
-                 (ghostel-plain-link-detection-delay 0)
-                 (inhibit-read-only t)
-                 (ghostel-enable-url-detection t)
-                 (ghostel-enable-file-detection nil))
-            ;; Write a row with a URL while it's in the viewport.
-            (ghostel--write-input term "see https://example.com here\r\n")
-            ;; Run the supported redraw path; zero delay keeps the deferred
-            ;; post-processing deterministic while still exercising it.
-            (ghostel--delayed-redraw buf)
-            ;; Sanity: delayed plain-link detection applied a help-echo while
-            ;; the row is visible.
-            (goto-char (point-min))
-            (let ((url-pos (search-forward "https://example.com" nil t)))
-              (should url-pos)
-              (should (equal "https://example.com"
-                             (get-text-property (- url-pos 19) 'help-echo))))
-            ;; Now scroll the URL row off the active screen.
-            (dotimes (_ 6) (ghostel--write-input term "filler\r\n"))
-            (ghostel--delayed-redraw buf)
-            ;; The URL row now lives in the scrollback region of the buffer.
-            (goto-char (point-min))
-            (let ((url-pos (search-forward "https://example.com" nil t)))
-              (should url-pos)
-              ;; The clickable text properties survived the scroll because
-              ;; promotion preserved the buffer text instead of re-fetching
-              ;; from libghostty.
-              (should (equal "https://example.com"
-                             (get-text-property (- url-pos 19) 'help-echo))))))
-      (kill-buffer buf))))
-
 
 
 ;;; Scrollback materialization and eviction
@@ -1542,13 +986,12 @@ scrolling libghostty's viewport."
         (with-current-buffer buf
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 5 80 100))
-          ;; Simulate pending PTY output.  `ghostel-clear' must flush this
-          ;; before writing CSI H / CSI 2J, otherwise the clear could race the
-          ;; output and either lose history or recreate stale viewport text.
-          (setq ghostel--pending-output
-                (list (mapconcat (lambda (i) (format "clear-test-%d\r\n" i))
-                                 (number-sequence 0 14) "")))
-          (should ghostel--pending-output)
+          ;; Seed enough content to create scrollback, then clear only the
+          ;; visible viewport.
+          (ghostel--write-input
+           ghostel--term
+           (mapconcat (lambda (i) (format "clear-test-%d\r\n" i))
+                      (number-sequence 0 14) ""))
           (ghostel-clear)
           ;; Simulate what delayed-redraw does after `ghostel-clear' invalidates.
           (let ((inhibit-read-only t))
@@ -1691,45 +1134,6 @@ scrollback; rows that were already in scrollback must not survive."
               (should (string-match-p "new-00" content))
               (should (string-match-p "new-05" content)))))
       (kill-buffer buf))))
-
-(ert-deftest ghostel-test-clear-scrollback-resets-scroll-state ()
-  "`ghostel-clear-scrollback' drops recorded scroll positions.
-After the buffer is wiped, the old content no longer exists, so the
-next redraw must anchor fresh to the new viewport rather than trying
-to restore to a missing line."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-clear-reset*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            ;; Pretend scroll state was recorded (e.g. user was reading
-            ;; history when scrollback gets cleared).
-            (setq ghostel--scroll-positions
-                  (list (cons (selected-window)
-                              (list '("scroll-10") '("scroll-11") 0))))
-            (setq ghostel--last-anchor-position 42)
-            (setq ghostel--process nil)
-            (ghostel-clear-scrollback)
-            ;; `ghostel--invalidate' schedules a redraw timer that
-            ;; would otherwise fire after the buffer is killed.
-            (when (timerp ghostel--redraw-timer)
-              (cancel-timer ghostel--redraw-timer)
-              (setq ghostel--redraw-timer nil))
-            (should-not ghostel--scroll-positions)
-            (should-not ghostel--last-anchor-position)))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-
 
 ;;; Incremental and dirty-row rendering
 
@@ -2038,40 +1442,31 @@ Now the erasure is deferred into redraw() under `inhibit-redisplay'."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-resize-sync ()
-  "Test that resize between BSU/ESU cycles gives clean content."
+  "Resize between BSU/ESU cycles renders clean content."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-resize-sync*")))
     (unwind-protect
         (with-current-buffer buf
           (let* ((term (ghostel--new 10 40 100))
                  (inhibit-read-only t))
-            ;; Enter alt screen, write content, cursor at bottom
+            ;; Enter alt screen and simulate a complete synchronized
+            ;; update cycle before resizing.
             (ghostel--write-input term "\e[?1049h")
-            (dotimes (i 9) (ghostel--write-input term (format "line %d\r\n" i)))
+            (dotimes (i 9)
+              (ghostel--write-input term (format "line %d\r\n" i)))
             (ghostel--write-input term "prompt> ")
-            (should (ghostel--mode-enabled term 1049))     ; alt screen enabled
-            ;; Simulate a full BSU/ESU cycle (app redraw)
+            (should (ghostel--mode-enabled term 1049))
             (ghostel--write-input term "\e[?2026h\e[H\e[2J")
-            (dotimes (i 9) (ghostel--write-input term (format "new %d\r\n" i)))
+            (dotimes (i 9)
+              (ghostel--write-input term (format "new %d\r\n" i)))
             (ghostel--write-input term "new prompt> ")
             (ghostel--write-input term "\e[?2026l")
-            (should-not (ghostel--mode-enabled term 2026)) ; sync off after ESU
-            ;; Resize between cycles (sync OFF) — should get clean content
+            (should-not (ghostel--mode-enabled term 2026))
             (ghostel--set-size term 6 40)
             (ghostel--redraw term)
             (let ((content (buffer-substring-no-properties (point-min) (point-max))))
-              (should (string-match-p "new prompt>" content)) ; prompt visible after resize
-              (should (> (line-number-at-pos) 1))          ; cursor not at top
-              (should (equal 6 (count-lines (point-min) (point-max))))) ; correct line count
-            ;; Verify: resize DURING BSU gives garbage (cursor at top)
-            (ghostel--write-input term "\e[?2026h\e[H\e[2J")
-            (ghostel--write-input term "BANNER\r\n")
-            (should (ghostel--mode-enabled term 2026))     ; sync on during BSU
-            (ghostel--set-size term 5 40)
-            (ghostel--redraw term)
-            (should (<= (line-number-at-pos) 2))           ; mid-BSU: cursor near top
-            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
-              (should-not (string-match-p "new prompt>" content))))) ; mid-BSU: no prompt
+              (should (string-match-p "new prompt>" content))
+              (should (= 6 (count-lines (point-min) (point-max)))))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-resize-redraw-alt-screen ()
@@ -2188,7 +1583,7 @@ app redraws all rows at new width via the filter pipeline."
 
 (ert-deftest ghostel-test-resize-through-filter-pipeline ()
   "Full pipeline test: resize, then app response goes through filter path.
-The app's output enters via `ghostel--filter' (pending-output) and is
+The app's output enters the terminal via `ghostel--filter' and is
 rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-pipeline*")))
@@ -2223,7 +1618,7 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
                   (setq ghostel--force-next-redraw t)
 
                   ;; Simulate app's SIGWINCH response arriving through the filter.
-                  ;; This is the real pipeline: filter → pending-output → delayed-redraw.
+                  ;; This is the real pipeline: filter → terminal → delayed-redraw.
                   ;; Use BSU/ESU like htop does.
                   (let ((response (concat
                                    "\e[?2026h"      ; BSU
@@ -2237,7 +1632,7 @@ rendered by `ghostel--delayed-redraw'.  This is the exact real-world path."
                                    "\e[6;7H"         ; position cursor
                                    "\e[?25h"         ; show cursor
                                    "\e[?2026l")))    ; ESU
-                    ;; Feed through the filter to accumulate as pending output.
+                    ;; Feed through the filter into the terminal.
                     (ghostel--filter proc response))
 
                   ;; Now call delayed-redraw (as the timer would).
@@ -2361,1296 +1756,6 @@ When the buffer reappears, it is immediately redrawn."
               (should (string-match-p "while-hidden" (buffer-string))))))
       (set-window-buffer win orig-buf)
       (kill-buffer buf))))
-
-(ert-deftest ghostel-test-hidden-buffer-snaps-on-reshow ()
-  "Buffer re-shown after output-while-hidden snaps to the viewport (issue #177).
-Dispatches through `window-buffer-change-functions' so the hook
-wiring — not just `ghostel--reshow-snap' in isolation — is exercised."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-177-snap*"))
-        (other (get-buffer-create "*ghostel-test-177-other*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t)
-                 (win (selected-window)))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "pre-%02d\r\n" i)))
-            (ghostel--write-input term "prompt> ")
-            (ghostel--redraw term t)
-            (set-window-buffer win buf)
-            (goto-char (point-max))
-            (set-window-point win (point-max))
-            (set-window-start win (ghostel--viewport-start) t)
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            (let ((pre-hide-ws (window-start win)))
-              ;; Hide; output arrives while hidden so the anchor advances.
-              (set-window-buffer win other)
-              (dotimes (i 30)
-                (ghostel--write-input term (format "hidden-%02d\r\n" i)))
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              ;; Re-show with the stale pre-hide `window-start', then
-              ;; dispatch the hook the way redisplay would.
-              (set-window-buffer win buf)
-              (set-window-start win pre-hide-ws t)
-              (run-hook-with-args 'window-buffer-change-functions win)
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              (should (= (window-start win) (ghostel--viewport-start)))
-              ;; The snap entry was consumed and cleared.
-              (should-not ghostel--windows-needing-snap))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf)
-      (when (buffer-live-p other) (kill-buffer other)))))
-
-
-
-;;; Window anchoring and scroll preservation
-
-(ert-deftest ghostel-test-resize-redraw-anchors-window-start ()
-  "After resize + redraw, `window-start' is at the viewport origin.
-Without explicit anchoring, erase+rebuild inside redraw() clamps
-`window-start' to 1 (top of scrollback), causing a visible jump when
-Emacs auto-scrolls to make point visible."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-resize-anchor*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (ghostel--force-next-redraw nil)
-                 (inhibit-read-only t))
-            ;; Build up scrollback so the viewport is not at buffer start.
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--write-input term "prompt> ")
-            (ghostel--redraw term t)
-            (should (> (line-number-at-pos (point-max)) 10))
-
-            ;; Display in a real window so we can test window-start.
-            (set-window-buffer (selected-window) buf)
-            ;; Simulate the pre-resize steady state: window was
-            ;; following the viewport (auto-follow), and a prior
-            ;; redraw anchored `window-start' at the viewport.
-            (let ((vp-before (save-excursion
-                               (goto-char (point-max))
-                               (forward-line -10)
-                               (line-beginning-position))))
-              (set-window-start (selected-window) vp-before t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            ;; Resize + redraw via delayed-redraw (simulates the real path).
-            (ghostel--set-size term 6 40)
-            (setq ghostel--term-rows 6)
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            ;; window-start should be at the viewport, not at buffer start.
-            (let* ((ws (window-start (selected-window)))
-                   (wp (window-point (selected-window)))
-                   (vp-start (save-excursion
-                               (goto-char (point-max))
-                               (forward-line -6)
-                               (line-beginning-position))))
-              (should (= ws vp-start))
-              (should (>= wp vp-start)))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-resets-vscroll ()
-  "Redraw resets `window-vscroll' when point is in the viewport.
-Regression for issue #105: with `pixel-scroll-precision-mode',
-a non-zero pixel vscroll left on the window clips the top line
-after a redraw (e.g. `clear').  Anchoring `window-start' alone is
-not enough; the pixel offset must also be cleared."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-vscroll*"))
-        (orig-buf (window-buffer (selected-window)))
-        ;; Simulated pixel vscroll state per window.  Batch-mode
-        ;; `window-vscroll' always returns 0, so we track the value
-        ;; ourselves via a mocked `set-window-vscroll'.
-        (vscroll-by-window (make-hash-table :test 'eq)))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--write-input term "prompt> ")
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Window was showing the viewport before the redraw — this
-            ;; is the auto-follow case where vscroll must be reset.
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp-before (save-excursion
-                               (goto-char (point-max))
-                               (forward-line -9)
-                               (line-beginning-position))))
-              (set-window-start (selected-window) vp-before t))
-            ;; Seed a non-zero pixel vscroll (simulating what
-            ;; `pixel-scroll-precision-mode' leaves behind).
-            (puthash (selected-window) 7 vscroll-by-window)
-            (cl-letf (((symbol-function 'set-window-vscroll)
-                       (lambda (win vscroll &optional pixels-p &rest _)
-                         (should (eq pixels-p t))
-                         (puthash win vscroll vscroll-by-window))))
-              (ghostel--delayed-redraw buf))
-            (should (= 0 (gethash (selected-window) vscroll-by-window)))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-resets-vscroll-all-windows ()
-  "Redraw resets `window-vscroll' on every window showing the buffer.
-`ghostel--delayed-redraw' iterates `get-buffer-window-list' so both
-windows must be anchored."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-vscroll-multi*"))
-        (orig-config (current-window-configuration))
-        (vscroll-by-window (make-hash-table :test 'eq)))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--write-input term "prompt> ")
-            (ghostel--redraw term t)
-            (goto-char (point-max))
-            (delete-other-windows)
-            (set-window-buffer (selected-window) buf)
-            (let ((w1 (selected-window))
-                  (w2 (split-window-vertically))
-                  (vp-before (save-excursion
-                               (goto-char (point-max))
-                               (forward-line -9)
-                               (line-beginning-position))))
-              (set-window-buffer w2 buf)
-              (set-window-point w1 (point-max))
-              (set-window-point w2 (point-max))
-              ;; Both windows were at the viewport pre-redraw.
-              (set-window-start w1 vp-before t)
-              (set-window-start w2 vp-before t)
-              (puthash w1 7 vscroll-by-window)
-              (puthash w2 4 vscroll-by-window)
-              (cl-letf (((symbol-function 'set-window-vscroll)
-                         (lambda (win vscroll &optional pixels-p &rest _)
-                           (should (eq pixels-p t))
-                           (puthash win vscroll vscroll-by-window))))
-                (ghostel--delayed-redraw buf))
-              (should (= 0 (gethash w1 vscroll-by-window)))
-              (should (= 0 (gethash w2 vscroll-by-window))))))
-      (set-window-configuration orig-config)
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-preserves-vscroll-in-scrollback ()
-  "Redraw leaves `window-vscroll' alone when point is in scrollback.
-The vscroll reset is gated on the same condition as `set-window-start':
-a user reading history should not be pulled around by live redraws."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-vscroll-scrollback*"))
-        (orig-buf (window-buffer (selected-window)))
-        (vscroll-called nil))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Seed the anchor by running a prior redraw so subsequent
-            ;; scroll-preservation logic is in steady state.
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            ;; Simulate the user scrolling into scrollback: both
-            ;; window-start and point move above the viewport (that's
-            ;; what real Emacs scrollers — pixel-scroll-precision,
-            ;; mouse-wheel, scroll-up-command — produce).
-            (goto-char (point-min))
-            (set-window-point (selected-window) (point-min))
-            (set-window-start (selected-window) (point-min) t)
-            (cl-letf (((symbol-function 'set-window-vscroll)
-                       (lambda (&rest _) (setq vscroll-called t))))
-              (ghostel--delayed-redraw buf))
-            (should-not vscroll-called)))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-captures-scrollback-on-first-non-anchored ()
-  "First non-anchored redraw captures `window-start' / `window-point'.
-Simulates wheel/pixel-scroll that moves `window-start' above the
-viewport before any scroll-positions entry has been recorded.  The
-redraw must not yank ws back to the viewport (no snap) and must
-capture the new scrollback state so subsequent redraws can preserve
-it through mangling."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-ws-scrollback*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (ghostel--snap-requested nil)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Seed the anchor via a prior redraw so we're in steady
-            ;; auto-follow state before simulating the wheel-up.
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            ;; Simulate a scroller that moves window-start without moving
-            ;; point (unusual but possible — e.g., pixel-scroll-precision
-            ;; on a scroll that's small enough to keep point on-screen).
-            (set-window-start (selected-window) (point-min) t)
-            (let ((ws-before (window-start (selected-window)))
-                  (wp-before (window-point (selected-window))))
-              ;; No scroll-positions entry for this window yet, so the
-              ;; pre-redraw restore is a no-op; this exercises capture,
-              ;; not restoration.
-              (should-not ghostel--scroll-positions)
-              (ghostel--delayed-redraw buf)
-              (should (= ws-before (window-start (selected-window))))
-              (should (= wp-before (window-point (selected-window))))
-              ;; And now scroll-positions has the captured entry.
-              (should ghostel--scroll-positions))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-second-window-does-not-disturb-scrollback ()
-  "Opening a second window on a ghostel buffer does not yank peer windows.
-Issue #177 regression guard for the multi-window case: a window
-already scrolled back for reading history must stay put when a new
-window opens on the same buffer."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-177-multi*"))
-        (orig-config (current-window-configuration))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t)
-                 (win-a (selected-window)))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "pre-%02d\r\n" i)))
-            (ghostel--write-input term "prompt> ")
-            (ghostel--redraw term t)
-            (set-window-buffer win-a buf)
-            (set-window-start win-a (ghostel--viewport-start) t)
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            ;; Scroll win-a into the scrollback.
-            (set-window-start win-a (point-min) t)
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            (let ((scrollback-ws (window-start win-a))
-                  (win-b (split-window win-a)))
-              (set-window-buffer win-b buf)
-              (set-window-start win-b (point-min) t)
-              ;; Simulate the callback redisplay fires for the new window.
-              (run-hook-with-args 'window-buffer-change-functions win-b)
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              ;; win-b snapped; win-a's scrollback is untouched.
-              (should (= (window-start win-b) (ghostel--viewport-start)))
-              (should (= (window-start win-a) scrollback-ws))
-              (should-not ghostel--windows-needing-snap))))
-      (set-window-configuration orig-config)
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-preserves-scroll-during-live-output ()
-  "Scrollback view is preserved when live PTY output triggers a redraw.
-Before the fix, any redraw timer firing while the user was reading
-scrollback yanked `window-start' and cursor back to the viewport.  With
-the fix, live output grows the buffer without disturbing the scrolled-up
-view or the user's cursor position."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-live-output-scroll*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Auto-follow steady state.
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            ;; User scrolls into scrollback (ws and point both move).
-            (set-window-start (selected-window) (point-min) t)
-            (goto-char (point-min))
-            (set-window-point (selected-window) (point-min))
-            (let ((ws-before (window-start (selected-window)))
-                  (wp-before (window-point (selected-window))))
-
-              ;; More PTY output arrives and the redraw timer fires.
-              (ghostel--write-input term "extra-line\r\n")
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-
-              (should (= ws-before (window-start (selected-window))))
-              (should (= wp-before (window-point (selected-window)))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-preserves-scroll-across-window-resize ()
-  "Window resize (e.g. `M-x' opening the minibuffer) keeps scrollback view.
-Reproduces the reported bug: user scrolls up with the mouse wheel and
-presses `M-x'; the minibuffer opens and shrinks the ghostel window,
-which calls `ghostel--window-adjust-process-window-size' → delayed
-redraw.  Before the fix, that redraw yanked `window-start' back to the
-viewport.  After the fix, the scrolled-up view is preserved."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-resize-preserve*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Steady-state auto-follow: window was at the viewport
-            ;; and a prior redraw established `last-anchor-position'.
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            ;; Simulate wheel-up that moves both window-start and point
-            ;; into the scrollback (as `pixel-scroll-precision-mode'
-            ;; does when point would otherwise fall off-screen).
-            (set-window-start (selected-window) (point-min) t)
-            (goto-char (point-min))
-            (set-window-point (selected-window) (point-min))
-            ;; Real-world flow: some PTY output arrives between the
-            ;; wheel-up and `M-x', so an output-driven redraw captures
-            ;; the scrolled window into `ghostel--scroll-positions'
-            ;; before the resize fires.  Without this intermediate
-            ;; capture the resize redraw's drift heuristic would
-            ;; (correctly, by that heuristic) classify this window as
-            ;; drifted-but-anchored and snap it back.
-            (ghostel--delayed-redraw buf)
-            (should (assq (selected-window) ghostel--scroll-positions))
-            (let ((ws-before (window-start (selected-window)))
-                  (wp-before (window-point (selected-window))))
-
-              ;; Simulate the M-x minibuffer resize path.  `cl-letf' on
-              ;; the default adjust-fn returns a smaller size, so the
-              ;; real handler runs `ghostel--set-size' and
-              ;; `ghostel--delayed-redraw'.
-              (cl-letf (((default-value 'window-adjust-process-window-size-function)
-                         (lambda (&rest _) (cons 40 6)))
-                        ;; The real handler reads process-buffer.  A
-                        ;; throwaway pipe process with this buffer is
-                        ;; enough; we clean it up below without letting
-                        ;; the sentinel insert any status text.
-                        ((symbol-function 'set-process-window-size) #'ignore))
-                (setq ghostel--process
-                      (make-pipe-process :name "ghostel-test-fake"
-                                         :buffer buf
-                                         :noquery t
-                                         :filter #'ignore
-                                         :sentinel #'ignore))
-                (unwind-protect
-                    (ghostel--window-adjust-process-window-size
-                     ghostel--process
-                     (list (selected-window)))
-                  (delete-process ghostel--process)
-                  (setq ghostel--process nil)))
-
-              ;; The user's scrolled-up view must be preserved.
-              (should (= ws-before (window-start (selected-window))))
-              (should (= wp-before (window-point (selected-window)))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-resize-preserves-anchor-when-emacs-drifts-ws ()
-  "Resize keeps the window anchored when Emacs drifted `window-start' below it.
-Regression test for issue #127: in TUIs whose cursor sits above the
-viewport bottom, opening the minibuffer shrinks the window body and
-Emacs's `keep-point-visible' moves `window-start' forward so the TUI
-cursor stays on screen.  The resulting `ws < anchor' looked identical
-to a real user scroll, so the force redraw captured a blank-row key,
-found it at `point-min', and jumped `window-start' to 1.
-
-With the fix, a force redraw classifies a window as anchored when it
-wasn't recorded in `ghostel--scroll-positions' at the prior redraw —
-so an Emacs-driven drift is treated as drift, not a scroll."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-resize-anchor-drift*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            ;; Write enough blank-terminated lines that a drifted
-            ;; ws-key would ambiguously match near `point-min'.
-            (dotimes (i 30)
-              (ghostel--write-input term (format "row-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Steady-state auto-follow; prior redraw seeds the anchor.
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            (should ghostel--last-anchor-position)
-            (should-not ghostel--scroll-positions)
-
-            ;; Simulate Emacs drift: `keep-point-visible' on a
-            ;; minibuffer-triggered resize slides `window-start' a
-            ;; couple rows below the anchor.  Point stays in the live
-            ;; viewport (TUI cursor on a row above the bottom).
-            (let ((drifted-ws (save-excursion
-                                (goto-char ghostel--last-anchor-position)
-                                (forward-line -2)
-                                (line-beginning-position))))
-              (should (< drifted-ws ghostel--last-anchor-position))
-              (set-window-start (selected-window) drifted-ws t))
-            ;; Window is NOT in `ghostel--scroll-positions' — it was
-            ;; auto-following, not user-scrolled.
-            (should-not ghostel--scroll-positions)
-
-            ;; Resize path (same harness as the scrolled-view test).
-            (cl-letf (((default-value 'window-adjust-process-window-size-function)
-                       (lambda (&rest _) (cons 40 6)))
-                      ((symbol-function 'set-process-window-size) #'ignore))
-              (setq ghostel--process
-                    (make-pipe-process :name "ghostel-test-fake"
-                                       :buffer buf
-                                       :noquery t
-                                       :filter #'ignore
-                                       :sentinel #'ignore))
-              (unwind-protect
-                  (ghostel--window-adjust-process-window-size
-                   ghostel--process
-                   (list (selected-window)))
-                (delete-process ghostel--process)
-                (setq ghostel--process nil)))
-
-            ;; Window must be re-anchored to the live viewport, NOT
-            ;; yanked to `point-min'.
-            (should (= (ghostel--viewport-start)
-                       (window-start (selected-window))))
-            (should (> (window-start (selected-window)) 1))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-resize-preserves-scrollback-jump ()
-  "Resize redraw must NOT re-anchor a window whose point is in scrollback.
-Regression test: consult-line / consult-imenu / plain `goto-char' jumps in
-line mode opened a minibuffer that resized the body twice.  The second
-resize fired with `ghostel--scroll-positions' empty (no scroll-tracking
-redraw ran while the minibuffer was open) and the predicate's
-resize-active branch classified the window as anchored, yanking
-`window-point' back to the live cursor.
-
-The fix is a `window-point' >= anchor guard on the resize branch:
-it preserves the drifted-ws case (`window-point' still in the live
-viewport) but rejects this case (`window-point' moved into scrollback)."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-resize-scrollback-jump*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "row-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Steady-state: cursor at live viewport, window anchored.
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            (should ghostel--last-anchor-position)
-            (should-not ghostel--scroll-positions)
-
-            ;; Simulate consult-line jumping point into scrollback.
-            (let ((target (save-excursion
-                            (goto-char (point-min))
-                            (forward-line 5)
-                            (line-beginning-position))))
-              (should (< target ghostel--last-anchor-position))
-              (set-window-point (selected-window) target)
-              (set-window-start (selected-window) target t)
-              (goto-char target)
-              ;; No plain redraw runs while the minibuffer is open, so
-              ;; `ghostel--scroll-positions' stays empty — exactly the
-              ;; state the resize-active branch used to misclassify.
-              (should-not ghostel--scroll-positions)
-
-              ;; Resize fires when the minibuffer closes.
-              (cl-letf (((default-value 'window-adjust-process-window-size-function)
-                         (lambda (&rest _) (cons 40 6)))
-                        ((symbol-function 'set-process-window-size) #'ignore))
-                (setq ghostel--process
-                      (make-pipe-process :name "ghostel-test-fake"
-                                         :buffer buf
-                                         :noquery t
-                                         :filter #'ignore
-                                         :sentinel #'ignore))
-                (unwind-protect
-                    (ghostel--window-adjust-process-window-size
-                     ghostel--process
-                     (list (selected-window)))
-                  (delete-process ghostel--process)
-                  (setq ghostel--process nil)))
-
-              ;; Window-point must still be in scrollback, not yanked
-              ;; back to the live viewport.
-              (should (< (window-point (selected-window))
-                         (ghostel--viewport-start))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-viewport-start-skips-trailing-newline ()
-  "`ghostel--viewport-start' must not be off-by-one on a trailing \\n.
-Partial redraws can leave the buffer ending with \\n (e.g. after
-trimming excess rows).  Emacs then counts an empty phantom line
-past `point-max'; a naive `forward-line (- (1- tr))' lands one line
-too deep and the anchored window clips the bottom content row.
-The fix must return the start of row 1, covering exactly TR content
-rows in the viewport — with or without the trailing newline."
-  (with-temp-buffer
-    (let ((tr 5))
-      (dotimes (i tr)
-        (insert (format "row-%d" (1+ i)))
-        (when (< i (1- tr)) (insert "\n")))
-      (let* ((ghostel--term-rows tr)
-             (vs-no-nl (ghostel--viewport-start)))
-        (should (= 1 vs-no-nl))
-        (insert "\n")
-        (let ((vs-nl (ghostel--viewport-start)))
-          (should (= 1 vs-nl))
-          (should (= tr (count-lines vs-nl (save-excursion
-                                             (goto-char (point-max))
-                                             (skip-chars-backward "\n")
-                                             (point))))))))))
-
-(ert-deftest ghostel-test-anchor-window-no-clamp-without-pending-wrap ()
-  "`ghostel--anchor-window' must leave `window-point' at PT outside pending-wrap.
-Regression test for #146: PR #139 originally clamped unconditionally
-whenever PT equalled `point-max', which pulled the block cursor onto
-the last character of a normal shell prompt (the cursor is legitimately
-at `point-max' right after typing).  The clamp must only fire for the
-#138 scenario where the terminal is genuinely in pending-wrap state.
-
-This pure-elisp test leaves `ghostel--term' nil; the helper must then
-skip the clamp entirely regardless of where PT sits."
-  (let ((buf (generate-new-buffer " *ghostel-test-anchor-no-clamp*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (progn
-          (with-current-buffer buf
-            (insert "row-1\nrow-2\n$ ls"))
-          (set-window-buffer (selected-window) buf)
-          (let ((win (selected-window))
-                (pmax (with-current-buffer buf (point-max))))
-            ;; pt at point-max, no term: window-point stays put (#146).
-            (with-current-buffer buf
-              (setq-local ghostel--term nil)
-              (ghostel--anchor-window win (point-min) pmax))
-            (should (= pmax (window-point win)))
-            ;; pt inside the buffer: window-point is left alone.
-            (with-current-buffer buf
-              (ghostel--anchor-window win (point-min) (- pmax 3)))
-            (should (= (- pmax 3) (window-point win))))
-          ;; Empty buffer: no underflow when pt == point-min == point-max.
-          (let ((empty-buf (generate-new-buffer " *ghostel-test-anchor-empty*")))
-            (unwind-protect
-                (progn
-                  (set-window-buffer (selected-window) empty-buf)
-                  (with-current-buffer empty-buf
-                    (setq-local ghostel--term nil)
-                    (ghostel--anchor-window (selected-window)
-                                            (point-min) (point-max)))
-                  (should (= (point-min)
-                             (window-point (selected-window)))))
-              (kill-buffer empty-buf))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-anchors-window-start-on-snap-request ()
-  "Redraw anchors `window-start' to the viewport when snap is requested.
-`ghostel--snap-to-input' sets `ghostel--snap-requested' on typing/paste/
-yank/drop.  The next redraw must override a scrolled-up `window-start'
-and pull it back to the viewport, then clear the flag."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-ws-snap*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (ghostel--snap-requested t)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (set-window-start (selected-window) (point-min) t)
-            (ghostel--delayed-redraw buf)
-            (let ((viewport-start (ghostel--viewport-start)))
-              (should (= viewport-start (window-start (selected-window))))
-              (should-not ghostel--snap-requested))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-scroll-preserved-across-blank-lines ()
-  "Scroll preservation disambiguates blank / repeated lines.
-Ghostel's content-based scroll restoration uses a multi-line key (not a
-single line's text) so that a window scrolled to a blank line isn't
-yanked to the first blank line in the buffer when a redraw rebuilds
-scrollback positions."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-blank-line*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            ;; Lots of blank-line separators mixed with content so the
-            ;; first match of "" is near the top.
-            (dotimes (i 30)
-              (ghostel--write-input term (format "line-%02d\r\n\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            ;; Seed auto-follow.
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            ;; Scroll so window-start is on a blank line in the middle
-            ;; (not the first blank line in the buffer).
-            (let ((target (save-excursion
-                            (goto-char (point-max))
-                            (forward-line -26)
-                            (line-beginning-position))))
-              (set-window-start (selected-window) target t)
-              (let ((pre-key (ghostel--line-key target)))
-                ;; Sanity: the line we're on is blank.
-                (should (equal "" (car pre-key)))
-                ;; Non-anchored redraw to capture scroll-positions.
-                (setq ghostel--force-next-redraw t)
-                (ghostel--delayed-redraw buf)
-                ;; Simulate Emacs mangling window-start to 1.
-                (set-window-start (selected-window) (point-min) t)
-                ;; Next redraw restores via multi-line key match.
-                (setq ghostel--force-next-redraw t)
-                (ghostel--delayed-redraw buf)
-                ;; Window-start must be back on the user's blank-line
-                ;; row, NOT at the first blank line in the buffer.
-                (should (equal pre-key
-                               (ghostel--line-key
-                                (window-start (selected-window)))))
-                (should (> (window-start (selected-window)) 1))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-anchored-and-scrolled-multi-window ()
-  "Anchored and scrolled windows showing the same buffer coexist.
-Two windows show the ghostel buffer: one follows the viewport, the
-other is pinned to scrollback.  A redraw must anchor the first and
-preserve the second."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-multi*"))
-        (orig-config (current-window-configuration)))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (goto-char (point-max))
-            (delete-other-windows)
-            (set-window-buffer (selected-window) buf)
-            (let* ((w1 (selected-window))
-                   (w2 (split-window-vertically))
-                   (vp (ghostel--viewport-start)))
-              (set-window-buffer w2 buf)
-              ;; w1 follows viewport; w2 will be scrolled to scrollback
-              ;; top *after* the seed redraw (the first-ever redraw
-              ;; treats every window as anchored).
-              (set-window-start w1 vp t)
-              (set-window-point w1 (point-max))
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              (set-window-start w2 (point-min) t)
-              (set-window-point w2 (point-min))
-              (let* ((w2-ws-before (window-start w2)))
-                ;; A redraw that appends more output should anchor w1
-                ;; to the new viewport and leave w2 where it is.
-                (ghostel--write-input term "extra-line\r\n")
-                (setq ghostel--force-next-redraw t)
-                (ghostel--delayed-redraw buf)
-                ;; w1 anchored to new viewport.
-                (let ((new-vp (ghostel--viewport-start)))
-                  (should (= new-vp (window-start w1))))
-                ;; w2 still in scrollback (same line content).
-                (should (equal (ghostel--line-key w2-ws-before)
-                               (ghostel--line-key (window-start w2))))))))
-      (set-window-configuration orig-config)
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-copy-mode-exit-resets-scroll-state ()
-  "Exiting copy mode drops stale scroll-positions.
-Delayed-redraw is short-circuited during copy mode; on exit, whatever
-`ghostel--scroll-positions' held is stale.  The exit handler drops it
-and requests a snap so the next redraw lands at the live viewport."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-copy-exit*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (setq ghostel--input-mode 'copy)
-          (setq ghostel--scroll-positions
-                (list (cons (selected-window)
-                            (list '("stale") '("stale") 0))))
-          (setq ghostel--snap-requested nil)
-          (setq ghostel--force-next-redraw nil)
-          (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore)
-                    ((symbol-function 'message) #'ignore))
-            (ghostel-readonly-exit))
-          (should-not ghostel--scroll-positions)
-          (should ghostel--snap-requested)
-          ;; `force-next-redraw' must also be set so the snap fires
-          ;; even when DEC 2026 synchronized output is active.
-          (should ghostel--force-next-redraw))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-syncs-window-point-to-cursor ()
-  "Anchored redraw syncs `window-point' to the terminal cursor.
-When an OSC 52;e callback moved selection elsewhere and left the
-ghostel window's `window-point' stale, the next redraw (which is
-anchored because the window is at the viewport) must update it."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-wp-sync*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            ;; Simulate OSC 52;e leaving window-point stale.
-            (set-window-point (selected-window) (point-min))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            ;; Anchored window's window-point follows the cursor
-            ;; (buffer-point after native redraw), not the stale value.
-            (should (= (window-point (selected-window)) (point)))
-            (should (> (window-point (selected-window)) 1))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-respects-user-rescroll ()
-  "A second scroll + redraw respects the NEW scroll position.
-Reproduces the bug where `ghostel--scroll-positions' goes stale across
-redraws: user scrolls to A, triggers a redraw (captures A), scrolls
-to B, triggers another redraw — the pre-redraw restore must detect
-that the user moved ws to a new valid position and refresh the saved
-key to B, rather than yanking ws back to A."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-rescroll*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 50)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            ;; Scroll #1: to an early (but non-point-min) line.
-            (let* ((target-a (save-excursion
-                               (goto-char (point-min))
-                               (forward-line 5)
-                               (line-beginning-position)))
-                   (key-a (ghostel--line-key target-a)))
-              (set-window-start (selected-window) target-a t)
-              (set-window-point (selected-window) target-a)
-              ;; Redraw #1 (simulates M-x triggering delayed-redraw).
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              (should (equal key-a
-                             (ghostel--line-key
-                              (window-start (selected-window)))))
-
-              ;; Scroll #2: to a DIFFERENT non-point-min line.  The
-              ;; pre-redraw restore must leave ws alone (only
-              ;; point-min looks mangled); the post-redraw capture
-              ;; rebuilds `ghostel--scroll-positions' from the
-              ;; window's live ws/wp, so the saved key picks up B.
-              (let* ((target-b (save-excursion
-                                 (goto-char (point-min))
-                                 (forward-line 15)
-                                 (line-beginning-position)))
-                     (key-b (ghostel--line-key target-b)))
-                (should-not (equal key-a key-b))
-                (set-window-start (selected-window) target-b t)
-                (set-window-point (selected-window) target-b)
-                ;; Redraw #2.
-                (setq ghostel--force-next-redraw t)
-                (ghostel--delayed-redraw buf)
-                ;; Must land on target-b (user's current intent),
-                ;; NOT target-a.
-                (should (equal key-b
-                               (ghostel--line-key
-                                (window-start (selected-window)))))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-restores-from-mangled-point-min ()
-  "When Emacs clamps `window-start' to `point-min', redraw restores.
-This is the signature behavior used to distinguish Emacs-side ws
-mangling (from window resize etc.) from a legitimate user scroll.
-If ws is clamped to point-min but the saved key points elsewhere,
-the pre-redraw restore searches for the saved key and moves ws back."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-mangled*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 50)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            (let* ((target (save-excursion
-                             (goto-char (point-min))
-                             (forward-line 15)
-                             (line-beginning-position)))
-                   (key (ghostel--line-key target)))
-              (set-window-start (selected-window) target t)
-              (set-window-point (selected-window) target)
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-
-              ;; Simulate Emacs clamping ws to point-min (mangling).
-              (set-window-start (selected-window) (point-min) t)
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              ;; Must restore ws to the saved key's line content.
-              (should (equal key
-                             (ghostel--line-key
-                              (window-start (selected-window))))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-restores-wp-mangled-independently ()
-  "`window-point' mangled to point-min is restored even when ws isn't.
-The wp restore path is decoupled from ws restore.  Emacs can in
-principle reset wp without touching ws (e.g. when the selected window
-changes and the previous buffer's point gets reset); verify the
-restore still fires."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-wp-mangled*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 50)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            (let* ((ws-target (save-excursion
-                                (goto-char (point-min))
-                                (forward-line 15)
-                                (line-beginning-position)))
-                   (wp-target (save-excursion
-                                (goto-char (point-min))
-                                (forward-line 18)
-                                (line-beginning-position)))
-                   (wp-key (ghostel--line-key wp-target)))
-              (set-window-start (selected-window) ws-target t)
-              (set-window-point (selected-window) wp-target)
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-
-              ;; Mangle only wp — ws stays at the same content.
-              (set-window-point (selected-window) (point-min))
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              (should (equal wp-key
-                             (ghostel--line-key
-                              (window-point (selected-window))))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-false-negative-mangle-refreshes-saved-key ()
-  "Non-point-min mangling is indistinguishable from user scroll.
-Document and lock in the known limitation of the no-post-command-hook
-heuristic: if Emacs moves `window-start' to a non-point-min position
-that doesn't match the saved key (e.g. programmatic `recenter',
-`follow-mode'), the pre-redraw pass treats it as a user scroll and
-refreshes the saved key rather than restoring.  The original scroll
-intent is lost."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-false-neg*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 50)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            (goto-char (point-max))
-            (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
-              (set-window-start (selected-window) vp t))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-
-            (let* ((saved (save-excursion
-                            (goto-char (point-min))
-                            (forward-line 10)
-                            (line-beginning-position)))
-                   (hijacked (save-excursion
-                               (goto-char (point-min))
-                               (forward-line 20)
-                               (line-beginning-position)))
-                   (hijacked-key (ghostel--line-key hijacked)))
-              (set-window-start (selected-window) saved t)
-              (set-window-point (selected-window) saved)
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-
-              ;; Move ws to a different VALID position (not point-min).
-              ;; The heuristic can't tell this from a user scroll.
-              (set-window-start (selected-window) hijacked t)
-              (setq ghostel--force-next-redraw t)
-              (ghostel--delayed-redraw buf)
-              ;; Known limitation: ws is accepted as the new intent.
-              (should (equal hijacked-key
-                             (ghostel--line-key
-                              (window-start (selected-window)))))
-              ;; scroll-positions has the new key, not the original.
-              (let* ((entry (assq (selected-window)
-                                  ghostel--scroll-positions))
-                     (saved-ws-key (nth 0 (cdr entry))))
-                (should (equal hijacked-key saved-ws-key))))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-redraw-first-call-anchors-fresh-buffer ()
-  "First-ever redraw anchors the window to the viewport.
-`ghostel--last-anchor-position' is nil on the first delayed-redraw; my
-code treats every window as anchored in that case so the fresh buffer
-pins to the viewport.  This guards the bootstrap path."
-  :tags '(native)
-  (let ((buf (generate-new-buffer " *ghostel-test-first-redraw*"))
-        (orig-buf (window-buffer (selected-window))))
-    (unwind-protect
-        (with-current-buffer buf
-          (ghostel-mode)
-          (let* ((term (ghostel--new 10 40 200))
-                 (ghostel--term term)
-                 (ghostel--term-rows 10)
-                 (inhibit-read-only t))
-            (dotimes (i 30)
-              (ghostel--write-input term (format "scroll-%02d\r\n" i)))
-            (ghostel--redraw term t)
-            (set-window-buffer (selected-window) buf)
-            ;; Fresh state.
-            (setq ghostel--last-anchor-position nil
-                  ghostel--scroll-positions nil
-                  ghostel--snap-requested nil)
-            (goto-char (point-max))
-            (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
-            ;; Anchor fired: window-start pinned to viewport.
-            (let ((vs (ghostel--viewport-start)))
-              (should (= vs (window-start (selected-window))))
-              (should (= vs ghostel--last-anchor-position)))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (kill-buffer buf))))
-
-
-
-;;; Preedit overlays during redraw
-
-(ert-deftest ghostel-test-delayed-redraw-preserves-preedit-anchor ()
-  "Active GUI preedit text keeps its point anchor across redraws.
-GTK/PGTK input-method candidate windows are anchored to the preedit
-overlay at point.  During streaming TUI output, native redraws move
-point to the terminal cursor; while preedit text is visible, the
-composing window must instead keep the overlay and `window-point' at
-the same viewport row and column.
-FIXME: `ghostel--term' is bound to a placeholder rather than a real
-native handle, and `ghostel--redraw' is stubbed to simulate the
-destructive renderer behavior.  A clean rewrite would need a real
-terminal fixture with a preedit overlay that survives the renderer's
-buffer rewrite at the right viewport row — non-trivial fixture work."
-  (let ((buf (generate-new-buffer " *ghostel-test-preedit-anchor*"))
-        (orig-buf (window-buffer (selected-window)))
-        (old-bound (boundp 'x-preedit-overlay))
-        (old-value (and (boundp 'x-preedit-overlay) x-preedit-overlay))
-        overlay)
-    (unwind-protect
-        (progn
-          (set-window-buffer (selected-window) buf)
-          (with-current-buffer buf
-            (ghostel-mode)
-            (setq-local ghostel--term 'fake-term
-                        ghostel--term-rows 5
-                        ghostel--force-next-redraw nil
-                        ghostel-enable-url-detection nil
-                        ghostel-enable-file-detection nil)
-            (insert "old-0\nold-1\nold-2\nold-3\nold-4")
-            (goto-char (point-max))
-            (setq overlay (make-overlay (point) (point) buf))
-            (overlay-put overlay 'before-string "ni")
-            (overlay-put overlay 'window (selected-window))
-            (setq x-preedit-overlay overlay)
-            (set-window-start (selected-window) (point-min) t)
-            (set-window-point (selected-window) (point)))
-          (cl-letf (((symbol-function 'ghostel--mode-enabled)
-                     (lambda (&rest _) nil))
-                    ((symbol-function 'ghostel--redraw)
-                     (lambda (&rest _)
-                       ;; Simulate a destructive native redraw that leaves
-                       ;; point at the terminal cursor on a different row.
-                       (erase-buffer)
-                       (insert "new-0\nnew-1\nnew-2\nnew-3\nnew-4")
-                       (goto-char (point-min))
-                       (forward-line 1)))
-                    ((symbol-function 'ghostel--cursor-pending-wrap-p)
-                     (lambda (&rest _)
-                       (error "Preedit anchor should bypass clamp checks")))
-                    ((symbol-function 'ghostel--cursor-on-empty-row-p)
-                     (lambda (&rest _)
-                       (error "Preedit anchor should bypass clamp checks"))))
-            (ghostel--delayed-redraw buf))
-          (with-current-buffer buf
-            (let ((expected (save-excursion
-                              (goto-char (point-min))
-                              (forward-line 4)
-                              (move-to-column 5)
-                              (point))))
-              (should (= expected (overlay-start overlay)))
-              (should (= expected (window-point (selected-window))))
-              (should (= expected (point))))))
-      (if old-bound
-          (setq x-preedit-overlay old-value)
-        (makunbound 'x-preedit-overlay))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (when (and overlay (overlayp overlay))
-        (delete-overlay overlay))
-      (kill-buffer buf))))
-
-(ert-deftest ghostel-test-preedit-window-fallback ()
-  "Verify the `selected-window' fallback in `ghostel--preedit-window'.
-This covers the pgtk-preedit-overlay shape, which has no `window'
-overlay property."
-  (let ((buf (generate-new-buffer " *ghostel-test-preedit-window*"))
-        (orig-buf (window-buffer (selected-window)))
-        overlay)
-    (unwind-protect
-        (with-current-buffer buf
-          (setq overlay (make-overlay (point-min) (point-min) buf))
-          ;; No 'window property — selected-window must show the buffer.
-          (set-window-buffer (selected-window) buf)
-          (should (eq (ghostel--preedit-window overlay) (selected-window)))
-          ;; Explicit 'window wins over the fallback.
-          (overlay-put overlay 'window (selected-window))
-          (should (eq (ghostel--preedit-window overlay) (selected-window)))
-          ;; Selected window showing some other buffer and no 'window
-          ;; property: nothing usable, return nil.
-          (overlay-put overlay 'window nil)
-          (when (buffer-live-p orig-buf)
-            (set-window-buffer (selected-window) orig-buf))
-          (should (null (ghostel--preedit-window overlay))))
-      (when (buffer-live-p orig-buf)
-        (set-window-buffer (selected-window) orig-buf))
-      (when (and overlay (overlayp overlay))
-        (delete-overlay overlay))
-      (kill-buffer buf))))
-
-
-
 
 ;;; Crash and internal-invariant regressions
 ;;

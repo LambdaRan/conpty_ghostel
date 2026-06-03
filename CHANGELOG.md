@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-06-02
+
+### Added
+- `ARCHITECTURE.md` now documents Ghostel's design and its architectural
+  trade-offs against other Emacs terminal packages.
+
+### Changed
+- Automatic buffer renaming now goes through `ghostel-buffer-name-function`,
+  a side-effect-free function called for both OSC 2 title changes and OSC 7
+  directory reports.  It receives the terminal title and returns the buffer
+  name to use, or nil to leave it unchanged; Ghostel performs the rename,
+  buffer-name uniquification, and the "don't clobber a manually renamed
+  buffer" guard.  `ghostel-set-title-function` remains as an obsolete alias.
+- `ghostel-mode` word boundaries now match Ghostty's terminal selection
+  defaults, so double-click selection, word motion, Evil text objects, and
+  word search treat paths, hostnames, and similar terminal text as single
+  words.  The new `ghostel-word-boundary-string` custom option can be changed
+  live.
+- Rendering now writes directly to the terminal buffer instead of maintaining
+  an Elisp side buffer, substantially improving throughput.
+
+### Fixed
+- Mouse drags in alt-screen applications with mouse tracking enabled (for
+  example vim with `:set mouse=a`) now stream motion events live instead of
+  updating only on release.  The final drag event is sent as a release, which
+  also fixes button-release reporting for basic mouse tracking.
+  Fixes [#349](https://github.com/dakra/ghostel/issues/349).
+- Multi-codepoint/composed characters now select the correct glyph when
+  computing display metrics.
+- Point, mark, and window-start/scroll positions are preserved by the native
+  renderer across redraws and resizes.
+
+### Internal
+- OSC 8 link handling now stores URIs directly in text properties and compares
+  link IDs in the renderer, reducing duplicated state between libghostty and
+  the materialized buffer.
+- Renderer state restoration moved into Zig and the Elisp redraw path was
+  simplified around the new invariants.
+- Link, glyph, scroll, shell-integration, and buffer-renaming tests were
+  expanded/reorganized.
+- `make package-lint` now provisions its own dependencies in an isolated
+  package directory, so it can run standalone outside CI.
+- Development tooling now uses `lldb-dap` for dape debugging.
+
 ## [0.31.0] — 2026-05-28
 
 ### Added

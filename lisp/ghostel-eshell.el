@@ -85,7 +85,7 @@ eshell."
         (setq-local ghostel-kill-buffer-on-exit
                     (bound-and-true-p eshell-destroy-buffer-when-process-dies))
         (unless ghostel-eshell-track-title
-          (setq-local ghostel-set-title-function nil))
+          (setq-local ghostel-buffer-name-function nil))
         (add-hook 'ghostel-exit-functions
                   #'ghostel-eshell--visual-exit nil t))
       nil)))

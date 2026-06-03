@@ -38,9 +38,9 @@ const DebugUserPtr = struct {
 var debug_userptrs: std.ArrayList(DebugUserPtr) = .{};
 
 pub const FunctionEntry = struct {
-    name: [*:0]const u8,
+    name: [:0]const u8,
     arity: struct { i32, i32 },
-    doc: [*:0]const u8,
+    doc: [:0]const u8,
     impl: type,
 };
 
@@ -67,6 +67,18 @@ pub const Env = struct {
     }
 
     pub fn f(self: Env, comptime func: []const u8, args: anytype) Value {
+        if (comptime builtin.mode == .Debug) {
+            if (self.nonLocalExitCheck() != .normal) {
+                return self.nil();
+            }
+        }
+        defer {
+            if (comptime builtin.mode == .Debug) {
+                if (self.nonLocalExitCheck() != .normal) {
+                    std.log.err("Call to {s} failed", .{func});
+                }
+            }
+        }
         return self.funcall(@field(sym, func), &self.makeValues(args));
     }
 
@@ -158,6 +170,16 @@ pub const Env = struct {
     }
 
     // --- Type extraction ---
+
+    pub fn cast(self: Env, T: type, val: Value) T {
+        const ty = @typeInfo(T);
+        return switch (ty) {
+            .int => @as(T, @intCast(self.extractInteger(val))),
+            .float => @as(T, @floatCast(self.extractFloat(val))),
+            .bool => self.isNotNil(val),
+            else => @compileError(std.fmt.comptimePrint("Non-supported type: {}", .{T})),
+        };
+    }
 
     pub fn extractInteger(self: Env, val: Value) i64 {
         return @intCast(self.raw.extract_integer.?(self.raw, val));
@@ -303,7 +325,11 @@ pub const Env = struct {
                 const prev_env = current_env;
                 current_env = env;
                 defer current_env = prev_env;
-                return entry.impl.call(env, nargs, args);
+                return entry.impl.call(env, nargs, args) catch |e| {
+                    env.logStackTrace(@errorReturnTrace());
+                    env.signalError("error in %s: %s", .{ entry.name, @errorName(e) });
+                    return env.nil();
+                };
             }
         }.call;
         const fun = self.makeFunction(entry.arity[0], entry.arity[1], &wrapped_fn, entry.doc, null);
@@ -313,83 +339,6 @@ pub const Env = struct {
     /// Register a named Elisp function backed by a C function.
     pub fn registerFunctions(self: Env, entries: []const FunctionEntry) void {
         inline for (entries) |*entry| self.registerFunction(entry);
-    }
-
-    /// Call (provide 'feature).
-    pub fn provide(self: Env, feature: [*:0]const u8) void {
-        _ = self.funcall(sym.provide, &[_]Value{self.intern(feature)});
-    }
-
-    // --- Buffer helpers ---
-
-    pub fn point(self: Env) Value {
-        return self.f("point", .{});
-    }
-
-    pub fn gotoChar(self: Env, pos: anytype) void {
-        _ = self.f("goto-char", .{pos});
-    }
-
-    pub fn insert(self: Env, text: []const u8) void {
-        _ = self.f("insert", .{text});
-    }
-
-    pub fn forwardLine(self: Env, n: anytype) i64 {
-        return self.extractInteger(self.f("forward-line", .{n}));
-    }
-
-    pub fn moveToColumn(self: Env, col: i64) void {
-        _ = self.f("move-to-column", .{col});
-    }
-
-    pub fn eraseBuffer(self: Env) void {
-        _ = self.f("erase-buffer", .{});
-    }
-
-    pub fn lineEndPosition(self: Env) Value {
-        return self.f("line-end-position", .{});
-    }
-
-    pub fn lineBeginningPosition2(self: Env) Value {
-        return self.f("line-beginning-position", .{2});
-    }
-
-    pub fn pointMin(self: Env) Value {
-        return self.f("point-min", .{});
-    }
-
-    pub fn pointMax(self: Env) Value {
-        return self.f("point-max", .{});
-    }
-
-    pub fn markMarker(self: Env) Value {
-        return self.f("mark-marker", .{});
-    }
-
-    pub fn markerPosition(self: Env, marker: Value) Value {
-        return self.f("marker-position", .{marker});
-    }
-
-    pub fn setMarker(self: Env, marker: Value, pos: Value) Value {
-        return self.f("set-marker", .{ marker, pos });
-    }
-
-    pub fn deleteRegion(self: Env, start: anytype, end: anytype) void {
-        _ = self.f("delete-region", .{ start, end });
-    }
-
-    pub fn eobp(self: Env) bool {
-        return self.isNotNil(self.f("eobp", .{}));
-    }
-
-    pub fn putTextProperty(
-        self: Env,
-        start: anytype,
-        end: anytype,
-        comptime prop: []const u8,
-        value: anytype,
-    ) void {
-        _ = self.f("put-text-property", .{ start, end, @field(sym, prop), value });
     }
 
     /// Create a unibyte string (for binary data like PNG images).
@@ -464,7 +413,6 @@ pub const Env = struct {
 // ---------------------------------------------------------------------------
 
 const interned_symbols = [_][:0]const u8{
-    "eobp",
     ":background",
     ":color",
     ":error",
@@ -480,8 +428,9 @@ const interned_symbols = [_][:0]const u8{
     ":width",
     "bold",
     "bright",
+    "car",
+    "cdr",
     "char-after",
-    "char-before",
     "composition-get-gstring",
     "cons",
     "dash",
@@ -492,6 +441,7 @@ const interned_symbols = [_][:0]const u8{
     "display-warning",
     "dot",
     "double-line",
+    "eobp",
     "erase-buffer",
     "error",
     "face",
@@ -506,6 +456,7 @@ const interned_symbols = [_][:0]const u8{
     "format",
     "forward-line",
     "fset",
+    "get-buffer-window-list",
     "ghostel",
     "ghostel--cursor-char-pos",
     "ghostel--cursor-pos",
@@ -515,8 +466,6 @@ const interned_symbols = [_][:0]const u8{
     "ghostel--kitty-clear",
     "ghostel--kitty-display-image",
     "ghostel--kitty-display-virtual",
-    "ghostel--native-link-help-echo",
-    "ghostel--native-uri-at",
     "ghostel--osc-progress",
     "ghostel--osc133-marker",
     "ghostel--osc52-eval",
@@ -532,6 +481,7 @@ const interned_symbols = [_][:0]const u8{
     "ghostel-input",
     "ghostel-link-id",
     "ghostel-link-map",
+    "ghostel-module",
     "ghostel-prompt",
     "ghostel-wrap",
     "goto-char",
@@ -541,33 +491,33 @@ const interned_symbols = [_][:0]const u8{
     "insert",
     "italic",
     "keymap",
-    "light",
     "line",
-    "line-beginning-position",
-    "line-end-position",
+    "line-number-at-pos",
     "list",
     "mark-marker",
     "marker-position",
     "message",
     "min-width",
     "mouse-face",
-    "move-to-column",
     "nil",
     "nth",
     "numberp",
     "point",
     "point-max",
-    "point-min",
+    "pos-bol",
     "provide",
     "put-text-property",
-    "query-font",
     "selected-window",
     "set",
     "set-marker",
+    "set-window-point",
+    "set-window-start",
     "space",
     "symbol-value",
     "t",
     "wave",
+    "window-point",
+    "window-start",
 };
 
 fn SymbolCache(comptime symbols: []const [:0]const u8) type {

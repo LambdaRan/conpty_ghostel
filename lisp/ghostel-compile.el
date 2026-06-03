@@ -445,14 +445,12 @@ same as in any compilation buffer."
           (when ghostel-compile-debug
             (message "ghostel-compile: sentinel exit=%S status=%S"
                      exit (process-status process)))
-          ;; Flush pending bytes to the VT parser, then cancel any
-          ;; scheduled redraw and commit the current terminal state to
-          ;; the buffer synchronously.  Without this, a short-lived
+          ;; Cancel any scheduled redraw and commit the current terminal state
+		  ;; to the buffer synchronously.  Without this, a short-lived
           ;; command (`echo`, `false`, `exit 7`) finishes before the
           ;; ~16 ms redraw timer fires and its output is lost when
           ;; `--teardown-terminal' destroys the renderer.
           (when ghostel--term
-            (ghostel--flush-pending-output)
             (when ghostel--redraw-timer
               (cancel-timer ghostel--redraw-timer)
               (setq ghostel--redraw-timer nil))
@@ -635,9 +633,9 @@ resize hooks
       ;; minor-mode keymap takes precedence over the major-mode map
       ;; and the buffer-local map, so the keys work in both states.
       (ghostel-compile-toggle-mode 1)
-      ;; Disable OSC 2 title tracking so a compile command's title
-      ;; sequence can't rename the buffer mid-run.
-      (setq-local ghostel-set-title-function nil)
+      ;; Disable buffer-name tracking so a compile command's title or
+      ;; directory report can't rename the buffer mid-run.
+      (setq-local ghostel-buffer-name-function nil)
       ;; Disable password-prompt detection: `ghostel-compile--stty-flags'
       ;; runs the pty in `canonical+!echo' so the compile command isn't
       ;; double-echoed, but that's exactly the state libghostty's

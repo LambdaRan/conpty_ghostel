@@ -49,15 +49,19 @@ newest-first list aligns with the buffer-order regions."
       (push cwd ghostel--imenu-cwds))))
 
 (ert-deftest ghostel-test-shell-integration ()
-  "Test shell process with echo command."
+  "Test shell process command output and PTY echo."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-shell*")))
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
           (setq ghostel--term (ghostel--new 25 80 1000))
-          (let* ((process-environment
-                  (append (list "TERM=xterm-256color" "COLUMNS=80" "LINES=25")
+          (let* ((prompt "GHOSTEL_TEST_PROMPT>")
+                 (prompt-regexp (regexp-quote prompt))
+                 (process-environment
+                  (append (list "TERM=xterm-256color" "COLUMNS=80" "LINES=25"
+                                (concat "PROMPT=" prompt)
+                                (concat "PS1=" prompt))
                           process-environment))
                  (proc (make-process
                         :name "ghostel-test-sh"
@@ -71,14 +75,26 @@ newest-first list aligns with the buffer-order regions."
             (set-process-query-on-exit-flag proc nil)
             ;; Wait for shell init
             (ghostel-test--wait-for proc
-                                    (lambda () (ghostel--copy-all-text ghostel--term)) 10)
+                                    (lambda ()
+                                      (string-match-p prompt-regexp
+                                                      (or (ghostel--copy-all-text ghostel--term)
+                                                          "")))
+                                    10)
             (should (process-live-p proc))                ; shell process alive
 
-            ;; Run a command
-            (process-send-string proc "echo GHOSTEL_TEST_OK\n")
+            ;; Run a command and wait until the shell has printed the next
+            ;; prompt.  Matching only the command output races with the shell
+            ;; becoming ready for the following interactive input.  The quoted
+            ;; empty string keeps the echoed command from containing the exact
+            ;; output token.
+            (process-send-string proc "print -r -- GHOSTEL_''TEST_OK\n")
             (ghostel-test--wait-for proc
-                                    (lambda () (string-match-p "GHOSTEL_TEST_OK"
-                                                               (ghostel--copy-all-text ghostel--term))))
+                                    (lambda ()
+                                      (string-match-p
+                                       (concat "GHOSTEL_TEST_OK\\(?:.\\|\n\\)*"
+                                               prompt-regexp)
+                                       (or (ghostel--copy-all-text ghostel--term)
+                                           ""))))
             (let ((state (ghostel--copy-all-text ghostel--term)))
               (should (string-match-p "GHOSTEL_TEST_OK" state))) ; command output visible
 
@@ -158,7 +174,6 @@ newest-first list aligns with the buffer-order regions."
             (ghostel-test--wait-for proc
                                     (lambda () (not (string-match-p "abc"
                                                                     (ghostel--copy-all-text ghostel--term)))))
-            (ghostel--flush-pending-output)
             (let ((state (ghostel--copy-all-text ghostel--term)))
               (should (string-match-p "ab" state))
               (should-not (string-match-p "abc" state)))
@@ -588,9 +603,9 @@ below it."
               (set-process-query-on-exit-flag proc nil)
               (unwind-protect
                   (progn
-                    ;; Wait for the initial default prompt to land.
+                    ;; Wait for the initial default prompt to reach the terminal.
                     (ghostel-test--wait-for
-                     proc (lambda () ghostel--pending-output) 10)
+                     proc (lambda () (ghostel--copy-all-text ghostel--term)) 10)
                     ;; Source ghostel.zsh (registers precmd hooks + the
                     ;; zle-line-init widget).  Then strip the wrap function
                     ;; from `precmd_functions' so PROMPT is left untouched
@@ -606,9 +621,9 @@ below it."
                       "precmd_functions=(${precmd_functions:#__ghostel_ensure_prompt_wrap})\n"
                       "PROMPT=$'top-line\\nfinal-> '\n"
                       "\n"))
-                    ;; Poll the asserted state directly: flush +
-                    ;; redraw on each tick and stop once the cursor
-                    ;; row starts with "final-> ".  Earlier attempts
+                    ;; Poll the asserted state directly: redraw on each tick
+                    ;; and stop once the cursor row starts with "final-> ".
+                    ;; Earlier attempts
                     ;; raced on slow CI: byte-pattern waits matched
                     ;; the echoed PROMPT assignment before zsh had
                     ;; rendered the new prompt, and a `(point-min)'
@@ -619,7 +634,6 @@ below it."
                     (ghostel-test--wait-for
                      proc
                      (lambda ()
-                       (ghostel--flush-pending-output)
                        (let ((inhibit-read-only t))
                          (ghostel--redraw ghostel--term t))
                        (let ((pos ghostel--cursor-pos)
@@ -702,7 +716,7 @@ checks that the most recent prompt's `top-line' row carries the
               (unwind-protect
                   (progn
                     (ghostel-test--wait-for
-                     proc (lambda () ghostel--pending-output) 10)
+                     proc (lambda () (ghostel--copy-all-text ghostel--term)) 10)
                     ;; Source ghostel.zsh + register a fake p10k that
                     ;; both overrides PROMPT AND self-reorders to end
                     ;; each cycle (this is what `_p9k_precmd' does).
@@ -730,12 +744,10 @@ checks that the most recent prompt's `top-line' row carries the
                     (ghostel-test--wait-for
                      proc
                      (lambda ()
-                       (cl-some (lambda (s)
-                                  (string-match-p "PROBE_DONE" s))
-                                ghostel--pending-output))
+                       (string-match-p "PROBE_DONE"
+                                       (ghostel--copy-all-text ghostel--term)))
                      15)
                     (sleep-for 0.2)
-                    (ghostel--flush-pending-output)
                     (let ((inhibit-read-only t))
                       (ghostel--redraw ghostel--term t))
                     ;; After the rearrange settles, the WRAP fires INLINE
@@ -1876,8 +1888,7 @@ but the cursor is at the end of the REPL's prompt."
                      (lambda (key _mods &optional _utf8)
                        (setq encoded key)))
                     ((symbol-function 'ghostel--redraw) #'ignore)
-                    ((symbol-function 'ghostel--invalidate) #'ignore)
-                    ((symbol-function 'ghostel--scroll-bottom) #'ignore))
+                    ((symbol-function 'ghostel--invalidate) #'ignore))
             (ghostel-line-mode)
             (should (eq ghostel--input-mode 'line))
             (goto-char (marker-position ghostel--line-input-end))

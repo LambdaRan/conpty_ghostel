@@ -1,13 +1,13 @@
 .{
     .name = .ghostel,
-    .version = "0.31.0",
+    .version = "0.32.0",
     .paths = .{""},
     .fingerprint = 0x5a44bdd1198a0f4b,
     .dependencies = .{
         .ghostty = .{
             // Upstream URL for reference (used by Unix via Zig package manager):
-            // https://github.com/ghostty-org/ghostty/archive/01825411ab2720e47e6902e9464e805bc6a062a1.tar.gz
-            // hash: ghostty-1.3.2-dev-5UdBCzaaBwVjJOr-ltYINjybeEOAmLAauH5oq8-cdNGN
+            // https://github.com/ghostty-org/ghostty/archive/6246c288ae1087c8d67f75432a59da004b30bf25.tar.gz
+            // hash: ghostty-1.3.2-dev-5UdBC7zDFAUYSL6EmAqDQxvWQCma-1lZ9QTXws90lLV6
             // On Windows, Zig 0.15 subprocess can't resolve URL dependencies
             // (Run.zig:662 assertion). Use local vendor/ghostty path instead.
             // Keep vendor/ghostty at the same commit as the URL above.
