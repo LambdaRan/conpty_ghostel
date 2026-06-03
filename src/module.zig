@@ -147,7 +147,7 @@ const emacs_functions = [_]emacs.FunctionEntry{
         \\(ghostel--conpty-resize ID WIDTH HEIGHT)
         ,
         .impl = struct {
-            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) emacs.Value {
+            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
                 return fnConptyResize(env, args);
             }
         },
@@ -192,7 +192,7 @@ fn fnConptyResize(env: emacs.Env, args: [*c]emacs.Value) emacs.Value {
     };
 
     var id_buf: [64]u8 = undefined;
-    const id = env.extractString(args[0], &id_buf) orelse return env.nil();
+    const id = env.extractString(args[0], &id_buf) catch return env.nil();
     const width: u16 = @intCast(env.extractInteger(args[1]));
     const height: u16 = @intCast(env.extractInteger(args[2]));
 
