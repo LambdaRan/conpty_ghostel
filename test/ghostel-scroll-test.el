@@ -118,7 +118,7 @@ SPEC is (BUFFER TERM ANCHORED-WINDOW HISTORY-WINDOW)."
 																					  (let ((history-start-before (window-start history))
 								    (history-point-before (window-point history)))
 							  (ghostel--write-input term "extra\r\n")
-							  (ghostel--delayed-redraw buf)
+							  (ghostel--redraw-now buf)
 							  (should (ghostel-test-scroll--bottom-visible-p anchored))
 							  (should (= history-start-before (window-start history)))
 							  (should (= history-point-before (window-point history)))
@@ -133,7 +133,7 @@ SPEC is (BUFFER TERM ANCHORED-WINDOW HISTORY-WINDOW)."
 							  (ghostel--set-size term 6 40)
 							  (setq ghostel--term-rows 6)
 							  (setq ghostel--force-next-redraw t)
-							  (ghostel--delayed-redraw buf)
+							  (ghostel--redraw-now buf)
 							  (should (ghostel-test-scroll--bottom-visible-p anchored))
 							  (should (= history-start-before (window-start history)))
 							  (should (= history-point-before (window-point history)))
@@ -167,6 +167,63 @@ SPEC is (BUFFER TERM ANCHORED-WINDOW HISTORY-WINDOW)."
 							  (should (= history-start-before (window-start history)))
 							  (should (= history-point-before (window-point history)))
 							  (should-not (ghostel-test-scroll--bottom-visible-p history)))))
+
+(defun ghostel-test-scroll--set-gui-anchor-start (win)
+  "Park WIN's `window-start' at the GUI-anchored steady state.
+The graphical branch of `ghostel--anchor-window' parks `window-start' one
+line above the topmost grid row to make room for its partial-top-line
+vscroll, so a bottom-anchored GUI window has
+`ws-lines-to-end' = floor(window-screen-lines) + 1.  That branch is gated
+on `display-graphic-p', which is never true in batch, so set
+`window-start' directly to reproduce the same position."
+  (let* ((target (1+ (floor (with-selected-window win
+                              (window-screen-lines)))))
+         (start (save-excursion
+                  (goto-char (point-max))
+                  (forward-line (- target))
+                  (line-beginning-position))))
+    (set-window-start win start t)))
+
+(ert-deftest ghostel-test-window-anchored-p-survives-mode-line-toggle ()
+  "`ghostel--window-anchored-p' ignores the mode-line's height (issue #373).
+A GUI-anchored window's `window-start' sits floor(window-screen-lines)+1
+lines above `point-max'.  The predicate must judge it \"following output\"
+whether or not a mode-line is present.  Measuring the threshold from the
+full `window-pixel-height' (mode-line included) only worked because the
+mode-line donated the +1 line of slack; disabling it removed that slack
+and stranded the cursor off-screen.
+
+In batch the GUI anchor's `forward-line -1' (display-graphic-p only)
+cannot run, so `window-start' is set directly; toggling the mode-line in
+batch reproduces the GUI geometry shift (the window body grows by one line
+while `window-pixel-height' stays constant)."
+  :tags '(native)
+  (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+    (let ((win (selected-window)))
+      (ghostel-test-scroll--write-lines term "scroll" 60)
+      (ghostel--redraw term t)
+      ;; Control: mode-line present — an anchored window reads as following.
+      (ghostel-test-scroll--set-gui-anchor-start win)
+      (should (ghostel--window-anchored-p win))
+      ;; Disable the mode-line and let the geometry settle; the body grows
+      ;; by one line.  Re-derive the anchored `window-start' for the larger
+      ;; body and assert the predicate still follows.  (Fails on HEAD
+      ;; before the fix; passes after.)
+      (setq-local mode-line-format nil)
+      (redisplay t)
+      (ghostel-test-scroll--set-gui-anchor-start win)
+      (should (ghostel--window-anchored-p win)))))
+
+(ert-deftest ghostel-test-pixel-anchor-gate-matches-emacs-version ()
+  "`ghostel--pixel-anchor-supported-p' gates on the Emacs 29 cons FROM form.
+The cons-cell meaning of `window-text-pixel-size's FROM argument, which
+`ghostel--pixel-anchor' relies on, arrived in Emacs 29.  The predicate
+must therefore be nil on Emacs 28 (where a cons FROM signals
+`wrong-type-argument') and non-nil from Emacs 29 on.  This guards against
+regressing to a bare `fboundp' check, which is true on Emacs 28 because
+`window-text-pixel-size' has existed since Emacs 25 (issue #384)."
+  (should (eq (and ghostel--pixel-anchor-supported-p t)
+              (>= emacs-major-version 29))))
 
 (ert-deftest ghostel-test-second-window-does-not-disturb-scrollback ()
   "Opening another window on the buffer does not move a scrolled peer."
@@ -203,10 +260,10 @@ SPEC is (BUFFER TERM ANCHORED-WINDOW HISTORY-WINDOW)."
 					(line-beginning-position))))
 	    (set-window-start (selected-window) target-a t)
 	    (set-window-point (selected-window) target-a)
-	    (ghostel--delayed-redraw buf)
+	    (ghostel--redraw-now buf)
 	    (set-window-start (selected-window) target-b t)
 	    (set-window-point (selected-window) target-b)
-	    (ghostel--delayed-redraw buf)
+	    (ghostel--redraw-now buf)
 	    (should (= target-b (window-start)))
 	    (should (= target-b (window-point))))))
 
@@ -251,7 +308,7 @@ not enough; the pixel offset must also be cleared."
                        (lambda (win vscroll &optional pixels-p &rest _)
                          (should (eq pixels-p t))
                          (puthash win vscroll vscroll-by-window))))
-              (ghostel--delayed-redraw buf))
+              (ghostel--redraw-now buf))
             (should (= 0 (gethash (selected-window) vscroll-by-window)))))
       (when (buffer-live-p orig-buf)
         (set-window-buffer (selected-window) orig-buf))
@@ -259,7 +316,7 @@ not enough; the pixel offset must also be cleared."
 
 (ert-deftest ghostel-test-redraw-resets-vscroll-all-windows ()
   "Redraw resets `window-vscroll' on every window showing the buffer.
-`ghostel--delayed-redraw' iterates `get-buffer-window-list' so both
+`ghostel--redraw-now' iterates `get-buffer-window-list' so both
 windows must be anchored."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-vscroll-multi*"))
@@ -297,7 +354,7 @@ windows must be anchored."
                          (lambda (win vscroll &optional pixels-p &rest _)
                            (should (eq pixels-p t))
                            (puthash win vscroll vscroll-by-window))))
-                (ghostel--delayed-redraw buf))
+                (ghostel--redraw-now buf))
               (should (= 0 (gethash w1 vscroll-by-window)))
               (should (= 0 (gethash w2 vscroll-by-window))))))
       (set-window-configuration orig-config)
@@ -332,7 +389,7 @@ a user reading history should not be pulled around by live redraws."
                         (line-beginning-position))))
               (set-window-start (selected-window) vp t))
             (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
+            (ghostel--redraw-now buf)
             ;; Simulate the user scrolling into scrollback: both
             ;; window-start and point move above the viewport (that's
             ;; what real Emacs scrollers — pixel-scroll-precision,
@@ -342,7 +399,7 @@ a user reading history should not be pulled around by live redraws."
             (set-window-start (selected-window) (point-min) t)
             (cl-letf (((symbol-function 'set-window-vscroll)
                        (lambda (&rest _) (setq vscroll-called t))))
-              (ghostel--delayed-redraw buf))
+              (ghostel--redraw-now buf))
             (should-not vscroll-called)))
       (when (buffer-live-p orig-buf)
         (set-window-buffer (selected-window) orig-buf))
@@ -377,7 +434,7 @@ anchored because the window is at the viewport) must update it."
             ;; Simulate OSC 52;e leaving window-point stale.
             (set-window-point (selected-window) (point-min))
             (setq ghostel--force-next-redraw t)
-            (ghostel--delayed-redraw buf)
+            (ghostel--redraw-now buf)
             ;; Anchored window's window-point follows the cursor
             ;; (buffer-point after native redraw), not the stale value.
             (should (= (window-point (selected-window)) (point)))
@@ -475,23 +532,26 @@ rows in the viewport — with or without the trailing newline."
 
 (ert-deftest ghostel-test-scroll-on-input-paste ()
   "Paste scrolls the window to the live cursor."
-  (let (sent-text)
+  (let ((kill-ring '("hello"))
+        (kill-ring-yank-pointer nil)
+        sent-text)
     (ghostel-test--with-scroll-on-input-window t
-	    (cl-letf (((symbol-function 'ghostel--bracketed-paste-p)
-			      (lambda () nil))
-			    ((symbol-function 'process-live-p)
-			  (lambda (_process) t))
-			    ((symbol-function 'process-send-string)
-			  (lambda (_process string)
-			    (setq sent-text string))))
-	    (ghostel--paste-text "hello"))
-	    (should (equal "hello" sent-text))
-	    (should (> (window-start) (point-min))))))
+      (cl-letf (((symbol-function 'ghostel--bracketed-paste-p)
+                 (lambda () nil))
+                ((symbol-function 'process-live-p)
+                 (lambda (_process) t))
+                ((symbol-function 'process-send-string)
+                 (lambda (_process string)
+                   (setq sent-text string))))
+        (ghostel-paste))
+      (should (equal "hello" sent-text))
+      (should (> (window-start) (point-min))))))
 
 (ert-deftest ghostel-test-emacs-mode-yank-scrolls-to-live-cursor ()
   "Yanking in Emacs mode scrolls the window to the live cursor."
   (let ((kill-ring '("hello"))
         (kill-ring-yank-pointer nil)
+        (ghostel-readonly-fast-exit nil)
         sent-text)
     (ghostel-test--with-scroll-on-input-window t
 	    (setq ghostel--input-mode 'emacs)

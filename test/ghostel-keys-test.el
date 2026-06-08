@@ -92,6 +92,9 @@ Covers punctuation, digits, uppercase, space, and lowercase letters."
         (sim (aref (kbd "C-S-<return>") 0) "return"   "ctrl,shift")
         (sim (aref (kbd "M-.") 0)  "."  "meta")
         (sim (aref (kbd "M-1") 0)  "1"  "meta")
+        ;; Control + non-letter punctuation decomposes to base + ctrl.
+        (sim ?\C-]      "]" "ctrl")
+        (sim ?\M-\C-]   "]" "ctrl,meta")
         ;; backtab (Emacs's name for S-TAB)
         (sim (aref (kbd "<backtab>") 0)   "tab"       "shift")))))
 
@@ -155,7 +158,7 @@ Covers punctuation, digits, uppercase, space, and lowercase letters."
       (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
                 ((symbol-function 'ghostel--write-input)
                  (lambda (_term data) (setq written data)))
-                ((symbol-function 'ghostel--delayed-redraw)
+                ((symbol-function 'ghostel--redraw-now)
                  (lambda (_buf) (setq immediate-called t)))
                 ((symbol-function 'ghostel--invalidate)
                  (lambda () (setq invalidate-called t))))
@@ -182,7 +185,7 @@ Covers punctuation, digits, uppercase, space, and lowercase letters."
       (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
                 ((symbol-function 'ghostel--write-input)
                  (lambda (_term data) (setq written data)))
-                ((symbol-function 'ghostel--delayed-redraw)
+                ((symbol-function 'ghostel--redraw-now)
                  (lambda (_buf) (setq immediate-called t)))
                 ((symbol-function 'ghostel--invalidate)
                  (lambda () (setq invalidate-called t))))
@@ -207,7 +210,7 @@ Covers punctuation, digits, uppercase, space, and lowercase letters."
       (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
                 ((symbol-function 'ghostel--write-input)
                  (lambda (_term data) (setq written data)))
-                ((symbol-function 'ghostel--delayed-redraw)
+                ((symbol-function 'ghostel--redraw-now)
                  (lambda (_buf) (setq immediate-called t)))
                 ((symbol-function 'ghostel--invalidate)
                  (lambda () (setq invalidate-called t))))
@@ -231,7 +234,7 @@ Covers punctuation, digits, uppercase, space, and lowercase letters."
       (cl-letf (((symbol-function 'process-buffer) (lambda (_) buf))
                 ((symbol-function 'ghostel--write-input)
                  (lambda (_term data) (setq written data)))
-                ((symbol-function 'ghostel--delayed-redraw)
+                ((symbol-function 'ghostel--redraw-now)
                  (lambda (_buf) (setq immediate-called t)))
                 ((symbol-function 'ghostel--invalidate)
                  (lambda () (setq invalidate-called t))))
@@ -395,6 +398,38 @@ where the ordering invariant lives."
   (should (eq (lookup-key ghostel-readonly-fast-exit-mode-map (kbd "C-g"))
               #'ghostel-readonly-exit)))
 
+(ert-deftest ghostel-test-c-c-fast-exits-before-sending ()
+  "The interrupt prefix exits copy/Emacs mode before forwarding."
+  (let ((call-order nil)
+        (send-args nil)
+        (ghostel--input-mode 'copy)
+        (ghostel-readonly-fast-exit t))
+    (cl-letf (((symbol-function 'ghostel-readonly-exit)
+               (lambda () (push 'exit call-order)))
+              ((symbol-function 'ghostel--send-encoded)
+               (lambda (key mods &rest _)
+                 (setq send-args (list key mods))
+                 (push 'send call-order))))
+      (ghostel-send-C-c)
+      (should (equal '(send exit) call-order))
+      (should (equal '("c" "ctrl") send-args)))))
+
+(ert-deftest ghostel-test-c-c-no-fast-exit-stays-readonly ()
+  "The interrupt prefix stays in copy/Emacs mode when fast exit is off."
+  (let ((exit-called nil)
+        (ghostel--input-mode 'copy)
+        (ghostel-readonly-fast-exit nil))
+    (cl-letf (((symbol-function 'ghostel-readonly-exit)
+               (lambda () (setq exit-called t)))
+              ((symbol-function 'ghostel--send-encoded) #'ignore))
+      (ghostel-send-C-c)
+      (should-not exit-called))))
+
+(ert-deftest ghostel-test-c-c-fast-exit-binding ()
+  "The fast-exit map still routes the interrupt prefix through its command."
+  (should (eq (lookup-key ghostel-readonly-fast-exit-mode-map (kbd "C-c C-c"))
+              #'ghostel-send-C-c)))
+
 (ert-deftest ghostel-test-inhibit-quit ()
   "`ghostel-mode' should set `inhibit-quit' buffer-locally."
   (let ((buf (generate-new-buffer " *ghostel-test-inhibit-quit*")))
@@ -492,6 +527,57 @@ instead of running Emacs commands like `forward-sexp'."
           (should-not (eq binding #'ghostel--send-event))
         (should (eq binding #'ghostel--send-event))))))
 
+(ert-deftest ghostel-test-control-punct-key-bindings ()
+  "Control + non-letter keys route to `ghostel--send-event' in semi-char.
+C-] and C-/ previously fell through to Emacs (C-] = `abort-recursive-edit',
+C-/ = `undo') instead of reaching the shell/readline.  Only the keys that
+the ghostty encoder maps to a terminal byte are forwarded."
+  (dolist (key-str '("C-]" "C-/"))
+    (should (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
+                #'ghostel--send-event)))
+  ;; Deliberately NOT forwarded (no terminal byte / would shadow Emacs):
+  ;; C-^ / C-_ aren't encodable; C-,/C-. have no C0 byte; C-0..C-9 are
+  ;; `digit-argument'.  These must keep their non-send-event resolution.
+  (dolist (key-str '("C-^" "C-_" "C-," "C-." "C-0" "C-9"))
+    (should-not (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
+                    #'ghostel--send-event)))
+  ;; C-\ stays a default exception in semi-char (falls through to Emacs).
+  (should-not (eq (lookup-key ghostel-semi-char-mode-map (kbd "C-\\"))
+                  #'ghostel--send-event))
+  ;; C-@ keeps its explicit NUL lambda (not send-event).
+  (should (commandp (lookup-key ghostel-semi-char-mode-map (kbd "C-@"))))
+  ;; ESC (C-[) must NOT be hijacked or TTY escape decoding breaks.
+  (should-not (eq (lookup-key ghostel-semi-char-mode-map (kbd "C-["))
+                  #'ghostel--send-event))
+  ;; The ESC-prefix CSI/SS3 forms (ESC [ and ESC O) used by TTY input
+  ;; decoding for arrows/function keys must stay unbound here.
+  (should-not (eq (lookup-key ghostel-semi-char-mode-map [27 ?\[])
+                  #'ghostel--send-event))
+  (should-not (eq (lookup-key ghostel-semi-char-mode-map [27 ?O])
+                  #'ghostel--send-event))
+  ;; M-# (and the rest of the M-<punct> sweep) keeps working.
+  (should (eq (lookup-key ghostel-semi-char-mode-map (kbd "M-#"))
+              #'ghostel--send-event)))
+
+(ert-deftest ghostel-test-control-meta-punct-key-bindings ()
+  "Control-Meta + non-letter keys route to `ghostel--send-event'."
+  (dolist (key-str '("C-M-]" "C-M-/"))
+    (should (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
+                #'ghostel--send-event))))
+
+(ert-deftest ghostel-test-control-punct-char-mode ()
+  "Char mode forwards C-]/C-/ but keeps the explicit C-\\ lambda."
+  (dolist (key-str '("C-]" "C-/" "C-M-]" "C-M-/"))
+    (should (eq (lookup-key ghostel-char-mode-map (kbd key-str))
+                #'ghostel--send-event)))
+  ;; C-\ in char mode keeps its explicit \x1c lambda (not send-event).
+  (should (commandp (lookup-key ghostel-char-mode-map (kbd "C-\\"))))
+  (should-not (eq (lookup-key ghostel-char-mode-map (kbd "C-\\"))
+                  #'ghostel--send-event))
+  ;; ESC still must not be hijacked in char mode either.
+  (should-not (eq (lookup-key ghostel-char-mode-map (kbd "C-["))
+                  #'ghostel--send-event)))
+
 (ert-deftest ghostel-test-encode-key-legacy-control-meta ()
   "Control-Meta letter chords encode to ESC + control byte in legacy mode.
 Regression test for issue #239: these byte sequences match readline
@@ -507,6 +593,26 @@ Regression test for issue #239: these byte sequences match readline
       (setq sent nil)
       (should (ghostel--encode-key term "v" "ctrl,meta" nil))
       (should (equal "\e\x16" sent)))))
+
+(ert-deftest ghostel-test-encode-key-legacy-control-punct ()
+  "Control punctuation encodes to the correct C0 byte in legacy mode.
+C-] is the headline case (-> 0x1d); C-/ -> 0x1f.  Control-Meta prepends
+ESC, matching the bytes eat sends.  (Only the punctuation the ghostty
+encoder recognizes is forwarded; see `ghostel--define-terminal-keys'.)"
+  :tags '(native)
+  (let* ((term (ghostel--new 25 80 1000))
+         (sent nil))
+    (cl-letf (((symbol-function 'ghostel--flush-output)
+               (lambda (data) (setq sent data))))
+      (pcase-dolist (`(,name ,bytes) '(("]" "\x1d") ("/" "\x1f")))
+        (setq sent nil)
+        (should (ghostel--encode-key term name "ctrl" nil))
+        (should (equal bytes sent)))
+      ;; Control-Meta prepends ESC: C-M-] -> 0x1b 0x1d, C-M-/ -> 0x1b 0x1f.
+      (pcase-dolist (`(,name ,bytes) '(("]" "\e\x1d") ("/" "\e\x1f")))
+        (setq sent nil)
+        (should (ghostel--encode-key term name "ctrl,meta" nil))
+        (should (equal bytes sent))))))
 
 (ert-deftest ghostel-test-send-encoded-meta-period ()
   "M-. sends ESC + period via raw fallback (legacy alt encoding)."

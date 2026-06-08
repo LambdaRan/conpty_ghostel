@@ -330,7 +330,7 @@ cursor one row and would stack the lines diagonally."
     (when ghostel--redraw-timer
       (cancel-timer ghostel--redraw-timer)
       (setq ghostel--redraw-timer nil))
-    (ghostel--delayed-redraw (current-buffer))))
+    (ghostel--redraw-now (current-buffer))))
 
 (defun ghostel-compile--finalize (buffer exit end-time)
   "Insert header/footer, parse errors, switch major mode for BUFFER.
@@ -357,6 +357,7 @@ same as in any compilation buffer."
                (command ghostel-compile--command)
                (directory ghostel-compile--directory)
                (footer (ghostel-compile--footer-text exit start-time end-time))
+               (msg (ghostel-compile--status-message exit))
                (inhibit-read-only t))
           (setq ghostel-compile--last-exit exit)
           (when ghostel-compile-debug
@@ -365,6 +366,10 @@ same as in any compilation buffer."
           (when start
             (ghostel-compile--trim-trailing-blanks start))
           (ghostel-compile--teardown-terminal)
+          ;; Run standard compilation finish hooks before switching major mode:
+          ;; callers may install buffer-local hooks or continuation state, and
+          ;; `funcall' below kills those locals as part of the mode change.
+          (run-hook-with-args 'compilation-finish-functions buffer msg)
           ;; Switch major mode now that the process is dead.  Preserve state
           ;; that `kill-all-local-variables' would otherwise wipe.  A
           ;; per-buffer override (set by the `compilation-start' advice
@@ -376,8 +381,10 @@ same as in any compilation buffer."
                  (saved-start-time start-time)
                  (saved-directory directory)
                  (saved-interactive ghostel-compile--interactive)
+                 (saved-compilation-arguments-local
+                  (local-variable-p 'compilation-arguments))
                  (saved-compilation-arguments
-                  (and (local-variable-p 'compilation-arguments)
+                  (and saved-compilation-arguments-local
                        compilation-arguments))
                  (target-mode (or ghostel-compile--view-mode-override
                                   ghostel-compile-finished-major-mode)))
@@ -428,9 +435,8 @@ same as in any compilation buffer."
         (ghostel-compile--set-mode-line-exit exit)
         (setq next-error-last-buffer buffer)
         (ghostel-compile--auto-jump buffer)
-        (let ((msg (ghostel-compile--status-message exit)))
-          (run-hook-with-args 'compilation-finish-functions buffer msg)
-          (run-hook-with-args 'ghostel-compile-finish-functions buffer msg))))))
+        (run-hook-with-args 'ghostel-compile-finish-functions
+                            buffer (ghostel-compile--status-message exit))))))
 
 
 ;;; Spawning
@@ -454,7 +460,7 @@ same as in any compilation buffer."
             (when ghostel--redraw-timer
               (cancel-timer ghostel--redraw-timer)
               (setq ghostel--redraw-timer nil))
-            (ghostel--delayed-redraw buffer))
+            (ghostel--redraw-now buffer))
           (setq compilation-in-progress
                 (delq process compilation-in-progress))
           (when (fboundp 'compilation--update-in-progress-mode-line)

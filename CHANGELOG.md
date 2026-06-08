@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-06-04
+
+### Changed
+- OSC 7 directory reports now only update the buffer directory when the
+  reported directory actually changes, avoiding redundant directory-change
+  work.
+
+### Fixed
+- Updated libghostty, fixing rendering of emoji such as the pilot emoji.
+- Immediate redraws now clear pending redraw timer bookkeeping, avoiding stale
+  delayed-redraw state.
+
+### Internal
+- Kitty graphics Elisp was split into `ghostel-kitty.el`.
+- Native module internals were simplified: CRLF patching moved into the handler
+  path, Emacs API helper/registration code was refactored, and `sys.zig` was
+  removed.
+- Flaky compile and shell tests were hardened.
+
 ## [0.32.0] — 2026-06-02
 
 ### Added
