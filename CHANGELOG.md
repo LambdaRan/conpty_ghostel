@@ -4,6 +4,59 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-06-08
+
+### Added
+- `ghostel-ime-mode`, an opt-in buffer-local minor mode that forwards text
+  committed by Emacs Lisp input methods — Quail-style methods such as Korean
+  Hangul, and Japanese/Chinese — to the PTY, so characters committed by a
+  direct `self-insert-command` reach the shell instead of being erased on the
+  next redraw.  Enable with `:hook (ghostel-mode . ghostel-ime-mode)`.  Core
+  gains a generic `ghostel-inhibit-redraw-functions` hook to defer redraws
+  mid-composition.
+- Undo now works on the input line during line-mode; renderer and internal
+  line-mode buffer mutations are shielded from the undo list.
+
+### Changed
+- A plain single left-click in an already-selected window now switches input
+  mode per `ghostel-mouse-drag-input-mode` (default `copy`), restoring
+  click-to-copy.  A click that focuses a previously-unselected window stays a
+  pure focus click and snaps point to the live cursor.  Set
+  `ghostel-mouse-drag-input-mode` to nil for standard click-sets-point.
+- Line-mode can now be entered at an OSC 133 shell prompt on the alternate
+  screen (for example a prompt inside tmux/screen); `C-u C-c C-l` forces entry,
+  otherwise line-mode arms and advertises the override.
+- `C-]`, `C-/`, and their `C-M-` variants are now forwarded to the shell in
+  semi-char/char mode (readline character-search and undo) instead of being
+  captured by Emacs (#380).
+- Read-only mode now exits immediately on explicit input.
+
+### Fixed
+- Bare LF on the primary screen now preserves the cursor column instead of
+  being normalized to CRLF.  The emulator no longer synthesizes a carriage
+  return: cooked-mode `\n` is turned into CRLF by the PTY's ONLCR (enabled by
+  `stty sane` in the spawn wrapper), and raw-mode applications that emit a bare
+  LF mean a column-preserving linefeed.  This fixes inline TUIs (bubbletea /
+  lipgloss apps such as the Antigravity `agy` CLI) whose banners position with
+  column-preserving LF plus relative cursor-back, which previously collapsed to
+  the left margin (#388).
+- ghostel buffers now redraw immediately when shown, avoiding a stale display.
+- Viewport anchoring no longer breaks when the mode-line is disabled in a GUI
+  buffer; the "still anchored" threshold is now measured from the window body
+  instead of the whole window (#373).
+- Window pixel anchoring falls back to line-count anchoring on GUI Emacs 28,
+  where the Emacs 29 cons `FROM` argument to `window-text-pixel-size` is
+  unsupported and previously broke the anchor.
+- `q` no longer leaks `kill-current-buffer` into the shared semi-char keymap
+  after an eshell visual command exits (#372).
+- `compilation-finish-functions` now run before ghostel's final mode switch, so
+  buffer-local continuation state installed by those hooks survives.
+- Corrected the `ghostel-eval-cmds` defcustom type.
+
+### Internal
+- Added glyph metrics caching and switched window pixel anchoring to accurate
+  text metrics.
+
 ## [0.33.0] — 2026-06-04
 
 ### Changed
