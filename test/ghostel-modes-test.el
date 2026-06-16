@@ -774,5 +774,147 @@ Exiting returns to whatever mode the user was in beforehand, mirroring
               (should-not buffer-read-only))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-mark-activation-enters-copy-mode ()
+  "Activating the mark in semi-char enters copy mode; the region survives."
+  (let ((buf (generate-new-buffer " *ghostel-test-mark-copy*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term 'fake)
+                (ghostel--redraw-timer nil)
+                (ghostel-mark-activation-input-mode 'copy)
+                ;; Batch Emacs has no transient-mark-mode, which makes
+                ;; the `deactivate-mark' on exit a no-op.
+                (transient-mark-mode t))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore)
+                      ((symbol-function 'ghostel--anchor-window) #'ignore))
+              (insert "some terminal output")
+              (goto-char 5)
+              ;; Any mark-activating command works; C-SPC's is the canonical one.
+              (set-mark-command nil)
+              (should (eq ghostel--input-mode 'copy))
+              (should (= (mark) 5))
+              (should mark-active)
+              ;; Exiting returns to semi-char and drops the region.
+              (ghostel-readonly-exit)
+              (should (eq ghostel--input-mode 'semi-char))
+              (should-not mark-active))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-mark-activation-enters-emacs-mode ()
+  "With `ghostel-mark-activation-input-mode' set to `emacs', Emacs mode."
+  (let ((buf (generate-new-buffer " *ghostel-test-mark-emacs*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term 'fake)
+                (ghostel--redraw-timer nil)
+                (ghostel-mark-activation-input-mode 'emacs))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore)
+                      ((symbol-function 'ghostel--anchor-window) #'ignore))
+              (set-mark-command nil)
+              (should (eq ghostel--input-mode 'emacs))
+              (should (= (mark) (point)))
+              (should mark-active))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-mark-activation-nil-stays-semi-char ()
+  "With `ghostel-mark-activation-input-mode' nil, no mode switch happens."
+  (let ((buf (generate-new-buffer " *ghostel-test-mark-nil*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term 'fake)
+                (ghostel-mark-activation-input-mode nil))
+            (set-mark-command nil)
+            (should (eq ghostel--input-mode 'semi-char))
+            (should mark-active)))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-mark-activation-only-in-semi-char ()
+  "Mark activation in char or copy mode does not switch (or toggle) modes."
+  (let ((buf (generate-new-buffer " *ghostel-test-mark-other-modes*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term 'fake)
+                (ghostel--redraw-timer nil)
+                (ghostel-mark-activation-input-mode 'copy))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore)
+                      ((symbol-function 'ghostel--anchor-window) #'ignore))
+              ;; Char mode: marking must not yank the user out of the TUI.
+              (ghostel-char-mode)
+              (push-mark (point) t t)
+              (should (eq ghostel--input-mode 'char))
+              (ghostel-semi-char-mode)
+              ;; Copy mode: marking must not toggle copy mode back off.
+              (ghostel-copy-mode)
+              (push-mark (point) t t)
+              (should (eq ghostel--input-mode 'copy)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-mark-activation-mouse-knob-wins ()
+  "A mouse drag follows `ghostel-mouse-drag-input-mode', not the mark knob."
+  (let ((buf (generate-new-buffer " *ghostel-test-mark-mouse*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term 'fake)
+                (ghostel--redraw-timer nil)
+                (ghostel-mouse-drag-input-mode 'emacs)
+                (ghostel-mark-activation-input-mode 'copy))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore)
+                      ((symbol-function 'ghostel--anchor-window) #'ignore)
+                      ((symbol-function 'ghostel--mouse-tracking-active-p)
+                       (lambda () nil))
+                      ;; The real mouse-set-region activates the mark.
+                      ((symbol-function 'mouse-set-region)
+                       (lambda (_event) (push-mark (point) t t))))
+              ;; A real drag selecting a region (distinct start/end points).
+              ;; `this-command' is what the command loop binds when dispatching
+              ;; the drag; `ghostel--mark-activated' reads it to stay out of
+              ;; mouse gestures, so the test must set it like a real dispatch.
+              (let ((this-command 'ghostel-mouse-drag-or-set-region))
+                (ghostel-mouse-drag-or-set-region
+                 `(drag-mouse-1 (,(selected-window) 1 (1 . 1) 0)
+                                (,(selected-window) 5 (5 . 1) 0))))
+              ;; The mouse knob picked the mode — the hook stayed out.
+              (should (eq ghostel--input-mode 'emacs)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-mark-activation-ignores-focus-click ()
+  "A focus click on an unselected window must not freeze into copy mode.
+Selecting a previously-unselected window via `mouse-drag-region' leaves an
+empty region active; the command loop finalizes that activation after the
+press handler returns, with `this-command' still the press command.
+`ghostel--mark-activated' must ignore it so the focus click stays in
+semi-char."
+  (let ((buf (generate-new-buffer " *ghostel-test-mark-focus-click*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (let ((ghostel--term 'fake)
+                (ghostel--redraw-timer nil)
+                (ghostel-mark-activation-input-mode 'copy)
+                ;; The deferred activation runs with `this-command' bound to
+                ;; the press command that triggered the click gesture.
+                (this-command 'ghostel-mouse-press-or-copy-mode))
+            (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore)
+                      ((symbol-function 'ghostel--anchor-window) #'ignore))
+              (insert "some terminal output")
+              ;; An empty region (point == mark), like a window-selecting click.
+              (push-mark (point) t t)
+              (should (eq ghostel--input-mode 'semi-char)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-ctrl-space-keybindings ()
+  "Char mode captures both Ctrl+Space events; semi-char only TTY `C-@'.
+GUI `C-SPC' must stay unbound in semi-char so it falls through to the
+global mark command, whose activation `ghostel--mark-activated' handles."
+  (should-not (lookup-key ghostel-semi-char-mode-map (kbd "C-SPC")))
+  (should (functionp (lookup-key ghostel-semi-char-mode-map (kbd "C-@"))))
+  (dolist (key '("C-SPC" "C-@"))
+    (should (functionp (lookup-key ghostel-char-mode-map (kbd key))))))
+
 (provide 'ghostel-modes-test)
 ;;; ghostel-modes-test.el ends here

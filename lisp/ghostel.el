@@ -788,7 +788,18 @@ Customize the faces `ghostel-fake-cursor' and
 
 Has no effect when a DEC mouse-tracking mode (1000/1002/1003) is
 active (the press is forwarded to the program) or when the buffer
-is not in semi-char-mode when the gesture completes."
+is not in semi-char-mode when the gesture completes.
+A click that focuses the window or its frame never switches mode."
+  :type '(choice (const :tag "Copy mode (default)" copy)
+                 (const :tag "Emacs mode"          emacs)
+                 (const :tag "Do not switch"       nil)))
+
+(defcustom ghostel-mark-activation-input-mode 'copy
+  "Input mode to switch to when the mark becomes active in semi-char mode.
+Triggered by any command that activates the region, e.g. `set-mark-command',
+expand-region variants, `mark-whole-buffer', `exchange-point-and-mark'.
+
+Mouse selection is governed separately by `ghostel-mouse-drag-input-mode'."
   :type '(choice (const :tag "Copy mode (default)" copy)
                  (const :tag "Emacs mode"          emacs)
                  (const :tag "Do not switch"       nil)))
@@ -1566,7 +1577,7 @@ Matches Ghostty 1.2.0's `bold-color' configuration."
   "The position of the terminal cursor in the buffer.")
 
 (defvar-local ghostel--rendered-font nil
-  "The font last used for rendering. Internally used by native code.")
+  "The font last used for rendering.  Internally used by native code.")
 
 (defvar ghostel--query-font-cache nil
   "Dynamically bound cache for `query-font' during one native redraw.")
@@ -1801,12 +1812,16 @@ When NO-EXCEPTIONS is non-nil, also bind the keys in
   ;; the `[M-backspace]' symbol path; without this binding, TTY
   ;; Alt-Backspace falls through to global `backward-kill-word'.
   (define-key map (kbd "M-DEL") #'ghostel--send-event)
-  ;; C-@ (NUL, same as C-SPC) — used by programs like Emacs-in-terminal
+  ;; Ctrl+Space is NUL. A TTY delivers it as `C-@'.  GUI Emacs as the distinct
+  ;; event `C-SPC', which only char mode captures.  In semi-char `C-SPC' falls
+  ;; through to the global map so mark commands run there.
   (define-key map (kbd "C-@")
               (lambda () (interactive) (ghostel--send-string "\x00")))
   ;; Char mode extras: also bind non-letter exception keys so nothing
   ;; gets stolen by Emacs while a TUI app runs.
   (when no-exceptions
+    (define-key map (kbd "C-SPC")
+                (lambda () (interactive) (ghostel--send-string "\x00")))
     (define-key map (kbd "C-\\")
                 (lambda () (interactive) (ghostel--send-string "\x1c")))
     (define-key map (kbd "M-:") #'ghostel--send-event)))
@@ -2123,11 +2138,15 @@ Falls back to raw escape sequences if the encoder doesn't produce output."
 Returns the sequence string, or nil for unknown keys."
   (let ((mod-num (ghostel--modifier-number mods)))
     (cond
-     ;; Ctrl + single letter
+     ;; Ctrl + a single ASCII char with a C0 control code.  Both a-z and
+     ;; the @ A-Z [ \ ] ^ _ range fold to (char & #x1f): ctrl-a=1,
+     ;; ctrl-z=26, ctrl-^=#x1e, ctrl-_=#x1f (readline / zle undo).
      ((and (= (length key-name) 1)
-           (<= ?a (aref key-name 0)) (<= (aref key-name 0) ?z)
+           (let ((c (aref key-name 0)))
+             (or (and (<= ?a c) (<= c ?z))
+                 (and (<= ?@ c) (<= c ?_))))
            (> (logand mod-num 4) 0))        ; ctrl bit
-      (string (- (aref key-name 0) 96)))    ; ctrl-a=1, ctrl-z=26
+      (string (logand (aref key-name 0) #x1f)))
      ;; Meta + printable ASCII → ESC + char (legacy alt encoding)
      ((and (= (length key-name) 1)
            (let ((c (aref key-name 0)))
@@ -2496,9 +2515,9 @@ Return non-nil if the event was forwarded (mouse tracking is active)."
 ;;; Mouse input
 
 (defvar ghostel--mouse-press-was-selected nil
-  "Non-nil if the window under the last left-press was already selected.
-Set at press, read at release to tell a focus click (which only focuses)
-from a click in an already-focused window (which enters copy mode).")
+  "Non-nil if the last left-press hit an already-selected window.
+Nil also when the press is the click that focused the frame.  Read
+at release to tell a focus click from an interaction click.")
 
 (defvar-local ghostel--mouse-drag-button nil
   "Button number held during an in-progress mouse-tracking drag.
@@ -2657,24 +2676,36 @@ to consume mouse input."
   "Forward EVENT to the terminal, or hand off to `mouse-drag-region'.
 With a DEC mouse-tracking mode (1000/1002/1003) on, forwards the press
 to the program; otherwise hands off to `mouse-drag-region'.  Records in
-`ghostel--mouse-press-was-selected' whether the window was already
-selected before focusing it, for `ghostel-mouse-release-or-set-point'."
+`ghostel--mouse-press-was-selected' whether the window was already selected,
+in an already-focused frame, before focusing it, for
+`ghostel-mouse-release-or-set-point'."
   (interactive "e")
-  (let ((win (posn-window (event-start event))))
-    (setq ghostel--mouse-press-was-selected (eq win (selected-window)))
+  (let* ((win (posn-window (event-start event)))
+         (frame (window-frame win))
+         ;; First press since the frame gained focus, or press dispatched
+         ;; before the focus-in (nil, not `unknown'): a focus click.
+         (refocused (or (frame-parameter frame 'ghostel--frame-refocused)
+                        (null (frame-focus-state frame)))))
+    (set-frame-parameter frame 'ghostel--frame-refocused nil)
+
+    (setq ghostel--mouse-press-was-selected
+          (and (eq win (selected-window)) (not refocused)))
     (select-window win)
     (if (ghostel--mouse-tracking-active-p)
         (ghostel--mouse-press event)
+      ;; `mouse-drag-region' activates the mark mid-drag; the release
+      ;; handler picks the input mode.  `ghostel--mark-activated' ignores
+      ;; activations made under the mouse handlers, so the hook stays out of it.
       (mouse-drag-region event))))
 
 (defun ghostel-mouse-release-or-set-point (event &optional promote-to-region)
   "Forward EVENT to the terminal, or set point / switch input mode.
 With tracking off, sets point (PROMOTE-TO-REGION keeps the word/line
 selection of a multi-click) and, in semi-char mode, switches to
-`ghostel-mouse-drag-input-mode' after a multi-click or a single click
-in an already-selected window.  A single click that only focuses a
-previously-unselected window instead snaps point to the live cursor and
-stays in semi-char (skipped when `ghostel-mouse-drag-input-mode' is nil)."
+`ghostel-mouse-drag-input-mode' after a multi-click or a single click in an
+already-selected window.  A single click that only focuses a previously
+unselected window or frame instead snaps point to the live cursor and stays
+in semi-char (skipped when `ghostel-mouse-drag-input-mode' is nil)."
   (interactive "e\np")
   (let ((active (and ghostel-mouse-drag-input-mode
                      (eq ghostel--input-mode 'semi-char))))
@@ -2705,15 +2736,24 @@ handler so the selection survives release; without this,
 `mouse-drag-track's exit hook deactivates the mark and our
 intercept keeps `mouse-set-region' from re-establishing the region.
 When the buffer is in semi-char mode, switches input mode once the
-region is set to mode configured in `ghostel-mouse-drag-input-mode'."
+region is set to the mode configured in `ghostel-mouse-drag-input-mode'.
+An empty drag (a click that wiggled into a drag event without selecting
+anything) is dispatched to `ghostel-mouse-release-or-set-point',
+so a focus click stays in semi-char like a plain click."
   (interactive "e")
-  (if (ghostel--mouse-tracking-active-p)
-      (ghostel--mouse-drag event)
+  (cond
+   ((ghostel--mouse-tracking-active-p)
+    (ghostel--mouse-drag event))
+   ;; An empty drag selected nothing: the wiggle was really a click
+   ((eq (posn-point (event-start event))
+        (posn-point (event-end event)))
+    (ghostel-mouse-release-or-set-point event))
+   (t
     (mouse-set-region event)
     (when (eq ghostel--input-mode 'semi-char)
       (pcase ghostel-mouse-drag-input-mode
         ('copy  (ghostel-copy-mode))
-        ('emacs (ghostel-emacs-mode))))))
+        ('emacs (ghostel-emacs-mode)))))))
 
 (defun ghostel-mouse-down-2-or-noop (event)
   "Forward EVENT to the terminal when a mouse-tracking mode is on.
@@ -3086,6 +3126,23 @@ returns to whichever input mode was active before."
     (ghostel--enter-readonly 'copy t ":Copy"
                              "Copy mode: Press any key to exit")))
 
+(defun ghostel--mark-activated ()
+  "Switch input mode when the region becomes active in semi-char mode.
+On buffer-local `activate-mark-hook'; the keyboard analog of
+`ghostel-mouse-drag-or-set-region'.  Runs after the activating
+command set the region, so the selection survives the switch."
+  ;; Mouse gestures pick the input mode in the mouse handlers themselves; the
+  ;; command loop can finalize their (often empty) mark activation after the
+  ;; handler has returned, so gate on the originating command rather than a
+  ;; dynamic binding the activation outlives.
+  (when (and (not (memq this-command '(ghostel-mouse-press-or-copy-mode
+                                       ghostel-mouse-release-or-set-point
+                                       ghostel-mouse-drag-or-set-region)))
+             (eq ghostel--input-mode 'semi-char))
+    (pcase ghostel-mark-activation-input-mode
+      ('copy  (ghostel-copy-mode))
+      ('emacs (ghostel-emacs-mode)))))
+
 (defun ghostel-readonly-exit ()
   "Exit copy or Emacs mode and return to the mode active before entry."
   (interactive)
@@ -3095,13 +3152,12 @@ returns to whichever input mode was active before."
       (setq ghostel--pre-readonly-mode nil)
       ;; Return to the live viewport before reenabling terminal input.
       (goto-char (point-max))
-      ;; Force the anchor even when DEC 2026 synchronized output is active.
-      (ghostel--anchor-window)
       (setq ghostel--force-next-redraw t)
       (pcase target
         ('char  (ghostel-char-mode))
         ('emacs (ghostel-emacs-mode))
         (_      (ghostel-semi-char-mode)))
+      (ghostel--anchor-window)
       (ghostel-force-redraw))
     (message "Read-only mode exited")))
 
@@ -4130,6 +4186,16 @@ semi-char/char mode never hijacks the key away from the PTY."
   (let ((uri (get-text-property pos 'help-echo)))
     (and (stringp uri) uri)))
 
+(defun ghostel--eldoc-link (callback &rest _)
+  "Report the hyperlink URI at point via eldoc CALLBACK.
+For `eldoc-documentation-functions'."
+  (when-let* (((eq (get-text-property (point) 'keymap) ghostel-link-map))
+              (uri (ghostel--uri-at-pos (point)))
+              (link (if (string-prefix-p "fileref:" uri)
+                        (substring uri (length "fileref:"))
+                      uri)))
+    (funcall callback link :thing "Link" :face 'link)))
+
 (defun ghostel--open-link (url)
   "Open URL, dispatching by scheme.
 file:// URIs open in Emacs; http(s) and other schemes use `browse-url'.
@@ -4242,6 +4308,9 @@ Wraps to `point-max' when no link is found before point."
     (ghostel-copy-mode))
   (dotimes (_ (or n 1))
     (ghostel--goto-hyperlink 'previous)))
+
+;; Make the ghostel-*-hyperlink play nice with eldoc.
+(eldoc-add-command #'ghostel-next-hyperlink #'ghostel-previous-hyperlink)
 
 (defun ghostel--detect-urls-skip-p (pos active-bounds)
   "Return non-nil if link detection should leave POS alone.
@@ -5300,13 +5369,21 @@ and the buffer is the active selection within it)."
                      (eq win (frame-selected-window frame)))))
             (get-buffer-window-list buf nil t)))
 
+(defun ghostel--frame-focus-flags (&rest _)
+  "Flag each focused frame so its next left-press is a focus click.
+For `ghostel-mouse-press-or-copy-mode'; called after a frame focus change."
+  ;; The refocusing click delivers a focus-in just before the press, so flag
+  ;; whichever frame reports focus at the event.  Read it fresh each time, not
+  ;; diffed against a stored value that a dropped focus-out can leave stale.
+  (dolist (frame (frame-list))
+    (set-frame-parameter frame 'ghostel--frame-refocused
+                         (eq (frame-focus-state frame) t))))
+
 (defun ghostel--focus-change (&rest _)
-  "Update focus state for every live ghostel buffer.
-Called from `after-focus-change-function',
-`window-selection-change-functions', and
-`window-buffer-change-functions'.  Sends a focus event only when
-the buffer's logical focus state transitions; `ghostel--focus-event'
-further gates on terminal mode 1004."
+  "Send terminal focus events for every live ghostel buffer.
+Called from `after-focus-change-function', `window-selection-change-functions',
+`window-buffer-change-functions'.  Sends a focus event only when the buffer's
+logical focus state transitions.  Further gates on terminal mode 1004."
   (dolist (buf (buffer-list))
     (when (buffer-live-p buf)
       (with-current-buffer buf
@@ -5315,9 +5392,9 @@ further gates on terminal mode 1004."
                    ghostel--process
                    (process-live-p ghostel--process))
           (let ((focused (and (ghostel--buffer-focused-p buf) t)))
-            (unless (eq focused ghostel--focus-state)
-              (when (ghostel--focus-event ghostel--term focused)
-                (setq ghostel--focus-state focused)))))))))
+            (when (and (not (eq focused ghostel--focus-state))
+                       (ghostel--focus-event ghostel--term focused))
+              (setq ghostel--focus-state focused))))))))
 
 
 ;;; Process management
@@ -6178,9 +6255,13 @@ the bottom of WINDOW."
 (defun ghostel--anchor-window (&optional window)
   "Scroll WINDOW so that the last row is aligned to the bottom of the window.
 In graphical frames, use Emacs's pixel layout for exact bottom alignment.
-In text frames, use line-count geometry with no vscroll."
+In text frames, use line-count geometry with no vscroll.
+Do nothing unless WINDOW displays a live Ghostel terminal."
   (when-let* ((window (or window (selected-window)))
-              (buffer (window-buffer window)))
+              (buffer (window-buffer window))
+              ((with-current-buffer buffer
+                 (and (derived-mode-p 'ghostel-mode)
+                      (ghostel--terminal-live-p)))))
     (with-selected-window window
       (with-current-buffer buffer
         (let ((target (point-max)))
@@ -6412,11 +6493,17 @@ scroll to active area to keep it focused even during resize."
   "Schedule anchoring of all the currently anchored Ghostel windows.
 The minibuffer when used with packages such as Vertico can cause a resize of
 a Ghostel window making it lose its anchoring."
-  (when-let* ((anchored (cl-delete-if-not #'ghostel--window-anchored-p
-                                          (window-list))))
+  (when-let* ((anchored (cl-loop for win in (window-list)
+                                 when (ghostel--window-anchored-p win)
+                                 collect (cons win (window-buffer win)))))
     (run-at-time 0 nil
                  (lambda ()
-                   (dolist (win anchored) (ghostel--anchor-window win))))))
+                   (dolist (entry anchored)
+                     (let ((win (car entry))
+                           (buffer (cdr entry)))
+                       (when (and (window-live-p win)
+                                  (eq (window-buffer win) buffer))
+                         (ghostel--anchor-window win))))))))
 
 
 ;;; Major mode
@@ -6455,13 +6542,17 @@ a Ghostel window making it lose its anchoring."
   (shell-completion-vars)
   (setq ghostel--input-mode 'semi-char)
   (use-local-map ghostel-semi-char-mode-map)
+  (add-function :after after-focus-change-function #'ghostel--frame-focus-flags)
   (add-function :after after-focus-change-function #'ghostel--focus-change)
   (add-hook 'window-selection-change-functions #'ghostel--focus-change)
   (add-hook 'window-buffer-change-functions #'ghostel--focus-change)
   (add-hook 'window-buffer-change-functions #'ghostel--window-buffer-change nil t)
   (add-hook 'window-buffer-change-functions #'ghostel--sync-tty-composition nil t)
   (add-hook 'window-size-change-functions #'ghostel--anchor-on-resize nil t)
+  (add-hook 'activate-mark-hook #'ghostel--mark-activated nil t)
   (add-hook 'minibuffer-exit-hook #'ghostel--minibuffer-exit)
+  ;; Show the hyperlink URI at point in eldoc.
+  (add-hook 'eldoc-documentation-functions #'ghostel--eldoc-link nil t)
   (ghostel--suppress-interfering-modes)
   (ghostel-imenu-setup)
   (setq ghostel--scroll-intercept-active t)

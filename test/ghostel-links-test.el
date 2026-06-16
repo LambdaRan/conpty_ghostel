@@ -174,6 +174,57 @@ row.  Navigation should land on the link only once, not on each chunk."
     (goto-char 5)
     (should (null (ghostel--uri-at-pos (point))))))
 
+;;; Eldoc
+
+(defun ghostel-test--eldoc-link-at-point ()
+  "Call `ghostel--eldoc-link' at point; return what it reported, or nil."
+  (let (reported)
+    (ghostel--eldoc-link (lambda (doc &rest _) (setq reported doc)))
+    reported))
+
+(ert-deftest ghostel-test-eldoc-link-reports-uri ()
+  "`ghostel--eldoc-link' reports the URI on a ghostel link span."
+  (with-temp-buffer
+    (insert "click here")
+    (put-text-property 1 11 'help-echo "https://example.com")
+    (put-text-property 1 11 'keymap ghostel-link-map)
+    (goto-char 5)
+    (should (equal "https://example.com"
+                   (ghostel-test--eldoc-link-at-point)))))
+
+(ert-deftest ghostel-test-eldoc-link-prettifies-fileref ()
+  "`ghostel--eldoc-link' strips the internal `fileref:' scheme."
+  (with-temp-buffer
+    (insert "src/main.rs:42:4")
+    (put-text-property 1 17 'help-echo "fileref:/tmp/src/main.rs:42:4")
+    (put-text-property 1 17 'keymap ghostel-link-map)
+    (goto-char 5)
+    (should (equal "/tmp/src/main.rs:42:4"
+                   (ghostel-test--eldoc-link-at-point)))))
+
+(ert-deftest ghostel-test-eldoc-link-nil-off-link ()
+  "`ghostel--eldoc-link' reports nothing on plain text."
+  (with-temp-buffer
+    (insert "plain text")
+    (goto-char 5)
+    (should (null (ghostel-test--eldoc-link-at-point)))))
+
+(ert-deftest ghostel-test-eldoc-link-nav-commands-registered ()
+  "Link navigation commands trigger eldoc directly.
+Eldoc only fires after commands in `eldoc-message-commands'; without
+registration the URI would only show after a subsequent motion command."
+  (should (intern-soft "ghostel-next-hyperlink" eldoc-message-commands))
+  (should (intern-soft "ghostel-previous-hyperlink" eldoc-message-commands)))
+
+(ert-deftest ghostel-test-eldoc-link-ignores-foreign-help-echo ()
+  "`ghostel--eldoc-link' skips `help-echo' spans lacking `ghostel-link-map'.
+E.g. `compilation-mode' error loci in `ghostel-compile-view-mode'."
+  (with-temp-buffer
+    (insert "main.c:3:1: error")
+    (put-text-property 1 12 'help-echo "mouse-2: visit the source location")
+    (goto-char 5)
+    (should (null (ghostel-test--eldoc-link-at-point)))))
+
 (ert-deftest ghostel-test-url-detection ()
   "Test automatic URL detection in plain text."
   ;; Test buffers add a trailing newline so point lands on an empty line

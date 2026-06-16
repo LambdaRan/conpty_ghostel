@@ -297,6 +297,17 @@ no mode switch.  When a TUI has DEC mouse-tracking enabled
 (1000/1002/1003 — htop, lazygit, etc.) the click is forwarded to the
 program and none of the above applies.
 
+Keyboard selections get the same protection: when a command activates
+the mark in semi-char mode — `C-SPC` (`set-mark-command`), an
+expand-region variant, `C-x h`, anything that turns the region on —
+ghostel switches to the mode picked by
+`ghostel-mark-activation-input-mode` (default `'copy`; also `'emacs`,
+or `nil` to stay in semi-char).  This hooks mark *activation* rather
+than any particular key, so custom bindings such as
+`set-mark-or-expand` trigger it too.  On a TTY, Ctrl+Space is
+indistinguishable from `C-@` (NUL) and is forwarded to the terminal
+instead; in char mode Ctrl+Space always reaches the terminal as NUL.
+
 ### Line mode
 
 Entered with `C-c C-l`.  Line mode buffers the user's input locally in

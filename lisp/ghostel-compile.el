@@ -207,7 +207,10 @@ the same keys work while the command is still executing."
   ;; compilation-mode's keywords are applied once via `font-lock-ensure'
   ;; on a finalised, static buffer and don't need to be cleaned up.
   (setq-local font-lock-unfontify-region-function #'ignore)
-  (setq-local list-buffers-directory (expand-file-name default-directory))) ; expose cwd to buffer-menu/ibuffer
+  ;; Show the URI at point in eldoc.
+  (add-hook 'eldoc-documentation-functions #'ghostel--eldoc-link nil t)
+  ;; Expose cwd to buffer-menu/ibuffer
+  (setq-local list-buffers-directory (expand-file-name default-directory)))
 
 (defun ghostel-compile--format-duration (seconds)
   "Format SECONDS (float) as a compilation-style duration string.

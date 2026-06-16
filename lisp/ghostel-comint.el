@@ -164,10 +164,18 @@ shell-mode buffers — the same advice applies here.  Add this to your
     (remove-hook 'comint-output-filter-functions
                  #'ansi-color-process-output t)
     (add-hook 'comint-preoutput-filter-functions
-              #'ghostel-comint-filter nil t))
+              #'ghostel-comint-filter nil t)
+    ;; Show the OSC 8 hyperlink URI at point in eldoc.
+    (add-hook 'eldoc-documentation-functions #'ghostel--eldoc-link nil t)
+    ;; Enable eldoc explicitly (when the user has `global-eldoc-mode' activated)
+    ;; because in pre-existing buffers, e.g. when `ghostel-comint-global-mode'
+    ;; sweeps `buffer-list', the global mode's auto-enable has already run.
+    (when (bound-and-true-p global-eldoc-mode)
+      (eldoc-mode 1)))
    (t
     (remove-hook 'comint-preoutput-filter-functions
                  #'ghostel-comint-filter t)
+    (remove-hook 'eldoc-documentation-functions #'ghostel--eldoc-link t)
     ;; Don't re-add ansi-color-process-output — the user may have
     ;; deliberately disabled it for other reasons.  Leave their config
     ;; as-is and let them re-add it via `shell-mode-hook' if needed.
