@@ -1783,6 +1783,37 @@ cursor jumps to the right edge of the window."
          (evil-ghostel--passthrough-delete))
        (should (equal '("delete") keys-sent))))))
 
+(ert-deftest evil-ghostel-test-delete-key-sends-pty-in-alt-screen ()
+  "`<delete>' still reaches the PTY in an alt-screen TUI (1049)."
+  (evil-ghostel-test--with-evil-buffer
+   (setq-local ghostel--term t)
+   ;; Report alt-screen (1049) as active, every other mode as inactive.
+   (cl-letf (((symbol-function 'ghostel--mode-enabled)
+              (lambda (_term mode) (= mode 1049))))
+     (let ((keys-sent '()) (fell-back nil))
+       (cl-letf (((symbol-function 'ghostel--send-encoded)
+                  (lambda (key _mods &rest _) (push key keys-sent)))
+                 ((symbol-function 'evil-ghostel--fallback-key)
+                  (lambda (&rest _) (setq fell-back t))))
+         (evil-ghostel--passthrough-delete))
+       (should (equal '("delete") keys-sent))
+       (should-not fell-back)))))
+
+(ert-deftest evil-ghostel-test-delete-key-falls-back-off-semi-char ()
+  "Off semi-char (e.g. line mode) `<delete>' falls back to evil, not the PTY."
+  (evil-ghostel-test--with-evil-buffer
+   (setq-local ghostel--term t)
+   (setq-local ghostel--input-mode 'line)
+   (cl-letf (((symbol-function 'ghostel--mode-enabled) (lambda (&rest _) nil)))
+     (let ((keys-sent '()) (fell-back nil))
+       (cl-letf (((symbol-function 'ghostel--send-encoded)
+                  (lambda (key _mods &rest _) (push key keys-sent)))
+                 ((symbol-function 'evil-ghostel--fallback-key)
+                  (lambda (&rest _) (setq fell-back t))))
+         (evil-ghostel--passthrough-delete))
+       (should-not keys-sent)
+       (should fell-back)))))
+
 (ert-deftest evil-ghostel-test-delete-key-bound-in-insert-state ()
   "`<delete>' is bound to `evil-ghostel--passthrough-delete' in insert state."
   (should (eq #'evil-ghostel--passthrough-delete

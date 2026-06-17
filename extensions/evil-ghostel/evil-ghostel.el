@@ -755,7 +755,7 @@ Off semi-char the local map wins first, so line mode's own \\`C-a' →
 Evil binds the delete key to `delete-char', which would edit buffer text
 rather than forward-delete in the shell."
   (interactive)
-  (if (evil-ghostel--active-p)
+  (if (evil-ghostel--ctrl-passthrough-active-p)
       (ghostel--send-encoded "delete" "")
     (evil-ghostel--fallback-key (kbd "<delete>"))))
 
