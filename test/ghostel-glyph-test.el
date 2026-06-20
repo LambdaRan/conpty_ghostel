@@ -135,7 +135,7 @@ SPECS is a plist with these keys:
                      [[0 1 ?⚠ 0 17 0 0 10 10 0]]))
                    (composition-gstring
                     (ghostel-test--mock-font-gstring composition-font)))
-              (ghostel--write-input term "⚠️")
+              (ghostel--write-vt term "⚠️")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :composition-gstring composition-gstring)
@@ -170,7 +170,7 @@ the ascent over the line."
                                 ["MockGlyph" "mock.ttf" 12 120 20 5 10 10 0]
                                 [[0 1 ?\u0100 0 10 0 0 20 5 0]])))
               ;; Write a character above the coverage threshold.
-              (ghostel--write-input term "\u0100")
+              (ghostel--write-vt term "\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -206,7 +206,7 @@ descent below the line."
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 5 20 10 10 0]
                                 [[0 1 ?\u0100 0 10 0 0 5 20 0]])))
-              (ghostel--write-input term "\u0100")
+              (ghostel--write-vt term "\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -222,7 +222,7 @@ descent below the line."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-glyph-adjust-double-width-small ()
-  "A double-width glyph with narrower aspect than its slot gets min-width of 2."
+  "A double-width glyph is adjusted to its native width."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-glyph-2*")))
     (unwind-protect
@@ -234,12 +234,13 @@ descent below the line."
                    (ghostel--term-rows 5)
                    (inhibit-read-only t)
                    (df (ghostel-test--make-font ghostel-test--default-font-info))
-                   ;; Glyph: 18px wide x 20px tall; narrower aspect breaks claim loop
+                   ;; Glyph: 18px wide x 20px tall, fitting within its native
+                   ;; two-cell slot.
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 10 10 18 18 0]
                                 [[0 1 ?あ 0 18 0 0 10 10 0]])))
               ;; Write a CJK character (double-width).
-              (ghostel--write-input term "あ")
+              (ghostel--write-vt term "あ")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -249,6 +250,43 @@ descent below the line."
                  (should disp)
                  (let ((min-w (cadr (assq 'min-width disp))))
                    (should (equal min-w '(2)))))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-glyph-adjust-cjk-never-claims-extra-space ()
+  "A CJK glyph never claims extra space at EOL or before a space."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-glyph-cjk-no-claim*")))
+    (unwind-protect
+        (save-window-excursion
+          (with-selected-window (display-buffer buf)
+            (ghostel-mode)
+            (let* ((term (ghostel--new 5 80 1000))
+                   (ghostel--term term)
+                   (ghostel--term-rows 5)
+                   (inhibit-read-only t)
+                   (df (ghostel-test--make-font ghostel-test--default-font-info))
+                   ;; Glyph: 30px wide x 20px tall; too wide for its native
+                   ;; two-cell slot, but CJK cells must not claim more space.
+                   (glyph-font (ghostel-test--make-font
+                                ["MockGlyph" "mock.ttf" 12 120 10 10 30 30 0]
+                                [[0 1 ?あ 0 30 0 0 10 10 0]])))
+              ;; Keep a non-space after the space so it is not right-trimmed.
+              (ghostel--write-vt term "あ x\r\nあ")
+              (ghostel-test--with-glyph-mocks
+               (:default-font df
+                              :glyph-font glyph-font)
+               (ghostel--redraw term t)
+               (goto-char (point-min))
+               (let ((disp-before-space (get-text-property (point) 'display)))
+                 (should disp-before-space)
+                 (should (equal (cadr (assq 'min-width disp-before-space)) '(2))))
+               (forward-char 1)
+               (should (equal (char-after) ?\s))
+               (should-not (get-text-property (point) 'display))
+               (forward-line 1)
+               (let ((disp-at-eol (get-text-property (point) 'display)))
+                 (should disp-at-eol)
+                 (should (equal (cadr (assq 'min-width disp-at-eol)) '(2))))))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-glyph-adjust-identical-metrics ()
@@ -268,7 +306,7 @@ descent below the line."
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 10 10 10 10 0]
                                 [[0 1 ?\u0100 0 10 0 0 10 10 0]])))
-              (ghostel--write-input term "\u0100")
+              (ghostel--write-vt term "\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -278,7 +316,7 @@ descent below the line."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-glyph-adjust-claims-following-space ()
-  "A wide glyph claims an adjacent space by giving it :width 0."
+  "An oversized single-width glyph claims an adjacent space as :width 0."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-glyph-4*")))
     (unwind-protect
@@ -295,8 +333,8 @@ descent below the line."
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 10 10 12 12 0]
                                 [[0 1 ?\u0100 0 12 0 0 10 10 0]])))
-              ;; Write: [wide-glyph][space]
-              (ghostel--write-input term "\u0100 ")
+              ;; Write: [oversized glyph][space]
+              (ghostel--write-vt term "\u0100 ")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -310,7 +348,7 @@ descent below the line."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-glyph-adjust-claims-past-eol ()
-  "A wide glyph claims trailing empty space past the written text."
+  "An oversized single-width glyph claims at most one trailing cell."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-glyph-5*")))
     (unwind-protect
@@ -322,11 +360,11 @@ descent below the line."
                    (ghostel--term-rows 5)
                    (inhibit-read-only t)
                    (df (ghostel-test--make-font ghostel-test--default-font-info))
-                   ;; Glyph: 25px wide x 10px tall (needs >2 cells)
+                   ;; Glyph: 25px wide x 10px tall (would need >2 cells).
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 5 5 25 25 0]
                                 [[0 1 ?\u0100 0 25 0 0 5 5 0]])))
-              (ghostel--write-input term "\u0100")
+              (ghostel--write-vt term "\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -335,11 +373,11 @@ descent below the line."
                (let ((disp (get-text-property (point) 'display)))
                  (should disp)
                  (let ((min-w (cadr (assq 'min-width disp))))
-                   (should (>= (car min-w) 2))))))))
+                   (should (equal min-w '(2)))))))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-glyph-adjust-last-column-no-claim ()
-  "When the glyph is at the last column, claiming loop never runs."
+  "A glyph at the last column does not claim out-of-bounds space."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-glyph-6*")))
     (unwind-protect
@@ -354,15 +392,14 @@ descent below the line."
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 5 5 15 15 0]
                                 [[0 1 ?\u0100 0 15 0 0 5 5 0]])))
-              (ghostel--write-input term "\e[1;10H")
-              (ghostel--write-input term "\u0100")
+              (ghostel--write-vt term "\e[1;10H")
+              (ghostel--write-vt term "\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
                (ghostel--redraw term t)
                (goto-char (point-min))
                (end-of-line)
-               ;; cell.col + char_width < cols is 9 + 1 < 10 = false
                (let ((disp (get-text-property (1- (point)) 'display)))
                  (should disp)
                  (let ((min-w (cadr (assq 'min-width disp))))
@@ -390,7 +427,7 @@ Sets floor to 1.0 and feeds a glyph larger than the cell.  With floor
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 12 13 12 12 0]
                                 [[0 1 ?\u0100 0 12 0 0 12 13 0]])))
-              (ghostel--write-input term "\u0100")
+              (ghostel--write-vt term "\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -422,7 +459,7 @@ Sets floor to 1.0 and feeds a glyph larger than the cell.  With floor
                    (glyph-font (ghostel-test--make-font
                                 ["MockGlyph" "mock.ttf" 12 120 12 13 12 12 0]
                                 [[0 1 ?\u0100 0 12 0 0 12 13 0]])))
-              (ghostel--write-input term "\u0100")
+              (ghostel--write-vt term "\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df
                               :glyph-font glyph-font)
@@ -466,7 +503,7 @@ Sets floor to 1.0 and feeds a glyph larger than the cell.  With floor
                    (bold-font (ghostel-test--make-font
                                ["BoldGlyph" "bold.ttf" 12 120 10 10 30 30 0]
                                [[0 1 ?\u0100 0 30 0 0 10 10 0]])))
-              (ghostel--write-input term "\u0100 \e[1m\u0100")
+              (ghostel--write-vt term "\u0100 \e[1m\u0100")
               (ghostel-test--with-glyph-mocks
                (:default-font df)
                (cl-letf (((symbol-function 'font-at)
@@ -504,7 +541,7 @@ Sets floor to 1.0 and feeds a glyph larger than the cell.  With floor
                    (ghostel--term-rows 5)
                    (inhibit-read-only t)
                    (df (ghostel-test--make-font ghostel-test--default-font-info)))
-              (ghostel--write-input term "a")
+              (ghostel--write-vt term "a")
               ;; Tripwire: if the code wrongly tried to adjust this glyph it
               ;; would call `font-at', and the deliberately-broken stub below
               ;; would fail the test.

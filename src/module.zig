@@ -12,7 +12,6 @@ const gt = @import("ghostty-vt");
 const emacs = @import("emacs.zig");
 const ComintFilter = @import("comint_filter.zig");
 const GhostelTerm = @import("GhostelTerm.zig");
-const pty = @import("pty.zig");
 const png = @import("png.zig");
 
 const c = emacs.c;
@@ -123,24 +122,6 @@ const emacs_functions = [_]emacs.FunctionEntry{
         },
     },
     .{
-        .name = "ghostel--pty-password-input-p",
-        .arity = .{ 1, 1 },
-        .doc =
-        \\Return t if the tty at PATH is in canonical mode with echo off.
-        \\
-        \\This mirrors libghostty's password-input heuristic.  Returns nil when the path can't be opened, `tcgetattr' fails, or the tty is in some other state.
-        \\
-        \\(ghostel--pty-password-input-p PATH)
-        ,
-        .impl = struct {
-            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
-                var stack_buf: [1024]u8 = undefined;
-                const path = env.extractString(args[0], &stack_buf) catch return env.nil();
-                return if (pty.isPasswordMode(path)) env.t() else env.nil();
-            }
-        },
-    },
-    .{
         .name = "ghostel--conpty-resize",
         .arity = .{ 3, 3 },
         .doc =
@@ -243,7 +224,10 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    std.log.defaultLog(message_level, scope, format, args);
+    // Debug only: in `emacs -nw' the module's stderr is the user's tty.
+    if (builtin.mode == .Debug) {
+        std.log.defaultLog(message_level, scope, format, args);
+    }
 
     if (!vt_log_active) return;
     const env = emacs.current_env orelse return;

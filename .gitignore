@@ -13,3 +13,4 @@ ghostel-module.*
 !ghostel-module.zig
 .zig-global-cache/
 .claude/
+public/
