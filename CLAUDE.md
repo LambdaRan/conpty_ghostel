@@ -64,20 +64,29 @@ emacs --batch -Q -L lisp -l ert -l test/ghostel-test.el \
 ```
 Shell (bash/zsh/fish/cmd.exe)
   → PTY/ConPTY → Elisp ghostel--filter
-  → GhostelTerm.ghostel--write-input (CRLF 规范化、OSC 通过 GhostelHandler 拦截、libghostty 解析)
+  → GhostelTerm.ghostel--write-vt (libghostty 解析、OSC 通过 GhostelHandler 拦截)
   → gt.Terminal (网格、样式、滚动缓冲区状态)
   → Renderer (脏行跟踪)
   → ghostel--redraw (增量渲染) → Emacs 缓冲区
+
+用户输入:
+  → ghostel--write-pty → PTY/ConPTY (native PTY 直接写入；Emacs PTY 通过 process-send-string)
+
+Native PTY 事件:
+  → 读取线程 → ghostel--events-filter (Lisp 表单求值、子进程退出检测)
 ```
 
 ### 原生模块 (src/)
 
 | 文件 | 说明 |
 |---|---|
-| `module.zig` | 入口点；注册模块级函数（version、vt-log、pty-password、conpty-resize） |
-| `GhostelTerm.zig` | 终端状态管理；注册核心函数（new、write-input、set-size、redraw、encode-key 等）；CRLF 规范化 |
+| `module.zig` | 入口点；注册模块级函数（version、vt-log、conpty-resize） |
+| `GhostelTerm.zig` | 终端状态管理；注册核心函数（new、write-vt、write-pty、set-size、redraw、encode-key 等）；native PTY 生命周期管理 |
 | `Renderer.zig` | 增量脏行渲染到 Emacs 缓冲区；单元格提取、样式/超链接应用 |
-| `GhostelHandler.zig` | 自定义流处理器，拦截 OSC 4/7/9/10/11/52/133/777 并路由到 Elisp |
+| `handler.zig` | 泛型流处理器（`GhostelHandler(Context)`），拦截 OSC 4/7/9/10/11/52/133/777 并路由到 Elisp |
+| `NativeProcess.zig` | Native PTY 读取线程：poll 循环、事件通知、信号处理；POSIX-only，Windows 上编译为空 stub |
+| `PtyProcess.zig` | POSIX PTY 创建和管理（posix_openpt、fork、exec）；Windows 上编译为空 stub（fork 使用 ConPTY） |
+| `pty_utils.zig` | PTY 密码模式检测等工具函数 |
 | `comint_filter.zig` | libghostty VT 解析器作为 comint preoutput 过滤器 |
 | `style_face.zig` | 样式/face 定义 |
 | `utils.zig` | parseHexColor、parseHexByte 等共享工具函数 |
@@ -85,7 +94,6 @@ Shell (bash/zsh/fish/cmd.exe)
 | `input.zig` | 键盘和鼠标事件编码 |
 | `kitty_graphics.zig` | Kitty 图形协议支持 |
 | `sys.zig` | 系统回调（PNG 解码器等） |
-| `pty.zig` | PTY 密码模式检测 |
 | `fixed_array_list.zig` | 固定大小数组列表 |
 | `png.zig` / `ppm.zig` | 图像格式支持 |
 | `version.zig` | 单一版本号来源 |
@@ -112,8 +120,14 @@ libghostty-vt 由 Zig 包管理器获取（见 `build.zig.zon`），通过 `cons
 | `lisp/ghostel.el` | `ghostel--conpty-proxy-make-process` | 通过 `conpty_proxy.exe` 生成 shell（替代 Unix PTY） |
 | `lisp/ghostel.el` | `ghostel--conpty-proxy-resize` | 通过 Zig `ghostel--conpty-resize` 调整大小（替代 Unix ioctl） |
 | `src/module.zig` | `ghostel--conpty-resize` / `fnConptyResize` | 写入命名管道 `\\.\pipe\conpty-proxy-ctrl-{id}` |
-| `src/GhostelTerm.zig` | `ghostel--write-input` | CRLF 规范化（流式插入缺失 `\r`），已是上游代码的一部分 |
+| `src/NativeProcess.zig` | 全文件 | `comptime` 守卫：POSIX-only 函数（`run`、`loop`、`deinit`）在 Windows 上返回空；struct 字段使用 `posix.fd_t` + `invalid_fd` 哨兵 |
+| `src/PtyProcess.zig` | 全文件 | `comptime` 守卫：`@cImport` 条件编译（Windows 跳过 `sys/ioctl.h` 等）；`Pty` 在 Windows 上为无字段 stub struct |
+| `src/emacs.zig` | `openChannel` | 返回 `c_int`（匹配 Emacs C API），调用点通过 `comptime` 转换为 `posix.fd_t` |
+| `src/GhostelTerm.zig` | `spawnNativeProcess` | 返回 `c_int`（pid）；Windows 上 pid 字段为 `void`，通过 `comptime` 返回 0 |
 | `build.cmd` / `build.zig` | — | GNU ABI (`-Dtarget=native-native-gnu`)；`build.zig` 中条件启用 `link_libcpp`；`ZIG_GLOBAL_CACHE_DIR` 必须在同一驱动器（Zig 0.15 bug） |
+
+### 已知问题
+- **CRLF 规范化**：上游 v0.35 重构将 `ghostel--write-input` 拆分为 `ghostel--write-vt` + `ghostel--write-pty`，原有的流式 CRLF 规范化（在 `\n` 前插入缺失 `\r`）被移除。如果 Windows ConPTY 输出出现换行显示异常，需在 Elisp `ghostel--filter` 或 Zig `vtWrite` 中重新添加。
 
 ## 上游同步工作流
 
@@ -129,9 +143,12 @@ git merge upstream/main --no-edit
 
 预期冲突位置：
 - `src/module.zig` — `emacs_functions` 表和 import 区域（上游可能重构注册模式）
-- `lisp/ghostel.el` — `ghostel--start-process` 中 Windows 条件分支
-- `src/emacs.zig` — Emacs API 封装层
+- `lisp/ghostel.el` — `ghostel--start-process` 中 Windows 条件分支、`ghostel--adjust-size` resize 逻辑
+- `src/emacs.zig` — Emacs API 封装层（类型变更如 `isize` → `c_long`、新增函数如 `openChannel`）
 - `src/GhostelTerm.zig` — 函数注册表和实现（核心逻辑集中于此）
+- `src/NativeProcess.zig` / `src/PtyProcess.zig` — 上游 POSIX-only 代码需要 Windows `comptime` 守卫
+- `lisp/ghostel-debug.el` — spawn capture plist 键名（上游可能重命名如 `:width` → `:cols`）
+- `.gitignore` — 双方可能各自新增忽略条目
 
 解决冲突原则：
 1. 采用上游的架构改进（如函数分散到各模块、表驱动注册）
@@ -144,9 +161,13 @@ git merge upstream/main --no-edit
 |---|---|---|
 | ConPTY 函数注册 | `src/module.zig` `emacs_functions` 表 | 确认 `ghostel--conpty-resize` 条目存在 |
 | `fnConptyResize` 实现 | `src/module.zig` | 确认函数体完整，签名匹配注册声明 |
-| CRLF 处理 | `src/GhostelTerm.zig` `ghostel--write-input` | 验证流式 CRLF 规范化 + alt screen 跳过逻辑 |
+| Native PTY Windows 守卫 | `src/NativeProcess.zig` | 确认 `comptime builtin.os.tag == .windows` 守卫存在于 `init`、`run`、`deinit` |
+| PtyProcess Windows 守卫 | `src/PtyProcess.zig` | 确认 `@cImport` 条件编译（Windows 跳过 `sys/ioctl.h` 等）；stub struct 包含 `primary_fd` 字段 |
+| `openChannel` 返回类型 | `src/emacs.zig` | 确认返回 `c_int`（非 `posix.fd_t`），调用点有 `comptime` 转换 |
+| `spawnNativeProcess` 签名 | `src/GhostelTerm.zig` | 确认返回 `c_int`，Windows pid 通过 `comptime` 返回 0 |
 | Emacs API 调用 | `src/emacs.zig` | 上游可能改变调用签名——确保 fork 代码跟上 |
 | Elisp 进程管理 | `lisp/ghostel.el` | ConPTY 路径环境变量、buffer 设置与 `ghostel--spawn-pty` 对等 |
+| Elisp spawn capture 键名 | `lisp/ghostel-debug.el` | ConPTY capture 使用 `:cols`/`:rows`（与上游 PTY capture 一致） |
 | 构建脚本 | `build.zig` / `build.zig.zon` | 确认 `link_libcpp`、`.dll` 输出名、依赖版本未被覆盖 |
 
 ### 步骤 3：逻辑审查清单
@@ -155,7 +176,9 @@ git merge upstream/main --no-edit
 - [ ] `ghostel--conpty-proxy-resize` 与 Unix resize 路径功能对等
 - [ ] `ghostel--conpty-resize` 在 `src/module.zig` `emacs_functions` 表中注册
 - [ ] `fnConptyResize` 实现完整，签名匹配表项
-- [ ] CRLF 规范化在 `src/GhostelTerm.zig` 中完整（alt screen 跳过 + 流式 \r 插入）
+- [ ] `NativeProcess.zig` Windows 守卫完整（`init`、`run`、`deinit` 有 `comptime` 提前返回）
+- [ ] `PtyProcess.zig` Windows 守卫完整（`@cImport` 条件编译、stub struct 有 `primary_fd` 字段）
+- [ ] `emacs.zig` `openChannel` 返回 `c_int`，`GhostelTerm.zig` 调用点有 `comptime` 转换
 - [ ] `version` 常量：`src/version.zig`、`build.zig.zon`、`lisp/ghostel.el` 三处一致
 
 ### 步骤 4：构建验证
