@@ -264,9 +264,8 @@ result must be 2 to prove the prop branch is consulted first."
 Also verifies the documented nil-return when no cursor is available."
   (ghostel-test--with-input-fixture "$ " "hello"
     (let ((cursor-pos ghostel--cursor-char-pos))
-      ;; Move point away from the cursor and verify the function still
-      ;; returns the cursor position — proves it reads
-      ;; `ghostel--cursor-char-pos', not `(point)'.
+      ;; Move point away from the cursor; the function still returns the
+      ;; terminal cursor position.
       (goto-char (point-min))
       (should-not (= (point) cursor-pos))
       (should (= cursor-pos (ghostel-cursor-point))))
@@ -315,11 +314,8 @@ Also verifies the documented nil-return when no cursor is available."
 
 (ert-deftest ghostel-test-copy-to-line-restarts-redraw-timer ()
   "Copy → line transition re-arms the redraw timer.
-Copy mode froze the timer via `ghostel--freeze-terminal'; line
-mode is live, so the redraw cycle must be running again on exit
-or the prompt sits stuck until the next PTY byte arrives.
-Regression: `ghostel--line-mode-enter' previously cleared
-`buffer-read-only' but never called `ghostel--invalidate'."
+Copy mode freezes the timer; line mode is live, so redraws must resume
+without waiting for another PTY byte."
   (let ((buf (generate-new-buffer " *ghostel-test-copy-to-line*"))
         (invalidate-calls 0))
     (unwind-protect
@@ -1663,10 +1659,7 @@ running through a redraw cycle."
 
 (ert-deftest ghostel-test-line-mode-restores-cursor-when-terminal-hid-it ()
   "Line mode shows the editor's cursor regardless of CSI ?25l from the TUI.
-Bug: a TUI that hides the cursor (e.g. claude-code) leaves
-`cursor-type' nil, and line mode previously inherited that — so
-moving point produced no visible cursor.  Entering line mode must
-force the editor default; teardown must restore the saved value."
+Entering line mode forces the editor default; teardown restores the saved value."
   (let ((buf (generate-new-buffer " *ghostel-test-line-cursor*")))
     (unwind-protect
         (with-current-buffer buf
@@ -1680,7 +1673,8 @@ force the editor default; teardown must restore the saved value."
                       ((symbol-function 'ghostel--invalidate) #'ignore)
                       ((symbol-function 'ghostel--anchor-window) #'ignore))
               ;; Simulate a TUI that hid the cursor in semi-char mode.
-              (ghostel--set-cursor-style 1 nil)
+              (setq-local ghostel--cursor-style nil)
+              (ghostel--apply-cursor-style)
               (should (null cursor-type))
               ;; Enter line mode — cursor must be visible (default).
               (ghostel-line-mode)
@@ -1980,6 +1974,77 @@ the flag must not keep suppressing the pause forever."
               (should (eq ghostel--input-mode 'semi-char))
               (should ghostel--line-mode-paused))))
       (kill-buffer buf))))
+
+;;; Initial input mode (ghostel-initial-input-mode)
+
+(ert-deftest ghostel-test-initial-input-mode-line-arms-deferred-entry ()
+  "`ghostel--apply-initial-input-mode' arms deferred entry for `line'.
+The buffer stays in semi-char until a prompt renders."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (with-current-buffer buf
+      (let ((ghostel-initial-input-mode 'line))
+        (ghostel--apply-initial-input-mode))
+      (should ghostel--pending-initial-line-mode)
+      (should (eq ghostel--input-mode 'semi-char)))))
+
+(ert-deftest ghostel-test-initial-input-mode-char-applies-immediately ()
+  "`ghostel-initial-input-mode' = `char' enters char mode at startup."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (set-window-buffer (selected-window) buf)
+    (with-current-buffer buf
+      (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
+        (let ((ghostel-initial-input-mode 'char))
+          (ghostel--apply-initial-input-mode)))
+      (should (eq ghostel--input-mode 'char))
+      (should-not ghostel--pending-initial-line-mode))))
+
+(ert-deftest ghostel-test-initial-line-mode-defers-until-prompt ()
+  "`ghostel-initial-input-mode' = `line' waits for the first prompt, then enters.
+The deferred entry stays armed across redraws with no detectable
+prompt and engages on the redraw that exposes one."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (setq ghostel-detect-password-prompts nil)
+    (set-window-buffer (selected-window) buf)
+    (setq ghostel--process 'fake-proc)
+    ;; Arm exactly as `ghostel--apply-initial-input-mode' would.
+    (setq ghostel--pending-initial-line-mode t)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
+              ((symbol-function 'ghostel--write-pty) #'ignore)
+              ((symbol-function 'ghostel--invalidate) #'ignore))
+      ;; Output with no prompt yet — must not enter line mode.
+      (ghostel--write-vt term "starting up...\r\n")
+      (ghostel--redraw-now buf)
+      (should ghostel--pending-initial-line-mode)
+      (should (eq ghostel--input-mode 'semi-char))
+      ;; First prompt arrives — the next redraw enters line mode.
+      (ghostel--write-vt term "\e]133;A\e\\$ \e]133;B\e\\")
+      (ghostel--redraw-now buf)
+      (should (eq ghostel--input-mode 'line))
+      (should-not ghostel--pending-initial-line-mode)
+      (should (markerp ghostel--line-input-start)))))
+
+(ert-deftest ghostel-test-initial-line-mode-respects-manual-override ()
+  "A manual mode switch before the first prompt cancels deferred line entry."
+  :tags '(native)
+  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+    (setq ghostel-detect-password-prompts nil)
+    (set-window-buffer (selected-window) buf)
+    (setq ghostel--process 'fake-proc)
+    (setq ghostel--pending-initial-line-mode t)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
+              ((symbol-function 'ghostel--write-pty) #'ignore)
+              ((symbol-function 'ghostel--invalidate) #'ignore))
+      ;; User switches to char mode before any prompt.
+      (ghostel-char-mode)
+      (should (eq ghostel--input-mode 'char))
+      ;; Prompt arrives; deferred entry must not override the user's choice.
+      (ghostel--write-vt term "\e]133;A\e\\$ \e]133;B\e\\")
+      (ghostel--redraw-now buf)
+      (should (eq ghostel--input-mode 'char))
+      (should-not ghostel--pending-initial-line-mode))))
 
 (provide 'ghostel-line-mode-test)
 ;;; ghostel-line-mode-test.el ends here

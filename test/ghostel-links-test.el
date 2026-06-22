@@ -781,9 +781,8 @@ to step past more than one run before landing on a different id."
             (put-text-property p (point) 'ghostel-link-id "other"))
           (insert " DDD")                ; 24..27
 
-          ;; Forward from inside A1: dedup loop must step PAST A2 (shared id)
-          ;; before landing on `other'.  This is the path that proves the
-          ;; loop actually iterates more than once.
+          ;; Forward from inside A1: dedup skips A2 (shared id) and lands
+          ;; on `other'.
           (should (equal 19 (ghostel--find-next-link 5)))
           ;; Forward from inside A2 also dedupes; lands on `other'.
           (should (equal 19 (ghostel--find-next-link 12)))

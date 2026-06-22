@@ -81,7 +81,7 @@ const FontInfo = struct {
     }
 };
 
-pub fn init(alloc: Allocator, term: *gt.Terminal) !Self {
+pub fn init(alloc: Allocator, env: emacs.Env, term: *gt.Terminal) !Self {
     var renderer = Self{
         .term = term,
         .render_state = gt.RenderState.empty,
@@ -91,7 +91,7 @@ pub fn init(alloc: Allocator, term: *gt.Terminal) !Self {
         .rendered_screen = term.screens.active,
         .pending_resize = .{ .cols = term.cols, .rows = term.rows, .cell_w = 1, .cell_h = 1 },
     };
-    try renderer.commitResize(alloc);
+    _ = try renderer.commitResize(alloc, env);
     return renderer;
 }
 
@@ -131,12 +131,13 @@ pub fn redraw(self: *Self, alloc: Allocator, env: emacs.Env, force_full_arg: boo
     try self.saved_markers.save(alloc, env);
     defer self.saved_markers.restoreAndClear(self.term.screens.active, env);
 
-    if (self.invalidate(alloc, env) or force_full_arg) {
+    self.evictScrollback(alloc, env);
+    self.gotoActiveStart(env);
+
+    if (try self.invalidate(alloc, env) or force_full_arg) {
         try self.clear(alloc, env);
     }
 
-    self.evictScrollback(alloc, env);
-    self.gotoActiveStart(env);
     try self.renderToEnd(
         alloc,
         env,
@@ -146,59 +147,30 @@ pub fn redraw(self: *Self, alloc: Allocator, env: emacs.Env, force_full_arg: boo
             self.rendered_screen.pages.getTopLeft(.active),
     );
 
-    // If we have a pending resize, commit it now and just rerender the active
-    // since the scrollback is already up to date.
-    if (self.pending_resize != null) {
-        try self.commitResize(alloc);
-        self.gotoActiveStart(env);
-        try self.render(alloc, env, self.term.screens.active.pages.getTopLeft(.active));
-        self.evictScrollback(alloc, env);
-    }
-
     try self.renderCursor(env);
 
     if (self.render_pin) |p| p.* = self.rendered_screen.pages.getTopLeft(.active);
 
+    // Verify integrity in debug mode
     std.debug.assert(self.rows_in_buffer == if (self.rendered_screen.no_scrollback)
         self.term.rows
     else
         self.rendered_screen.pages.total_rows);
 }
 
-fn invalidate(self: *Self, alloc: Allocator, env: emacs.Env) bool {
-    // If the font metrics or related parameters changed, the cached metrics
-    // are no longer valid, so we rebuild.
-    if (self.updateFontInfo(alloc, env)) return true;
-
-    // We always do a full rebuild if the width changed
-    if (self.pending_resize) |rz| {
-        if (rz.cols != self.term.cols) {
-            // Pin our saved positions during resize
-            self.saved_markers.pin(self.term.screens.active, env);
-            return true;
-        }
-    }
-
-    // If we are in no-scrollback mode, just redraw whenever we have a resize.
-    if (self.pending_resize != null and self.rendered_screen.no_scrollback) {
-        return true;
-    }
-
-    // If the active screen changes, we reset scrollback
-    if (self.rendered_screen != self.term.screens.active) {
-        return true;
-    }
-
-    // If we had existing scrollback, the render pin should be below the top of
-    // the scrollback. If it isn't that means that the scrollback was cleared.
-    if (self.rows_in_buffer > self.term.rows and
+fn invalidate(self: *Self, alloc: Allocator, env: emacs.Env) !bool {
+    const font_info_changed = self.updateFontInfo(alloc, env);
+    const resize_invalidation = try self.commitResize(alloc, env);
+    const screen_changed = self.rendered_screen != self.term.screens.active;
+    const scrollback_cleared =
+        self.rows_in_buffer > self.term.rows and
         self.render_pin != null and
-        self.render_pin.?.eql(self.rendered_screen.pages.getTopLeft(.screen)))
-    {
-        return true;
-    }
+        self.render_pin.?.eql(self.rendered_screen.pages.getTopLeft(.screen));
 
-    return false;
+    return font_info_changed or
+        resize_invalidation or
+        screen_changed or
+        scrollback_cleared;
 }
 
 /// Read the default font and rendering parameters from Emacs, compare
@@ -937,10 +909,16 @@ fn renderCursor(self: *Self, env: emacs.Env) !void {
         _ = env.set("ghostel--cursor-pos", env.nil());
     }
 
-    _ = env.f("ghostel--set-cursor-style", .{
-        @intFromEnum(self.render_state.cursor.visual_style),
-        if (self.render_state.cursor.visible) env.t() else env.nil(),
-    });
+    _ = env.set("ghostel--cursor-blinking", if (self.render_state.cursor.blinking) env.t() else env.nil());
+
+    if (self.render_state.cursor.visible) {
+        env.set(
+            "ghostel--cursor-style",
+            @intFromEnum(self.render_state.cursor.visual_style),
+        );
+    } else {
+        env.set("ghostel--cursor-style", env.nil());
+    }
 }
 
 // Render all pages from start_pin through the end of the active area,
@@ -952,15 +930,26 @@ fn renderToEnd(self: *Self, alloc: Allocator, env: emacs.Env, start_pin: gt.Pin)
     }
 }
 
-fn commitResize(self: *Self, alloc: Allocator) !void {
+fn commitResize(self: *Self, alloc: Allocator, env: emacs.Env) !bool {
     if (self.pending_resize) |rz| {
+        const cols_changed = rz.cols != self.term.cols;
+        // Pin our saved positions during resize
+        self.saved_markers.pin(self.term.screens.active, env);
+
         try self.term.resize(alloc, rz.cols, rz.rows);
         self.term.width_px = std.math.mul(u32, rz.cols, rz.cell_w) catch
             std.math.maxInt(u32);
         self.term.height_px = std.math.mul(u32, rz.rows, rz.cell_h) catch
             std.math.maxInt(u32);
         self.pending_resize = null;
+
+        env.set("ghostel--term-rows", self.term.rows);
+        env.set("ghostel--term-cols", self.term.cols);
+        const total_rows_changed = self.rows_in_buffer != self.term.screens.active.pages.total_rows;
+        return cols_changed or total_rows_changed or self.term.screens.active.no_scrollback;
     }
+
+    return false;
 }
 
 /// Position the Emacs point at the start of the active area: `self.term.rows`
@@ -989,9 +978,6 @@ fn clear(self: *Self, alloc: Allocator, env: emacs.Env) !void {
     self.clearPages(alloc);
     if (self.render_pin) |p| self.rendered_screen.pages.untrackPin(p);
     self.render_pin = null;
-
-    // Commit any pending resize since we're doing a rebuild anyway.
-    try self.commitResize(alloc);
 
     self.rendered_screen = self.term.screens.active;
     if (!self.rendered_screen.no_scrollback) {

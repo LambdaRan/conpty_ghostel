@@ -40,12 +40,10 @@
 ;; the launch mode (read-only vs interactive); when invoked from an
 ;; unrelated buffer it falls back to the global default (read-only).
 ;;
-;; Enable `ghostel-compile-global-mode' to route *all* `compile',
-;; `recompile', `project-compile', ... calls through ghostel.  It
-;; advises `compilation-start' so every caller benefits without any
-;; further configuration.  `compilation-start' callers asking for
+;; Enable `ghostel-compile-global-mode' to route `compile',
+;; `recompile', `project-compile', ... through ghostel.
 ;; `MODE=t' (the comint variant — \\[universal-argument] \\[compile])
-;; are routed to a writable ghostel terminal instead of comint.
+;; becomes a writable ghostel terminal instead of comint.
 ;; `grep-mode' falls through to the stock implementation.
 ;;
 ;; Standard `compile' options honoured:
@@ -708,11 +706,8 @@ any other code that walks `compilation-arguments') re-runs via
             ghostel-compile--finalized nil
             ghostel-compile--view-mode-override finished-mode
             ghostel-compile--interactive interactive)
-      ;; Make `revert-buffer' (and third-party code that walks
-      ;; `compilation-arguments') restart the run via `compilation-start'.
-      ;; Direct callers don't pass a tuple — synthesize one that records
-      ;; the launch mode in the MODE slot so a revert routes through the
-      ;; advice and lands back on the same variant.
+      ;; Preserve the launch mode for `revert-buffer' and code that reads
+      ;; `compilation-arguments'.
       (setq-local compilation-arguments
                   (or compilation-args
                       (list command (and interactive t) nil nil)))
@@ -728,8 +723,7 @@ any other code that walks `compilation-arguments') re-runs via
         (let ((oh (max 1 (with-selected-window outwin
                            (floor (window-screen-lines)))))
               (ow (max 1 (window-max-chars-per-line outwin))))
-          (ghostel--set-size ghostel--term oh ow)
-          (setq ghostel--term-rows oh)))
+          (ghostel--set-size ghostel--term oh ow)))
       ;; Render the compilation header into the terminal before spawning
       ;; the command, so the user sees the "Compilation started at ..."
       ;; banner *during* the run rather than only when it finishes (the
@@ -1002,10 +996,7 @@ error highlighting in all cases."
    ((or continue (memq mode ghostel-compile-global-mode-excluded-modes))
     (funcall orig-fn command mode name-function highlight-regexp continue))
    ((eq mode t)
-    ;; Mirror stock `compilation-start': name-of-mode is "compilation"
-    ;; when MODE is t.  Spawn a writable ghostel terminal — same UX
-    ;; the legacy `ghostel-compile' had, so callers asking for an
-    ;; interactive buffer still get one (just rendered by ghostel).
+    ;; MODE=t means interactive comint-style compilation.
     (let* ((buf-name (compilation-buffer-name "compilation" t name-function))
            (buffer (ghostel-compile--start
                     command buf-name default-directory nil t

@@ -154,12 +154,7 @@ newest-first list aligns with the buffer-order regions."
 				      (should-not (string-match-p "abc" state)))))))
 
 (ert-deftest ghostel-test-fish-auto-inject-loads-integration ()
-  "Fish auto-inject shim chains to ghostel.fish and cleans XDG_DATA_DIRS.
-Regression test: the vendor_conf.d shim previously (a) inlined a
-partial copy of the integration and silently dropped the outbound
-\\='ssh' wrapper, and (b) used a temp variable name (\\='xdg_data_dirs')
-that collided with a fish-internal local variable, leaking
-\\='/fish'-suffixed paths back to exported XDG_DATA_DIRS."
+  "Fish auto-inject shim chains to ghostel.fish and cleans XDG_DATA_DIRS."
   :tags '(:fish)
   (skip-unless (executable-find "fish"))
   (let* ((ghostel-dir (or (ghostel--resource-root)

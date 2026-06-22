@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.35.4
+;; Version: 0.37.0
 ;; Package-Requires: ((emacs "28.1") (evil "1.0") (ghostel "0.8.0"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -77,9 +77,8 @@ buffer with \\[evil-ghostel-toggle-send-escape]."
                  (const :tag "Always to evil" evil)))
 
 (defcustom evil-ghostel-sync-render-max-iterations 10
-  "Iteration cap for the drain loop in `evil-ghostel--sync-render'.
-Each iteration waits up to 50 ms, bounding the total wait at ~500 ms so a
-runaway shell can't hang the caller."
+  "Iteration cap for waiting on terminal output to settle.
+Each iteration waits up to 50 ms, bounding the total wait at ~500 ms."
   :type 'integer)
 
 ;; Apply at load: a plain `setq' before load skips the `:set' above.
@@ -163,14 +162,17 @@ ORIG-FN is the advised function (TERM, FULL).  Skipped in alt-screen (1049)."
 
 ;; Cursor style: let evil control cursor shape
 
-(defun evil-ghostel--override-cursor-style (orig-fn style visible)
+(defun evil-ghostel--override-cursor-style (orig-fn)
   "Let evil control cursor shape instead of the terminal.
 ORIG-FN is the advised setter (STYLE, VISIBLE); deferred to in alt-screen."
   (if (and evil-ghostel-mode
            ghostel--term
            (not (ghostel--mode-enabled ghostel--term 1049)))
-      (evil-refresh-cursor)
-    (funcall orig-fn style visible)))
+      ;; Evil owns the cursor now; end any terminal-driven blink that a
+      ;; full-screen app left running before we exited the alt-screen.
+      (progn (ghostel--cursor-blink-stop)
+             (evil-refresh-cursor))
+    (funcall orig-fn)))
 
 
 ;; Evil state hooks
@@ -298,12 +300,7 @@ Loops `accept-process-output' (capped by
 
 (defun evil-ghostel-goto-input-position (pos)
   "Drive the terminal cursor and Emacs point to buffer position POS.
-Returns t when the cursor reached POS.  Sends arrow keys to move the
-shell's line editor toward POS (analogous to `vterm-goto-char'), then
-snaps point to POS.  On rightward moves it detects and recovers from two
-inner-program echoes — literal \"^[[C\" arrow echo, and autosuggest
-accept-on-right-arrow — returning nil if either fired (see comments).
-Only meaningful in semi-char mode."
+Returns t when the cursor reached POS.  Only meaningful in semi-char mode."
   (when (and ghostel--term ghostel--cursor-pos)
     (let* ((start-char-pos ghostel--cursor-char-pos)
            (start-cursor ghostel--cursor-pos)
@@ -363,8 +360,7 @@ the delete lands when the shell echoes it.  Semi-char only."
       (evil-ghostel-goto-input-position end)
       (dotimes (_ count)
         (ghostel--send-encoded "backspace" ""))
-      ;; Drain so `ghostel--cursor-pos' reflects the post-backspace position
-      ;; before any caller (e.g. `evil-ghostel-insert' for cc / cw) reads it.
+      ;; Keep cursor state current for commands that continue editing.
       (evil-ghostel--sync-render)
       (goto-char beg))
     count))
@@ -382,9 +378,7 @@ STRING through bracketed paste.  Only meaningful in `semi-char' mode."
 ;; Motions (the few that must be prompt-aware)
 
 (evil-define-motion evil-ghostel-first-non-blank ()
-  "Move point to the first input character after the prompt.
-On a prompt row, jumps past the prompt prefix; otherwise falls through
-to `evil-first-non-blank'."
+  "Move to the first input character after the prompt."
   :type exclusive
   (if (or (evil-ghostel--active-p)
           (evil-ghostel--line-mode-active-p))
@@ -407,9 +401,7 @@ $ would walk into non-typed cells).  Off the cursor row, unchanged."
       (goto-char (1- input-end)))))
 
 (evil-define-motion evil-ghostel-next-line (count)
-  "Move COUNT lines down, but not past the terminal cursor's row.
-Prevents `j' from stranding the user on empty renderer rows below the
-live prompt.  Falls through to `evil-next-line' outside semi-char."
+  "Move COUNT lines down, but not past the terminal cursor's row."
   :type line
   (if (not (evil-ghostel--active-p))
       (evil-next-line count)
@@ -428,9 +420,7 @@ live prompt.  Falls through to `evil-next-line' outside semi-char."
         (move-to-column col)))))
 
 (defun evil-ghostel-goto-cursor ()
-  "Move point to the live terminal cursor.
-Replaces `evil-goto-line' (G) in ghostel buffers — the natural \"go to
-the prompt\" gesture.  Outside semi-char, runs `evil-goto-line'."
+  "Move point to the live terminal cursor."
   (interactive)
   (if (not (evil-ghostel--active-p))
       (call-interactively #'evil-goto-line)
@@ -440,9 +430,7 @@ the prompt\" gesture.  Outside semi-char, runs `evil-goto-line'."
 ;; Insert / Append
 
 (defun evil-ghostel-insert ()
-  "Enter insert state at point, driving the shell cursor to match.
-Off the cursor row, snap to `ghostel-input-start-point'; on it, drive to
-point clamped to `evil-ghostel--input-end'.  Outside semi-char, `evil-insert'."
+  "Enter insert state at point, driving the shell cursor to match."
   (interactive)
   (cond
    ((not (evil-ghostel--active-p))
@@ -458,9 +446,7 @@ point clamped to `evil-ghostel--input-end'.  Outside semi-char, `evil-insert'."
     (evil-insert-state 1))))
 
 (defun evil-ghostel-insert-line ()
-  "Move to the start of input on the current line, then enter insert.
-Drives the shell cursor to `ghostel-input-start-point' (semi-char) or
-jumps to `ghostel--line-input-start' (line mode); else `evil-insert-line'."
+  "Move to the start of input on the current line, then enter insert."
   (interactive)
   (cond
    ((evil-ghostel--active-p)
@@ -473,10 +459,7 @@ jumps to `ghostel--line-input-start' (line mode); else `evil-insert-line'."
    (t (call-interactively #'evil-insert-line))))
 
 (defun evil-ghostel-append ()
-  "Append after point, driving the shell cursor to match.
-Target is one cell right of point (clamped to `evil-ghostel--input-end'),
-or point itself when point is at/past the cursor on a blank/eol cell.  Off
-the cursor row, snap to `ghostel-input-start-point'; else `evil-append'."
+  "Append after point, driving the shell cursor to match."
   (interactive)
   (cond
    ((not (evil-ghostel--active-p))
@@ -499,9 +482,7 @@ the cursor row, snap to `ghostel-input-start-point'; else `evil-append'."
     (evil-insert-state 1))))
 
 (defun evil-ghostel-append-line ()
-  "Move to the end of input on the current line, then enter insert.
-Symmetric to `evil-ghostel-insert-line': drives the cursor to
-`evil-ghostel--input-end' (semi-char) or `ghostel--line-input-end' (line)."
+  "Move to the end of input on the current line, then enter insert."
   (interactive)
   (cond
    ((evil-ghostel--active-p)
@@ -518,10 +499,9 @@ Symmetric to `evil-ghostel-insert-line': drives the cursor to
 
 (evil-define-operator evil-ghostel-delete
   (beg end type register yank-handler)
-  "Delete BEG..END via the PTY (semi-char), else run `evil-delete'.
-`evil-ghostel--clamp' trims the range to live input so overshoot (e.g.
-`dw' on the last word) can't over-delete; block deletes go per row.
-Covers d, dd, x, X."
+  "Delete BEG..END through the terminal when editing live input.
+Ranges are limited to the current input, including per-row handling for
+block deletes.  Covers d, dd, x, and X."
   (interactive "<R><x><y>")
   (if (not (evil-ghostel--active-p))
       (evil-delete beg end type register yank-handler)
@@ -670,18 +650,16 @@ unless at end-of-input, where a right arrow would accept a suggestion."
         (ghostel--paste-text text)))))
 
 (defun evil-ghostel-paste-after (&optional count register yank-handler)
-  "Paste after the cursor via bracketed paste.  Covers p.
-COUNT repeats; REGISTER selects a register; YANK-HANDLER is forwarded to
-`evil-paste-after' in the fall-through path."
+  "Paste after the cursor via bracketed paste COUNT times from REGISTER.
+YANK-HANDLER is used by Evil outside live terminal input.  Covers p."
   (interactive "*P")
   (if (evil-ghostel--active-p)
       (evil-ghostel--do-paste count register t)
     (evil-paste-after count register yank-handler)))
 
 (defun evil-ghostel-paste-before (&optional count register yank-handler)
-  "Paste before the cursor via bracketed paste.  Covers P.
-COUNT repeats; REGISTER selects a register; YANK-HANDLER is forwarded to
-`evil-paste-before' in the fall-through path."
+  "Paste before the cursor via bracketed paste COUNT times from REGISTER.
+YANK-HANDLER is used by Evil outside live terminal input.  Covers P."
   (interactive "*P")
   (if (evil-ghostel--active-p)
       (evil-ghostel--do-paste count register nil)
@@ -691,8 +669,7 @@ COUNT repeats; REGISTER selects a register; YANK-HANDLER is forwarded to
 ;; Undo / Redo
 
 (defun evil-ghostel-undo (count)
-  "Send Ctrl-_ (readline undo) COUNT times.  Covers u.
-Falls through to `evil-undo' outside semi-char."
+  "Send Ctrl-_ (readline undo) COUNT times.  Covers u."
   (interactive "p")
   (if (not (evil-ghostel--active-p))
       (evil-undo count)
@@ -700,8 +677,7 @@ Falls through to `evil-undo' outside semi-char."
       (ghostel--send-encoded "_" "ctrl"))))
 
 (defun evil-ghostel-redo (count)
-  "Redo is not supported in the terminal.
-COUNT is forwarded to `evil-redo' in the fall-through path."
+  "Run Evil redo COUNT times when not editing live terminal input."
   (interactive "p")
   (if (not (evil-ghostel--active-p))
       (evil-redo count)
@@ -865,12 +841,11 @@ Decides whether the global advice can be removed on the last disable."
 
 ;;;###autoload
 (define-minor-mode evil-ghostel-mode
-  "Minor mode for evil integration in ghostel terminal buffers.
-Binds the `evil-ghostel-*' operators in `evil-ghostel-mode-map' and syncs
-the terminal cursor with point across evil state transitions.  It also advises
-`ghostel--redraw' and `ghostel--set-cursor-style' (to preserve point and the
-evil cursor style); since the mode is buffer-local but the advice global,
-the advice is installed on first enable and removed on the last disable."
+  "Minor mode for Evil integration in ghostel terminal buffers.
+Binds Evil operators to terminal-aware variants and keeps point aligned
+with the terminal cursor across Evil state transitions.
+
+Enabling installs global advice while any buffer has the mode enabled."
   :lighter nil
   :keymap evil-ghostel-mode-map
   (if evil-ghostel-mode
@@ -890,10 +865,8 @@ the advice is installed on first enable and removed on the last disable."
         ;; states expect point to follow the terminal cursor.
         (add-hook 'evil-emacs-state-entry-hook
                   #'evil-ghostel--insert-state-entry nil t)
-        ;; `advice-add' is idempotent per (symbol, fn), so re-adding on
-        ;; every enable is safe — no separate install flag needed.
         (advice-add 'ghostel--redraw :around #'evil-ghostel--around-redraw)
-        (advice-add 'ghostel--set-cursor-style :around
+        (advice-add 'ghostel--apply-cursor-style :around
                     #'evil-ghostel--override-cursor-style)
         (evil-refresh-cursor))
     (remove-hook 'evil-insert-state-entry-hook
@@ -903,7 +876,7 @@ the advice is installed on first enable and removed on the last disable."
     (kill-local-variable 'ghostel-mark-activation-input-mode)
     (unless (evil-ghostel--any-active-elsewhere-p (current-buffer))
       (advice-remove 'ghostel--redraw #'evil-ghostel--around-redraw)
-      (advice-remove 'ghostel--set-cursor-style
+      (advice-remove 'ghostel--apply-cursor-style
                      #'evil-ghostel--override-cursor-style))))
 
 (provide 'evil-ghostel)

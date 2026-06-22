@@ -499,11 +499,7 @@ exits, so a regression here would leak the timer past the buffer's life."
         (should (= 1 stop-calls))))))
 
 (ert-deftest ghostel-test-progress-preserves-input-mode-tag ()
-  "Progress updates compose with `ghostel--mode-line-tag', not clobber it.
-Regression test: the previous implementation overwrote
-`mode-line-process' directly, so OSC 9;4 progress reports erased
-input-mode labels like \":Char\" or \":Line\".  The composed
-`mode-line-process' must contain both the tag and the progress."
+  "Progress updates compose with the input-mode tag in `mode-line-process'."
   (with-temp-buffer
     (setq ghostel--mode-line-tag ":Line")
     (ghostel--mode-line-refresh)
@@ -534,10 +530,7 @@ the spinner is active."
       (should (equal ":Char" mode-line-process)))))
 
 (ert-deftest ghostel-test-mode-line-refresh-skips-fmlu-when-unchanged ()
-  "Refresh skips FMLU when the composed mode-line value is unchanged.
-Regression: the previous `ghostel--mode-line-refresh' always
-fired `force-mode-line-update', defeating the no-spam contract
-that motivated the face-cache fix on the progress callpath."
+  "Refresh skips FMLU when the composed mode-line value is unchanged."
   (let ((fmlu-calls 0))
     (cl-letf (((symbol-function #'force-mode-line-update)
                (lambda (&rest _) (cl-incf fmlu-calls))))
@@ -566,14 +559,8 @@ that motivated the face-cache fix on the progress callpath."
 
 (ert-deftest ghostel-test-osc-partial-does-not-starve-later ()
   "A partial OSC must not cannibalize a following complete OSC.
-Input \"\\e]7;PARTIAL\\e]52;c;aGVsbG8=\\a\" used to be treated as
-two distinct OSCs by ghostel's own scanner: the partial OSC 7 was
-dropped and OSC 52 dispatched.  ghostty-vt's OSC parser treats the
-intervening \\e] as the end of the OSC 7 (truncating its payload to
-\"PARTIAL\") and then starts OSC 52 fresh — both dispatch, and the
-truncated OSC 7 lands as PWD = \"PARTIAL\".  This test pins the new
-behavior so a regression toward the old reject-partial logic would
-be caught."
+The parser dispatches the truncated OSC 7 payload and then starts OSC 52
+fresh."
   :tags '(native)
   (ghostel-test--with-pty-matrix backend
     (ghostel-test--with-raw-cat-buffer (buf proc)

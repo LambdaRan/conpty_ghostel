@@ -139,6 +139,17 @@ modes (47 / 1047 / 1049) are handled uniformly."
     (ghostel--redraw term)
     (should (equal '(5 . 3) ghostel--cursor-pos))))
 
+(ert-deftest ghostel-test-redraw-publishes-cursor-style-buffer-locals ()
+  "Native redraw publishes cursor style data without applying it."
+  :tags '(native)
+  (let ((term (ghostel--new 25 80 1000)))
+    (with-temp-buffer
+      (setq-local cursor-type 'box)
+      (ghostel--write-vt term "\e[?25l")
+      (ghostel--redraw term)
+      (should-not ghostel--cursor-style)
+      (should (equal cursor-type 'box)))))
+
 (ert-deftest ghostel-test-erase ()
   "Test CSI erase sequences."
   :tags '(native)
@@ -277,9 +288,7 @@ dimensions otherwise."
 		  (ghostel--adjust-size 'fake-window))
         (should (equal '(32 120) set-size-args))
         (should ghostel--force-next-redraw)
-        (should redraw-called)
-        (should (= 32 ghostel--term-rows))
-        (should (= 120 ghostel--term-cols))))))
+        (should redraw-called)))))
 
 (ert-deftest ghostel-test-resize-rows-only-outside-minibuffer-still-resizes ()
   "Rows-only resize with no minibuffer active goes through the normal path.
@@ -303,9 +312,7 @@ shell so $LINES stays accurate."
 		  (ghostel--adjust-size 'fake-window))
         (should (equal '(32 120) set-size-args))
         (should ghostel--force-next-redraw)
-        (should redraw-called)
-        (should (= 32 ghostel--term-rows))
-        (should (= 120 ghostel--term-cols))))))
+        (should redraw-called)))))
 
 (ert-deftest ghostel-test-resize-cols-change-during-minibuffer-still-resizes ()
   "Cols change during a minibuffer still goes through the normal path.
@@ -330,9 +337,7 @@ minibuffer state."
 		  (ghostel--adjust-size 'fake-window))
         (should (equal '(40 100) set-size-args))
         (should ghostel--force-next-redraw)
-        (should redraw-called)
-        (should (= 40 ghostel--term-rows))
-        (should (= 100 ghostel--term-cols))))))
+        (should redraw-called)))))
 
 (ert-deftest ghostel-test-cleanup-temp-paths-handles-files-and-dirs ()
   "`ghostel--cleanup-temp-paths' deletes files and recursively deletes dirs.
@@ -404,6 +409,24 @@ state from the wrong buffer after feeding output to the native module."
       (kill-buffer ghostel-buf)
       (kill-buffer other-buf))))
 
+(ert-deftest ghostel-test-apply-cursor-style-from-render-state ()
+  "Apply cursor style from buffer-local render state."
+  (let ((buf (generate-new-buffer " *ghostel-test-apply-cursor*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq cursor-type 'box)
+          (setq-local ghostel--cursor-style 0)
+          (ghostel--apply-cursor-style)
+          (should (equal cursor-type '(bar . 2)))
+          (setq-local ghostel--cursor-style 2)
+          (ghostel--apply-cursor-style)
+          (should (equal cursor-type '(hbar . 2)))
+          (setq-local ghostel--cursor-style nil)
+          (ghostel--apply-cursor-style)
+          (should (null cursor-type)))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-ignore-cursor-change ()
   "Test that `ghostel-ignore-cursor-change' suppresses cursor style updates."
   (let ((buf (generate-new-buffer " *ghostel-test-ignore-cursor*")))
@@ -413,13 +436,57 @@ state from the wrong buffer after feeding output to the native module."
           ;; Default: cursor changes are applied
           (let ((ghostel-ignore-cursor-change nil))
             (setq cursor-type 'box)
-            (ghostel--set-cursor-style 2 t)
+            (setq-local ghostel--cursor-style 2)
+            (ghostel--apply-cursor-style)
             (should (equal cursor-type '(hbar . 2))))
           ;; With ignore: cursor changes are suppressed
           (let ((ghostel-ignore-cursor-change t))
             (setq cursor-type 'box)
-            (ghostel--set-cursor-style 1 t)
+            (setq-local ghostel--cursor-style 1)
+            (ghostel--apply-cursor-style)
             (should (equal cursor-type 'box))))  ; unchanged
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-cursor-blink ()
+  "A blinking cursor request starts the blink timer; steady cancels it."
+  (let ((buf (generate-new-buffer " *ghostel-test-cursor-blink*")))
+    (unwind-protect
+        ;; Pretend we are on a graphical display and the user has the
+        ;; global blink off, so `ghostel--cursor-blink-start' engages.
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t)))
+          (with-current-buffer buf
+            (ghostel-mode)
+            (let ((blink-cursor-mode nil))
+              ;; Blinking block requested -> timer running, box shape,
+              ;; and both blink hooks installed buffer-locally.
+              (setq ghostel--cursor-blinking t)
+              (setq ghostel--cursor-style 1)
+              (ghostel--apply-cursor-style)
+              (should (equal cursor-type 'box))
+              (should (timerp ghostel--cursor-blink-timer))
+              (should (memq #'ghostel--cursor-blink-restore-window
+                            window-buffer-change-functions))
+              (should (memq #'ghostel--cursor-blink-stop kill-buffer-hook))
+              ;; Steady request -> timer cancelled and hooks removed.
+              (setq ghostel--cursor-blinking nil)
+              (setq ghostel--cursor-style 1)
+              (ghostel--apply-cursor-style)
+              (should-not ghostel--cursor-blink-timer)
+              (should-not (memq #'ghostel--cursor-blink-restore-window
+                                window-buffer-change-functions))
+              (should-not (memq #'ghostel--cursor-blink-stop kill-buffer-hook))
+              ;; Blinking again, then hidden cursor -> cancelled, hooks gone.
+              (setq ghostel--cursor-blinking t)
+              (setq ghostel--cursor-style 0)
+              (ghostel--apply-cursor-style)
+              (should (timerp ghostel--cursor-blink-timer))
+              (setq ghostel--cursor-style nil)
+              (ghostel--apply-cursor-style)
+              (should-not ghostel--cursor-blink-timer)
+              (should-not (memq #'ghostel--cursor-blink-restore-window
+                                window-buffer-change-functions)))))
+      ;; `kill-buffer' runs the buffer-local `kill-buffer-hook' that
+      ;; `ghostel--cursor-blink-start' installs, cancelling any timer.
       (kill-buffer buf))))
 
 (provide 'ghostel-terminal-test)

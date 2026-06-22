@@ -4,7 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-06-21
+
+### Added
+- `ghostel-initial-input-mode` lets new `ghostel` terminals start in
+  semi-char, char, or line mode; line mode is entered automatically after the
+  first prompt is detected.
+
 ### Changed
+- Pasting now uses libghostty's paste encoder, matching terminal state for
+  bracketed paste, newline normalization, and filtering unsafe control bytes.
+
+### Fixed
+- Resizing a terminal while the cursor is not on the bottom row no longer leaves
+  the rendered buffer out of sync.
+
+### Internal
+- Line-mode-specific code was split into `lisp/ghostel-line-mode.el`.
+- Renderer resize invalidation was simplified, and the renderer now owns native
+  terminal row/column bookkeeping when resizes are committed.
+- Hypothesis driver coverage was fixed.
+
+## [0.36.0] — 2026-06-21
+
+### Added
+- `isearch` and minibuffer navigation (`consult-line`, etc.) in semi-char mode
+  now switch to a read-only mode when they leave you parked in the scrollback,
+  mirroring a mouse click — so the next redraw no longer yanks point back to
+  the prompt.  The target mode is picked by the new
+  `ghostel-point-leave-input-mode` defcustom (`copy` default, `emacs`, or nil
+  to disable).  Wired into `isearch-mode-end-hook` and `minibuffer-exit-hook`;
+  for other jump packages (avy, flash, …) add the new command
+  `ghostel-maybe-leave-input` to their after-jump hook or as `:after` advice.
+  Mouse selection and region activation keep their independent
+  `ghostel-mouse-drag-input-mode` / `ghostel-mark-activation-input-mode` knobs.
+- Blinking cursor support. A terminal app that requests a blinking cursor
+  (DECSCUSR `CSI 5/3/1 SP q`, i.e. mode 12) now blinks the cursor in the Emacs
+  buffer instead of rendering it steady. Works for the bar, block, and
+  underline shapes. Yields to the global `blink-cursor-mode` when that is
+  enabled (no double-blink); graphical frames only.
+
+### Changed
+- Programs launched by Ghostel are now resolved through Emacs's `exec-path`
+  (bare names) and `default-directory` (names with a directory component)
+  before being spawned, instead of relying on the child inheriting `PATH`.
+  The resolved binary now matches what other Emacs commands (`executable-find`,
+  `M-x compile`, …) would find, and remote TRAMP buffers are unaffected.
 - Internal libghostty VT-parser warnings no longer leak to the module's
   stderr in release builds. In a terminal Emacs (`emacs -nw`) that stderr is
   the controlling tty, so the warnings were painted onto the screen outside
@@ -12,6 +57,12 @@ All notable changes to this project will be documented in this file.
   stale line near the mode line after running lazygit (#425). Such logs are
   now available only via `M-x ghostel-debug-start` (`*ghostel-debug*`);
   debug builds keep console output as before.
+
+### Internal
+- Cursor style (shape) is now driven from Elisp rather than the Zig renderer,
+  unifying cursor control with the new blink support.
+- The forked child now writes via `posix.write` instead of a Zig buffered
+  writer, keeping the post-fork / pre-exec path async-signal-safe.
 
 ## [0.35.4] — 2026-06-19
 

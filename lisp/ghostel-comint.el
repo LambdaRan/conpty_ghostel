@@ -125,9 +125,8 @@ For full coverage disable `font-lock-mode' in the comint buffer."
   "Preoutput filter: hand STRING to ghostel's VT parser, return propertized text.
 Suitable for `comint-preoutput-filter-functions'.
 
-When the host buffer has `font-lock-mode' enabled, rewrites `face' text
-properties to `font-lock-face' so font-lock's unfontify pass doesn't
-strip our colours (see `ghostel-comint--face-to-font-lock-face')."
+When the host buffer has `font-lock-mode' enabled, protects the
+terminal colours from font-lock's unfontify pass."
   (unless ghostel-comint--state
     (ghostel--load-module)
     (setq ghostel-comint--state (ghostel--comint-make-state))
@@ -149,7 +148,6 @@ Adds `ghostel-comint-filter' as the first entry of the buffer-local
 `ansi-color-process-output' from `comint-output-filter-functions' so the
 two don't double-process bytes.
 
-See the file commentary for what's gained and what's not.
 
 For performance, xterm-color recommends disabling font-locking in
 shell-mode buffers — the same advice applies here.  Add this to your

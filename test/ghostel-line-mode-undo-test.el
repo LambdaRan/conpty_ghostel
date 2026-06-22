@@ -2,10 +2,9 @@
 
 ;;; Commentary:
 
-;; Undo in line mode: recording is armed for the user's input-region
-;; edits, the renderer and the snapshot/restore helpers are shielded so
-;; their mutations never pollute the undo list, and recording is
-;; disabled again outside line mode.  See plans/line-mode-undo.md.
+;; Undo in line mode records user edits in the input region only.
+;; Renderer mutations and snapshot/restore bookkeeping stay out of the
+;; undo list, and recording is disabled outside line mode.
 
 ;;; Code:
 
@@ -126,13 +125,8 @@ start, so an undo can never delete the prompt or earlier output."
                        scrollback-before))))))
 
 ;; 6.4 — a redraw firing between edits does not corrupt undo.
-;; This is the central test for the renderer shield and the
-;; stale-position risk (plan §5 / open question 1).  The renderer
-;; shield keeps the grid rewrites out of the undo list; the restore
-;; re-arms an empty history because the input was re-inserted at a moved
-;; prompt and the old undo positions are stale.  An undo AFTER the
-;; redraw must therefore act on the input's CURRENT location, never on
-;; the renderer's output that now sits where the input used to be.
+;; Redraw rewrites must stay out of undo history.  After a prompt moves,
+;; new edits should undo at the input's current position.
 (ert-deftest ghostel-test-line-mode-redraw-between-edits-no-undo-pollution ()
   "A redraw mid-edit preserves the input and leaves undo well-formed.
 The renderer's mutations never enter the undo list, the stale
@@ -151,14 +145,11 @@ correctly against the input's new position."
     ;; (line mode forces full redraws).
     (ghostel--write-vt term "some output\r\n\e]133;A\e\\$ \e]133;B\e\\")
     (ghostel--redraw-now buf)
-    ;; (a) Regression guard: the input survived snapshot/restore.
+    ;; The input survived snapshot/restore.
     (should (equal (ghostel--line-mode-input-text) "foo"))
-    ;; (b) The renderer's whole-viewport delete/insert storm did NOT
-    ;; pollute undo: the only thing left is the empty re-armed history.
+    ;; Renderer rewrites did not pollute undo.
     (should (null buffer-undo-list))
-    ;; (c) A new edit after the redraw undoes correctly — proving the
-    ;; history refers to the input's CURRENT position, not the stale
-    ;; pre-redraw one (which would have deleted renderer output).
+    ;; A new edit after the redraw undoes at the input's current position.
     (let ((scrollback-before (buffer-substring-no-properties
                               (point-min)
                               (marker-position ghostel--line-input-start))))

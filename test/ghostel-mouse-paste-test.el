@@ -1318,14 +1318,7 @@ binding wins."
               (lookup-key ghostel-readonly-mode-map (kbd "<return>")))))
 
 (ert-deftest ghostel-test-scroll-intercept-unselected-window ()
-  "Wheel events on an unselected ghostel window must not loop.
-
-Regression test: previously `ghostel--redispatch-scroll-event' set
-the buffer-local intercept flag in `current-buffer', which for wheel
-events on an unselected window is the *selected* window's buffer —
-not the ghostel buffer.  The flag therefore stayed t in the ghostel
-buffer and the re-dispatched event was intercepted again, hanging
-Emacs until `C-g'."
+  "Wheel events on an unselected ghostel window must not loop."
   (let ((ghostel-buf (generate-new-buffer " *ghostel-test-unsel*"))
         (other-buf (generate-new-buffer " *other-test-unsel*")))
     (unwind-protect

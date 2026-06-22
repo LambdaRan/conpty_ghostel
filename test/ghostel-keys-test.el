@@ -239,6 +239,49 @@ Without this guard a flood would spawn a storm of redraw timers."
         (should (equal sent '("a")))
         (should ghostel--last-send-time)))))
 
+(defun ghostel-test--paste-and-read-hex (text byte-count &optional setup)
+  "Paste TEXT to a byte-recorder child and return BYTE-COUNT bytes as hex.
+SETUP, when non-nil, is called before sending the paste."
+  (let ((python (executable-find "python3")))
+    (unless python (ert-skip "python3 not available"))
+    (ghostel-test--with-exec-buffer
+        (buf proc python
+             (list "-c" ghostel-test--pty-byte-recorder-script
+                   (number-to-string byte-count)))
+      (ghostel-test--wait-for-text "GHOSTEL_RECORDER_READY" proc 5)
+      (when setup (funcall setup))
+      (ghostel--paste-text text)
+      (ghostel-test--wait-for-marker-payload
+       "GHOSTEL_INPUT_HEX:"
+       (lambda (hex) (= (length hex) (* 2 byte-count)))
+       proc 5))))
+
+(ert-deftest ghostel-test-encode-paste-bracketed ()
+  "Bracketed-paste mode wraps pasted data via libghostty's paste encoder."
+  :tags '(native)
+  (ghostel-test--with-pty-matrix backend
+    (let ((expected (ghostel-test--hex-encode-string "\e[200~hello\e[201~")))
+      (should (equal expected
+                     (ghostel-test--paste-and-read-hex
+                      "hello" 17
+                      (lambda () (ghostel--write-vt ghostel--term "\e[?2004h"))))))))
+
+(ert-deftest ghostel-test-encode-paste-unbracketed-newline ()
+  "Without bracketed-paste mode, libghostty normalizes paste newlines to CR."
+  :tags '(native)
+  (ghostel-test--with-pty-matrix backend
+    (let ((expected (ghostel-test--hex-encode-string "hello\rworld")))
+      (should (equal expected
+                     (ghostel-test--paste-and-read-hex "hello\nworld" 11))))))
+
+(ert-deftest ghostel-test-encode-paste-strips-unsafe-bytes ()
+  "Libghostty replaces unsafe paste control bytes with spaces."
+  :tags '(native)
+  (ghostel-test--with-pty-matrix backend
+    (let ((expected (ghostel-test--hex-encode-string "a b")))
+      (should (equal expected
+                     (ghostel-test--paste-and-read-hex "a\C-cb" 3))))))
+
 (ert-deftest ghostel-test-send-encoded-fallback-writes-raw-key ()
   "When native encoding fails, raw fallback writes through `ghostel--write-pty'."
   (with-temp-buffer
@@ -430,9 +473,7 @@ instead of running Emacs commands like `forward-sexp'."
 
 (ert-deftest ghostel-test-control-punct-key-bindings ()
   "Control + non-letter keys route to `ghostel--send-event' in semi-char.
-C-] and C-/ previously fell through to Emacs (C-] = `abort-recursive-edit',
-C-/ = `undo') instead of reaching the shell/readline.  Only the keys that
-the ghostty encoder maps to a terminal byte are forwarded."
+Only keys that the ghostty encoder maps to a terminal byte are forwarded."
   (dolist (key-str '("C-]" "C-/"))
     (should (eq (lookup-key ghostel-semi-char-mode-map (kbd key-str))
                 #'ghostel--send-event)))

@@ -134,10 +134,7 @@ file mmap'd keeps a valid mapping (issue #247)."
         (delete-directory dir t)))))
 
 (ert-deftest ghostel-test-download-module-creates-missing-directory ()
-  "`ghostel--download-module' creates DIR before writing the module.
-Regression for the auto-install path: setting `ghostel-module-directory'
-to a path that does not yet exist used to fail silently because the
-temp-file write under that directory errored out."
+  "`ghostel--download-module' creates DIR before writing the module."
   (let* ((parent (make-temp-file "ghostel-dl-parent-" t))
          (dir (expand-file-name "sub/dir/" parent))
          (asset "ghostel-module-x86_64-linux.so"))

@@ -75,7 +75,7 @@ literal key."
    (should (memq 'evil-ghostel--insert-state-entry
                  evil-insert-state-entry-hook))
    (should (advice--p (advice--symbol-function 'ghostel--redraw)))
-   (should (advice--p (advice--symbol-function 'ghostel--set-cursor-style)))
+   (should (advice--p (advice--symbol-function 'ghostel--apply-cursor-style)))
    ;; Editing operators are bound via [remap evil-FOO] in normal state.
    (should (eq #'evil-ghostel-delete
                (lookup-key (evil-get-auxiliary-keymap
@@ -134,8 +134,7 @@ to nil buffer-locally so that chain yields to evil's own selection model."
        ;; Opted out -> activating the mark is a no-op, mode stays editable.
        (ghostel--mark-activated)
        (should-not copied)
-       ;; Control (proves the test is not vacuous): restore the default knob
-       ;; and the same hook DOES switch -> the nil knob is exactly what gates it.
+       ;; With the default knob restored, the hook switches modes.
        (let ((ghostel-mark-activation-input-mode 'copy))
          (ghostel--mark-activated)
          (should copied))))))
@@ -174,13 +173,13 @@ wrapper from every other ghostel buffer."
           (should (advice-member-p #'evil-ghostel--around-redraw
                                    'ghostel--redraw))
           (should (advice-member-p #'evil-ghostel--override-cursor-style
-                                   'ghostel--set-cursor-style))
+                                   'ghostel--apply-cursor-style))
           ;; Disable in B — no buffers left, advice removed.
           (with-current-buffer b (evil-ghostel-mode -1))
           (should-not (advice-member-p #'evil-ghostel--around-redraw
                                        'ghostel--redraw))
           (should-not (advice-member-p #'evil-ghostel--override-cursor-style
-                                       'ghostel--set-cursor-style)))
+                                       'ghostel--apply-cursor-style)))
       (when (buffer-live-p a) (kill-buffer a))
       (when (buffer-live-p b) (kill-buffer b)))))
 
@@ -205,9 +204,7 @@ wrapper from every other ghostel buffer."
       (customize-set-variable 'evil-ghostel-initial-state orig))))
 
 (ert-deftest evil-ghostel-test-mode-activation-preserves-initial-state ()
-  "Enabling `evil-ghostel-mode' must not clobber the initial-state setting.
-Regression guard: the minor-mode body used to call
-`evil-set-initial-state' on every activation, overriding user config."
+  "Enabling `evil-ghostel-mode' must not clobber the initial-state setting."
   (let ((orig evil-ghostel-initial-state))
     (unwind-protect
         (progn
@@ -717,14 +714,14 @@ arrows are sent (which the old `sync-inhibit' path mistakenly did)."
 ;; -----------------------------------------------------------------------
 
 (ert-deftest evil-ghostel-test-cursor-style-override ()
-  "Test that `ghostel--set-cursor-style' defers to evil."
+  "Test that `ghostel--apply-cursor-style' defers to evil."
   (evil-ghostel-test--with-buffer 5 40 "hello"
                                   (evil-normal-state)
-                                  (let ((evil-called nil)
-                                        (orig-called nil))
+                                  (let ((evil-called nil))
                                     (cl-letf (((symbol-function 'evil-refresh-cursor)
                                                (lambda (&rest _) (setq evil-called t))))
-                                      (ghostel--set-cursor-style 0 t)
+                                      (setq-local ghostel--cursor-style 0)
+                                      (ghostel--apply-cursor-style)
                                       (should evil-called)))))
 
 ;; -----------------------------------------------------------------------
@@ -961,8 +958,7 @@ then enters insert state.  Same vterm-style shape as `dd'."
        (should (= 5 (cl-count '("backspace" . "") keys-sent :test #'equal)))
        (should-not (cl-find '("e" . "ctrl") keys-sent :test #'equal))
        (should-not (cl-find '("u" . "ctrl") keys-sent :test #'equal))
-       ;; Bug fix: point lands at input-start (pos 3, just after "$ "),
-       ;; NOT at column 0 of the buffer line.
+       ;; Point lands at input-start (pos 3, just after "$ ").
        (should (= 3 (point)))
        (should (eq evil-state 'insert))))))
 
@@ -1112,10 +1108,6 @@ line)."
                       (push (cons k mods) keys-sent))))
            (evil-ghostel--passthrough-ctrl key))
          (should (cl-find (cons key "ctrl") keys-sent :test #'equal)))))))
-
-;; (Removed: evil-ghostel-test-ctrl-passthrough-invalidates-shadow.
-;; The shadow-cursor model is gone — the new architecture reads
-;; `ghostel--cursor-pos' directly each time.)
 
 (ert-deftest evil-ghostel-test-ctrl-passthrough-sends-in-alt-screen ()
   "Insert-state Ctrl passthrough remains active in alt-screen TUIs.
@@ -1480,25 +1472,12 @@ rather than silently dropping the keystroke."
      (should (eq 'normal evil-state)))))
 
 ;; -----------------------------------------------------------------------
-;; Test: beginning-of-line lands at input start, not column 0
-;; -----------------------------------------------------------------------
-
-;; (Removed: evil-ghostel-test-shadow-cursor-tracks-cursor-to-point and
-;; evil-ghostel-test-shadow-cursor-tracks-delete-region.  The shadow-cursor
-;; model is gone — the new operators read `ghostel--cursor-pos' directly
-;; each time and don't rely on a queued-key projection.  See the
-;; "Shadow-cursor: drop" analysis in plans/evil-rewrite-plan.md.)
-
-;; -----------------------------------------------------------------------
 ;; Test: cw doesn't emit redundant left arrows after delete
 ;; -----------------------------------------------------------------------
 
 (ert-deftest evil-ghostel-test-delete-word-with-trailing-space ()
-  "Regression: `dw' over `\"word \"' sends 5 backspaces, not 4.
-Trailing whitespace in single-line ranges is real user content.
-\(With the old per-line stripping heuristic applied to single-line
-ranges, `dw' over `\"word word word\" + ESC bb' would send only 4
-backspaces — leaving a stray `w' behind.)"
+  "`dw' over `\"word \"' sends 5 backspaces, not 4.
+Trailing whitespace in single-line ranges is real user content."
   (evil-ghostel-test--with-evil-buffer
    (setq-local ghostel--term t)
    (insert "word word word")
@@ -1955,12 +1934,9 @@ uniform color distinct from the typed char."
       (kill-buffer buf))))
 
 (ert-deftest evil-ghostel-test-input-end-keeps-input-when-cursor-at-start ()
-  "Trailing colored input is NOT mistaken for a suggestion at the line start.
-After deleting the first word the cursor sits at the input start over
-recolored real input (fish repaints it red).  With no typed text before
-the cursor there can be no suggestion, so the whole line stays editable —
-the luminance test used to compare the red input against the white prompt
-space and collapse the region."
+  "Trailing colored input is not mistaken for a suggestion at the line start.
+After deleting the first word, the cursor sits at the input start over
+recolored real input; the whole line remains editable."
   (let ((buf (generate-new-buffer " *eg-no-suggest-at-start*")))
     (unwind-protect
         (with-current-buffer buf

@@ -41,6 +41,23 @@ The `ghostel-test-clean' property is placed by
 
 ;;; Redraw harness and buffer invariants
 
+(ert-deftest ghostel-test-size-vars-follow-committed-resize ()
+  "`ghostel--term-rows' and `ghostel--term-cols' update when resize commits."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-size-vars*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((term (ghostel--new 5 40 1000)))
+            (should (= ghostel--term-rows 5))
+            (should (= ghostel--term-cols 40))
+            (ghostel--set-size term 7 30)
+            (should (= ghostel--term-rows 5))
+            (should (= ghostel--term-cols 40))
+            (ghostel--redraw term)
+            (should (= ghostel--term-rows 7))
+            (should (= ghostel--term-cols 30))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-redraw-preserves-mark ()
   "`ghostel--redraw' must keep `mark' stable across the destructive ops.
 Full redraws call `eraseBuffer' and partial redraws `deleteRegion',
@@ -792,11 +809,7 @@ This is the vterm-style growing-buffer model that lets `isearch' and
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-scrollback-bootstrap-not-blank ()
-  "First-time scrollback materialization must contain actual content.
-Regression test: when the initial (mostly empty) viewport was rendered
-and then a burst of output overflowed the screen, the promotion
-optimisation incorrectly kept the stale empty rows as scrollback
-instead of fetching the real content from libghostty."
+  "First-time scrollback materialization must contain actual content."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-sb-bootstrap*")))
     (unwind-protect
@@ -1245,6 +1258,31 @@ and `forward-line' for clean ones.  Only the dirty row loses the sentinel."
 
 ;;; Resize rendering
 
+(ert-deftest ghostel-test-expand-with-restored-cursor-keeps-scrollback ()
+  "Vertical expand with restored cursor keeps existing scrollback.
+When growing the viewport, libghostty only pulls scrollback into the active area
+when the cursor is at the bottom.  If the cursor is restored away from the
+bottom while the resize is pending, the existing scrollback row must remain
+materialized above the expanded active area."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-restore-cursor*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 2 10 10))
+                 (inhibit-read-only t))
+            (ghostel--write-vt term "row0\r\nrow1\r\n")
+            (ghostel--set-size term 3 10)
+            ;; DECRC restores the default saved cursor position, away from the
+            ;; bottom, before the pending resize commits on redraw.
+            (ghostel--write-vt term "\e8")
+            (ghostel--redraw term)
+            ;; row0 is still scrollback; row1 plus two blank rows are the
+            ;; expanded active area.
+            (should (equal "row0\nrow1\n\n\n"
+                           (buffer-substring-no-properties
+                            (point-min) (point-max))))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-content-preserved-across-vertical-resizes ()
   "Buffer content survives expand then shrink without loss or duplication.
 Expands from the initial size (staying within the available scrollback so
@@ -1336,10 +1374,7 @@ the written content; all remaining lines must be empty."
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-resize-no-blank-flash ()
-  "Buffer keeps old content after resize; redraw replaces it atomically.
-Regression test: fnSetSize used to call `erase-buffer' synchronously,
-leaving the buffer visibly empty until the next timer-driven redraw.
-Now the erasure is deferred into redraw() under `inhibit-redisplay'."
+  "Buffer keeps old content after resize; redraw replaces it atomically."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-resize-no-blank*")))
     (unwind-protect

@@ -149,11 +149,8 @@ SPECS is a plist with these keys:
 (ert-deftest ghostel-test-glyph-adjust-clamps-on-ascent ()
   "An oversized glyph is clamped by its ascent when only the ascent overflows.
 The default font is 10 ascent / 10 descent.  This glyph's ascent (20)
-exceeds the default ascent while its descent (5) fits, so the row would
-grow above the baseline.  The scale must bound the ascent side
-\(10/20 = 0.5\), which is stricter than the sum ratio
-\(20/25 = 0.8\) the old height-based code used and which would have left
-the ascent over the line."
+exceeds the default ascent while its descent (5) fits.  The scale must
+bound the ascent side (10/20 = 0.5)."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-glyph-ascent*")))
     (unwind-protect

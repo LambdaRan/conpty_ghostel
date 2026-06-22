@@ -163,12 +163,9 @@ fired but the underlying signal vanished by the time we looked again
 ;;;###autoload
 (defun ghostel-debug-password-events-show ()
   "Display recent password-prompt rising edges.
-Shows every fire of `ghostel--detect-password-prompt' along with the
-arm that triggered it (libghostty heuristic / regex on remote / regex
-on unobservable tty), the cursor row text at the moment, and the
-buffer's remote-shell state.  Use this to diagnose spurious
-`read-passwd' prompts: the entry that opened the unwanted minibuffer
-will identify which detection arm misfired."
+Shows which detection arm fired, the cursor row text at the time,
+and whether the buffer was in a remote shell.  Use this to diagnose
+spurious `read-passwd' prompts."
   (interactive)
   (let ((out (get-buffer-create "*ghostel-debug-password*")))
     (with-current-buffer out
@@ -1390,19 +1387,10 @@ ghostel produces (rendered locally in the `Key encoding' section)."
 (defun ghostel-debug-ghostel (&optional arg)
   "Like `ghostel', but capture spawn diagnostics into the new buffer.
 
-The new buffer carries a snapshot of:
-- the wrapper command as sent to `make-process' (with the on-remote
-  TERM preamble for TRAMP spawns — the smoking gun for #224-class
-  bugs)
-- the `process-environment' that ghostel was about to push
-- phase timestamps: `ghostel--start-process' entry, spawn entry
-  (`ghostel--spawn-pty' or `ghostel--conpty-proxy-make-process'),
-  first output byte received.  The deltas isolate where time goes
-  per spawn (elisp prep / transport + shell startup) — useful for
-  diagnosing spawn slowness on any platform.
-- the first ~16 KB of output (did the shell start?  Send a
-  prompt?  Garbage?)
-- the first ~64 keystrokes you typed
+The capture includes the wrapper script, process environment, phase
+timestamps (covering both `ghostel--spawn-pty' and
+`ghostel--conpty-proxy-make-process'), early PTY output, and the
+first keystrokes typed.
 
 ARG is forwarded to `ghostel' (same prefix-argument conventions).
 View the capture with \\[ghostel-debug-info]."
@@ -1588,10 +1576,8 @@ command, where KIND is `:write-pty' or `:send-string').")
 After you press one key, a report appears in *ghostel-debug-keypress*
 suitable for pasting into a GitHub issue.
 
-Captures the raw event, the resolved keymap binding, every byte that
-flowed through `ghostel--send-string' or `ghostel--write-pty' during
-the command, terminal mode flags (DECCKM, DECKPAM, bracketed paste,
-mouse modes, alt screen, sync output), and process state."
+Captures the raw event, resolved key binding, terminal bytes emitted
+during the command, terminal mode flags, and process state."
   (interactive)
   (unless (derived-mode-p 'ghostel-mode)
     (user-error "Not in a ghostel buffer"))

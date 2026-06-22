@@ -28,9 +28,7 @@
       (should-not (string-match-p "\\*\\*" (cdr result))))))
 
 (ert-deftest ghostel-test-project-universal-arg ()
-  "`ghostel-project' forwards the prefix arg AND binds `ghostel-buffer-name'.
-The captured value of `ghostel-buffer-name' at `ghostel' call time
-proves the project-prefixed binding actually took effect."
+  "`ghostel-project' forwards the prefix arg and binds `ghostel-buffer-name'."
   (require 'project)
   ;; Numeric prefix arg (C-5 M-x ghostel-project)
   (let ((ghostel-buffer-name "*ghostel*")
@@ -166,8 +164,8 @@ proves the project-prefixed binding actually took effect."
             (ghostel--init-buffer buf 7 33))
           (with-current-buffer buf
             (should (eq ghostel--term 'new-term))
-            (should (= ghostel--term-rows 7))
-            (should (= ghostel--term-cols 33))
+            (should-not ghostel--term-rows)
+            (should-not ghostel--term-cols)
             (should (equal ghostel--managed-buffer-name "managed"))
             (should (equal ghostel--buffer-identity "identity"))))
       (kill-buffer buf))))
@@ -184,8 +182,8 @@ proves the project-prefixed binding actually took effect."
           (with-current-buffer buf
             (should (derived-mode-p 'ghostel-mode))
             (should (eq ghostel--term 'fake-term))
-            (should (= ghostel--term-rows 7))
-            (should (= ghostel--term-cols 33))
+            (should-not ghostel--term-rows)
+            (should-not ghostel--term-cols)
             (should-not ghostel--buffer-identity)))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
