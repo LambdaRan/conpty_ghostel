@@ -100,6 +100,9 @@ Native PTY 事件:
 
 ### Elisp 层 (lisp/)
 - `ghostel.el` — 主模块：终端创建、PTY/ConPTY 生成、渲染循环、快捷键、shell 集成、TRAMP
+- `ghostel-line-mode.el` — line-mode（从 ghostel.el 提取，上游 v0.36.0）
+- `ghostel-kitty.el` — Kitty 图形协议 Elisp 层（上游 v0.36.0）
+- `ghostel-ime.el` — Emacs Lisp IME 集成（可选，autoload 加载）
 - `ghostel-comint.el` — comint 集成，将 libghostty VT 解析器作为 comint preoutput 过滤器
 - `ghostel-compile.el` — 使用真实 TTY 的 `M-x compile` 替代（支持进度条、颜色、TUI 工具）
 - `ghostel-eshell.el` — 将 eshell 可视命令 (vim, htop) 路由到 ghostel
@@ -119,6 +122,8 @@ libghostty-vt 由 Zig 包管理器获取（见 `build.zig.zon`），通过 `cons
 |---|---|---|
 | `lisp/ghostel.el` | `ghostel--conpty-proxy-make-process` | 通过 `conpty_proxy.exe` 生成 shell（替代 Unix PTY） |
 | `lisp/ghostel.el` | `ghostel--conpty-proxy-resize` | 通过 Zig `ghostel--conpty-resize` 调整大小（替代 Unix ioctl） |
+| `lisp/ghostel.el` | `declare-function ghostel--conpty-resize` | 必须在 `ghostel.el` 声明，否则 byte-compile 报 warning |
+| `lisp/ghostel.el` | ConPTY post-spawn | `(process-put proc 'adjust-window-size-function nil)` — 必须为 `nil`（与 PTY 路径一致），resize 由 `ghostel--adjust-size` 通过 `window-size-change-functions` 处理 |
 | `src/module.zig` | `ghostel--conpty-resize` / `fnConptyResize` | 写入命名管道 `\\.\pipe\conpty-proxy-ctrl-{id}` |
 | `src/NativeProcess.zig` | 全文件 | `comptime` 守卫：POSIX-only 函数（`run`、`loop`、`deinit`）在 Windows 上返回空；struct 字段使用 `posix.fd_t` + `invalid_fd` 哨兵 |
 | `src/PtyProcess.zig` | 全文件 | `comptime` 守卫：`@cImport` 条件编译（Windows 跳过 `sys/ioctl.h` 等）；`Pty` 在 Windows 上为无字段 stub struct |
@@ -128,10 +133,11 @@ libghostty-vt 由 Zig 包管理器获取（见 `build.zig.zon`），通过 `cons
 
 ### 已知问题
 - **CRLF 规范化**：上游 v0.35 重构将 `ghostel--write-input` 拆分为 `ghostel--write-vt` + `ghostel--write-pty`，原有的流式 CRLF 规范化（在 `\n` 前插入缺失 `\r`）被移除。如果 Windows ConPTY 输出出现换行显示异常，需在 Elisp `ghostel--filter` 或 Zig `vtWrite` 中重新添加。
+- **括号嵌套陷阱**：Fork 在 `let*` bindings 中添加 `(if ...)` 条件分支时，会多一层嵌套。必须在 binding 末尾多加一个 `)` 来关闭 bindings 列表，否则 let* body 会被错误地嵌套在 bindings 中。`check-parens` 只验证整体平衡，无法检测此类嵌套错误；必须用 `batch-byte-compile` 检查自由变量引用。
 
 ## 上游同步工作流
 
-> **严格按步骤执行：** 步骤 1→2→3→4→5 必须逐项完成，不得跳过或合并。
+> **严格按步骤执行：** 步骤 1→2→3→4→5→6 必须逐项完成，不得跳过或合并。
 
 ### 步骤 1：拉取并合并
 
@@ -143,17 +149,19 @@ git merge upstream/main --no-edit
 
 预期冲突位置：
 - `src/module.zig` — `emacs_functions` 表和 import 区域（上游可能重构注册模式）
-- `lisp/ghostel.el` — `ghostel--start-process` 中 Windows 条件分支、`ghostel--adjust-size` resize 逻辑
+- `lisp/ghostel.el` — `ghostel--start-process` 中 Windows 条件分支、`ghostel--adjust-size` resize 逻辑、`ghostel--send-encoded` 按键处理
 - `src/emacs.zig` — Emacs API 封装层（类型变更如 `isize` → `c_long`、新增函数如 `openChannel`）
 - `src/GhostelTerm.zig` — 函数注册表和实现（核心逻辑集中于此）
 - `src/NativeProcess.zig` / `src/PtyProcess.zig` — 上游 POSIX-only 代码需要 Windows `comptime` 守卫
 - `lisp/ghostel-debug.el` — spawn capture plist 键名（上游可能重命名如 `:width` → `:cols`）
+- `lisp/ghostel-line-mode.el` / `lisp/ghostel-kitty.el` — 上游新增的拆分文件（fork 可能需要同步 `(require ...)` 声明）
 - `.gitignore` — 双方可能各自新增忽略条目
 
 解决冲突原则：
 1. 采用上游的架构改进（如函数分散到各模块、表驱动注册）
 2. 保留 fork 特有的 ConPTY 函数（`ghostel--conpty-resize`、`fnConptyResize`）
 3. 新增的上游功能若与 fork 功能重叠，以上游为准
+4. 自动合并成功的区域仍需审查：上游删除的变量/函数可能被 fork 代码引用（合并残留）
 
 ### 步骤 2：审查 ConPTY Patch 影响
 
@@ -172,16 +180,53 @@ git merge upstream/main --no-edit
 
 ### 步骤 3：逻辑审查清单
 
+**ConPTY 功能对等：**
 - [ ] `ghostel--conpty-proxy-make-process` 与 `ghostel--spawn-pty` 功能对等
 - [ ] `ghostel--conpty-proxy-resize` 与 Unix resize 路径功能对等
 - [ ] `ghostel--conpty-resize` 在 `src/module.zig` `emacs_functions` 表中注册
 - [ ] `fnConptyResize` 实现完整，签名匹配表项
+- [ ] ConPTY process post-spawn 设置 `adjust-window-size-function` 为 `nil`
+
+**Windows 编译守卫：**
 - [ ] `NativeProcess.zig` Windows 守卫完整（`init`、`run`、`deinit` 有 `comptime` 提前返回）
 - [ ] `PtyProcess.zig` Windows 守卫完整（`@cImport` 条件编译、stub struct 有 `primary_fd` 字段）
 - [ ] `emacs.zig` `openChannel` 返回 `c_int`，`GhostelTerm.zig` 调用点有 `comptime` 转换
+
+**合并残留检查（上游重命名/删除导致的引用失效）：**
+- [ ] `git diff upstream/main HEAD -- lisp/` 逐段审查 fork diff，确认引用的函数/变量仍然存在
+- [ ] 检查 fork 代码是否引用了上游已重命名的函数（如 `ghostel--window-adjust-process-window-size` → `ghostel--adjust-size`）
+- [ ] 检查 fork 代码是否引用了上游已删除的变量（如 `ghostel--input-buffer`、`ghostel--input-timer`）
+- [ ] 检查 fork 代码中传递的变量是否在当前作用域内绑定（避免自由变量引用，如 `width`/`height` 应改为 `ghostel--term-cols`/`ghostel--term-rows`）
+
+**声明与版本：**
+- [ ] `declare-function` 声明所有 fork 新增的 native module 函数（`ghostel--conpty-resize`）
 - [ ] `version` 常量：`src/version.zig`、`build.zig.zon`、`lisp/ghostel.el` 三处一致
 
-### 步骤 4：构建验证
+### 步骤 4：Elisp 验证
+
+在 Zig 构建之前，先验证 Elisp 正确性：
+
+```bash
+# 1. 删除旧 .elc（合并后旧编译文件会导致 void-function 错误）
+rm -f lisp/*.elc
+
+# 2. 括号匹配检查（所有 .el 文件）
+"/c/Program Files/Emacs/emacs-30.2/bin/emacs.exe" --batch \
+  --eval '(dolist (f (directory-files "lisp" t "\\.el$"))
+            (with-current-buffer (find-file-noselect f)
+              (condition-case err (check-parens)
+                (error (message "%s: %s" f (error-message-string err))
+                       (kill-emacs 1)))))
+          (message "check-parens: all OK")'
+
+# 3. 字节编译（零 warning 才算通过）
+"/c/Program Files/Emacs/emacs-30.2/bin/emacs.exe" --batch \
+  -L lisp -f batch-byte-compile lisp/ghostel.el
+```
+
+> **注意**：`check-parens` 通过不代表嵌套正确。两处互补的括号错误可以保持整体平衡但产生错误的作用域。`batch-byte-compile` 能捕获自由变量引用（`reference to free variable`），是更可靠的嵌套验证。
+
+### 步骤 5：构建验证
 
 ```bash
 MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
@@ -189,7 +234,7 @@ MSYS_NO_PATHCONV=1 cmd.exe /c "E:\lambda\selfcode\conpty_ghostel\build.cmd"
 
 零错误零警告才算通过。
 
-### 步骤 5：总结变更
+### 步骤 6：总结变更
 
 输出格式：
 ```

@@ -200,7 +200,10 @@ fn fnConptyResize(env: emacs.Env, args: [*c]emacs.Value) emacs.Value {
     const msg = std.fmt.bufPrint(&msg_buf, "{d} {d}", .{ width, height }) catch return env.nil();
 
     var written: DWORD = 0;
-    _ = kernel32.WriteFile(pipe, msg.ptr, @intCast(msg.len), &written, null);
+    const ok = kernel32.WriteFile(pipe, msg.ptr, @intCast(msg.len), &written, null);
+    if (ok == 0 or written != @as(DWORD, @intCast(msg.len))) {
+        return env.nil();
+    }
     return env.t();
 }
 

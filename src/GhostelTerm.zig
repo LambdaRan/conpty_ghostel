@@ -324,6 +324,7 @@ pub fn isPasswordMode(self: *Self) !bool {
             "process-tty-name",
             .{env.symbolValue("ghostel--process")},
         );
+        if (env.isNil(tty_name_val)) return false;
         const tty_name = try env.extractStringAlloc(
             self.alloc,
             tty_name_val,
@@ -840,6 +841,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 ));
                 defer module_alloc.free(cwd);
                 const channel_fd = env.openChannel(pipe_val);
+                if (channel_fd < 0) return error.OpenChannelFailed;
                 const fd: std.posix.fd_t = if (comptime builtin.os.tag == .windows)
                     @as(std.posix.fd_t, @ptrFromInt(@as(usize, @intCast(channel_fd))))
                 else
