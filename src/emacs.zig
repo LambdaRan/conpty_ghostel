@@ -75,7 +75,11 @@ pub const Env = struct {
                 }
             }
         }
-        return self.funcall(@field(sym, func), &self.makeValues(args));
+
+        return self.funcall(@field(sym, func), switch (@typeInfo(@TypeOf(args))) {
+            .@"struct" => &self.makeValues(args),
+            else => args,
+        });
     }
 
     pub fn set(self: Env, comptime symbol: []const u8, value: anytype) void {
@@ -419,6 +423,7 @@ const interned_symbols = [_][:0]const u8{
     "delete-region",
     "ding",
     "display",
+    "display-graphic-p",
     "display-warning",
     "dot",
     "double-line",
@@ -445,6 +450,7 @@ const interned_symbols = [_][:0]const u8{
     "ghostel--cursor-pos",
     "ghostel--cursor-style",
     "ghostel--debug-log-vt",
+    "ghostel--defer",
     "ghostel--handle-notification",
     "ghostel--kitty-clear",
     "ghostel--kitty-display-image",
@@ -456,10 +462,10 @@ const interned_symbols = [_][:0]const u8{
     "ghostel--process",
     "ghostel--query-font-cached",
     "ghostel--rendered-font",
-    "ghostel--term-cols",
-    "ghostel--term-rows",
     "ghostel--set-buffer-face",
     "ghostel--set-title",
+    "ghostel--term-cols",
+    "ghostel--term-rows",
     "ghostel--update-directory",
     "ghostel-comint--update-dir",
     "ghostel-glyph-scale-floor",
@@ -469,6 +475,7 @@ const interned_symbols = [_][:0]const u8{
     "ghostel-module",
     "ghostel-prompt",
     "ghostel-wrap",
+    "getenv",
     "goto-char",
     "height",
     "help-echo",
@@ -494,8 +501,11 @@ const interned_symbols = [_][:0]const u8{
     "process-live-p",
     "process-send-string",
     "process-tty-name",
+    "propertize",
     "provide",
     "put-text-property",
+    "reverse",
+    "run-at-time",
     "selected-window",
     "set",
     "set-marker",

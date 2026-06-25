@@ -81,6 +81,34 @@ either of which would snap every marker in the buffer to `point-min'."
               (should (= target (marker-position (mark-marker)))))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-redraw-rejects-reentrant-call ()
+  "A nested `ghostel--redraw' of the same terminal signals an error."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-reentrant-redraw*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((term (ghostel--new 5 40 1000))
+                caught
+                entered)
+            (ghostel--write-vt term "hello")
+            (cl-letf* ((orig-mark-marker (symbol-function 'mark-marker))
+                       ((symbol-function 'mark-marker)
+                        (lambda (&optional buffer)
+                          (unless entered
+                            (setq entered t)
+                            (setq caught
+                                  (condition-case err
+                                      (progn (ghostel--redraw term) nil)
+                                    (error err))))
+                          (if buffer
+                              (funcall orig-mark-marker buffer)
+                            (funcall orig-mark-marker)))))
+              (ghostel--redraw term t))
+            (should caught)
+            (should (string-match-p "ReentrantRedraw"
+                                    (error-message-string caught)))))
+      (kill-buffer buf))))
+
 (defun ghostel-test--token-position (token)
   "Return the start position of TOKEN in the current buffer."
   (save-excursion
@@ -776,9 +804,12 @@ and typed text was invisible."
 (ert-deftest ghostel-test-title ()
   "Test OSC 2 title change."
   :tags '(native)
-  (let ((term (ghostel--new 25 80 1000)))
-    (ghostel--write-vt term "\e]2;My Title\e\\")
-    (should (equal "My Title" (ghostel--get-title term)))))
+  (with-temp-buffer
+    (let ((term (ghostel--new 25 80 1000)))
+      (ghostel--write-vt term "\e]2;My Title\e\\")
+      (should (equal "My Title"
+                     (ghostel-test--wait-until
+                      (lambda () ghostel--title) nil 1))))))
 
 
 ;;; Scrollback materialization and eviction
@@ -1488,6 +1519,71 @@ for new size inside BSU/ESU → verify buffer shows new content."
               (should-not (string-match-p "OLD-LINE" content)))))
       (kill-buffer buf))))
 
+(defmacro ghostel-test--with-open-sync-output (spec &rest body)
+  "Run BODY in a displayed terminal buffer left mid synchronized output.
+SPEC is (BUFFER TERM).  Sets up a ghostel buffer showing BASELINE-CONTENT,
+then opens mode 2026 and mutates the grid to UPDATED-CONTENT *without*
+closing it - the state of a buffer hidden while a TUI streams a frame."
+  (declare (indent 1))
+  (pcase-let ((`(,buffer ,term) spec))
+    `(let ((,buffer (generate-new-buffer " *ghostel-test-open-sync-output*")))
+       (unwind-protect
+           (with-current-buffer ,buffer
+             (set-window-buffer (selected-window) (current-buffer))
+             (ghostel-mode)
+             (let* ((,term (ghostel--new 10 40 100))
+                    (ghostel--term ,term)
+                    (ghostel--term-rows 10)
+                    (ghostel--term-cols 40)
+                    (ghostel--force-next-redraw nil)
+                    (inhibit-read-only t))
+               ;; Baseline content, rendered into the buffer.
+               (ghostel--write-vt ,term "\e[H\e[2JBASELINE-CONTENT")
+               (ghostel--redraw ,term t)
+               (should (string-match-p "BASELINE-CONTENT" (buffer-string)))
+               ;; Open synchronized output and mutate the grid without closing
+               ;; it, as a streaming TUI does mid-frame.
+               (ghostel--write-vt ,term "\e[?2026h\e[H\e[2JUPDATED-CONTENT")
+               (should (ghostel--mode-enabled ,term 2026))
+               ,@body))
+         (kill-buffer ,buffer)))))
+
+(ert-deftest ghostel-test-redraw-now-force-bypasses-open-sync-output ()
+  "FORCE makes `ghostel--redraw-now' repaint even while mode 2026 is open.
+Without FORCE the redraw is correctly suppressed during synchronized
+output; with FORCE it repaints now (the contract the #456 fix relies on)."
+  :tags '(native)
+  (ghostel-test--with-open-sync-output (buf term)
+    ;; Unforced redraw is suppressed mid synchronized output: still baseline.
+    (ghostel--redraw-now buf)
+    (should (string-match-p "BASELINE-CONTENT" (buffer-string)))
+    (should-not (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    ;; Forced redraw bypasses the skip and repaints now.
+    (ghostel--redraw-now buf t)
+    (should (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    (should-not (string-match-p "BASELINE-CONTENT" (buffer-string)))))
+
+(ert-deftest ghostel-test-window-buffer-change-repaints-stale-reappear ()
+  "Regression for #456: a buffer reappearing repaints past open mode 2026.
+A hidden ghostel buffer renders nothing, so its content is stale on
+reappear.  `ghostel--window-buffer-change' must force the repaint instead
+of leaving the stale content until the next non-2026 output."
+  :tags '(native)
+  (ghostel-test--with-open-sync-output (_buf term)
+    (ghostel--window-buffer-change (selected-window))
+    (should (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    (should-not (string-match-p "BASELINE-CONTENT" (buffer-string)))))
+
+(ert-deftest ghostel-test-force-redraw-recovers-during-sync-output ()
+  "`ghostel-force-redraw' recovers stale content even while mode 2026 is open.
+The user-facing recovery command must not be defeated by the same
+synchronized-output skip that stranded the content (#456)."
+  :tags '(native)
+  (ghostel-test--with-open-sync-output (_buf term)
+    (ghostel-force-redraw)
+    (should (string-match-p "UPDATED-CONTENT" (buffer-string)))
+    (should-not (string-match-p "BASELINE-CONTENT" (buffer-string)))))
+
 (ert-deftest ghostel-test-resize-width-change-full-repaint ()
   "After width change on alt screen, all rows repainted correctly.
 Matches the real htop scenario: width changes from wide to narrow,
@@ -1734,6 +1830,13 @@ When the buffer reappears, it is immediately redrawn."
 ;; the feature-oriented sections above and have an obvious home for
 ;; future additions.
 
+(defun ghostel-test--numbered-lines (count width)
+  "Return COUNT numbered lines with WIDTH x characters per line."
+  (with-temp-buffer
+    (dotimes (i count)
+      (insert (format "%05d: " i) (make-string width ?x) "\n"))
+    (buffer-string)))
+
 (ert-deftest ghostel-test-page-eviction-before-redraw ()
   "Regression: page-serial underflow when initial active area scrolls off entirely.
 Scenario (from Hypothesis failure): 1×136 terminal, render once while
@@ -1773,6 +1876,26 @@ subtracts old_line_len from the newly-created page whose char_len is
             (should (string-match-p "x"
                                     (buffer-substring-no-properties
                                      (point-min) (point-max))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-resize-eviction-char-count-stays-in-buffer-bounds ()
+  "Regression: resizing must not stale scrollback char counts.
+A row-count resize between materialized scrollback and later eviction
+left page character accounting larger than the actual buffer, so the
+next eviction called `delete-region' beyond `point-max'."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-resize-evict*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((term (ghostel--new 1 90 16384))
+                (inhibit-read-only t))
+            (ghostel--write-vt term (ghostel-test--numbered-lines 400 20))
+            (ghostel--set-size term 10 90)
+            (ghostel--redraw term)
+            (ghostel--set-size term 11 90)
+            (ghostel--redraw term)
+            (ghostel--write-vt term (ghostel-test--numbered-lines 800 20))
+            (ghostel--redraw term)))
       (kill-buffer buf))))
 
 

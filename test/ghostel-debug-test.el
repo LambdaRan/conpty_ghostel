@@ -466,6 +466,37 @@ delta in the phase timings section."
                      #'ghostel-debug--capture-start-process)
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-debug-redraw-advices-tolerate-force ()
+  "Debug redraw/latency advices accept and forward `ghostel--redraw-now's FORCE.
+Regression for #460: adding the optional FORCE argument made the :around
+log advice and the :after latency advice receive an extra argument.  Both
+must tolerate it without `wrong-number-of-arguments', and the :around must
+forward FORCE to the real redraw."
+  (let ((log-buf (generate-new-buffer " *ghostel-test-redraw-advice*"))
+        (recorded nil))
+    (unwind-protect
+        (let ((ghostel-debug--log-buffer log-buf)
+              (ghostel-debug--latency-active nil))
+          (cl-letf* (((symbol-function 'ghostel--redraw-now)
+                      (lambda (_buffer &optional force) (push force recorded)))
+                     ;; Stub the snapshot so the log body needs no live terminal.
+                     ((symbol-function 'ghostel-debug--snapshot)
+                      (lambda (_buffer)
+                        (list :sync nil :force nil :buf-size 0 :trailing-nl nil
+                              :point 1 :cursor nil :cursor-char nil
+                              :term-rows 0 :vs 1 :wins nil))))
+            (advice-add 'ghostel--redraw-now :around #'ghostel-debug--log-redraw)
+            (advice-add 'ghostel--redraw-now :after #'ghostel-debug--latency-on-render)
+            (with-temp-buffer
+              (ghostel--redraw-now (current-buffer) t)
+              (ghostel--redraw-now (current-buffer)))
+            ;; Both calls returned without an arity error, and FORCE was
+            ;; forwarded: newest-first push records the bare then forced call.
+            (should (equal recorded '(nil t)))))
+      (advice-remove 'ghostel--redraw-now #'ghostel-debug--log-redraw)
+      (advice-remove 'ghostel--redraw-now #'ghostel-debug--latency-on-render)
+      (kill-buffer log-buf))))
+
 
 (ert-deftest ghostel-test-vt-warnings-do-not-leak-to-stderr ()
   "VT-parser warnings must not reach the module's stderr (#425).

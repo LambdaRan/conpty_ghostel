@@ -104,12 +104,6 @@ written by `ghostel-test--pty-winsize-script'."
             start (match-end 0)))
     last))
 
-(ert-deftest ghostel-test-get-shell-local ()
-  "Test that local shell resolution returns `ghostel-shell'."
-  (let ((default-directory "/tmp/")
-        (ghostel-shell "/bin/zsh"))
-    (should (equal "/bin/zsh" (ghostel--get-shell)))))
-
 (ert-deftest ghostel-test-shell-program-and-args-string ()
   "String SPEC splits into (PROGRAM . nil)."
   (should (equal '("/bin/zsh") (ghostel--shell-program-and-args "/bin/zsh"))))
@@ -127,11 +121,189 @@ written by `ghostel-test--pty-winsize-script'."
   (should-error (ghostel--shell-program-and-args '()))
   (should-error (ghostel--shell-program-and-args '(nil "foo"))))
 
-(ert-deftest ghostel-test-get-shell-local-returns-program-from-list ()
-  "When `ghostel-shell' is a list, `ghostel--get-shell' returns just the program."
-  (let ((default-directory "/tmp/")
-        (ghostel-shell '("/bin/zsh" "--login")))
-    (should (equal "/bin/zsh" (ghostel--get-shell)))))
+;;; Remote shell spec resolution (issue #444)
+
+(ert-deftest ghostel-test-default-remote-shell-args-recognized ()
+  "Recognized remote shells default to login+interactive args."
+  (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/bin/zsh")))
+  (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/bin/bash")))
+  (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/usr/bin/fish")))
+  ;; NixOS-style path: detection keys off the basename.
+  (should (equal '("-l" "-i")
+                 (ghostel--default-remote-shell-args
+                  "/run/current-system/sw/bin/zsh"))))
+
+(ert-deftest ghostel-test-default-remote-shell-args-unrecognized ()
+  "Unrecognized remote shells get no default args (they may reject -l)."
+  (should-not (ghostel--default-remote-shell-args "/bin/sh"))
+  (should-not (ghostel--default-remote-shell-args "/bin/dash")))
+
+(ert-deftest ghostel-test-default-remote-shell-args-integration ()
+  "With integration active, bash drops `-l'; zsh/fish keep login+interactive."
+  ;; Bash: `-l' would make login bash ignore integration's `--rcfile'.
+  (should (equal '("-i") (ghostel--default-remote-shell-args "/bin/bash" t)))
+  ;; Zsh and fish compose cleanly with `-l -i'.
+  (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/usr/bin/zsh" t)))
+  (should (equal '("-l" "-i") (ghostel--default-remote-shell-args "/usr/bin/fish" t)))
+  ;; Unrecognized shells still get nothing.
+  (should-not (ghostel--default-remote-shell-args "/bin/sh" t)))
+
+(ert-deftest ghostel-test-tramp-shell-spec-explicit-args ()
+  "Explicit args after the fallback slot are returned in the spec."
+  (let ((ghostel-tramp-shells '(("ssh" "/bin/zsh" nil "-i" "-l"))))
+    (should (equal '("/bin/zsh" "-i" "-l") (ghostel--tramp-shell-spec "ssh")))))
+
+(ert-deftest ghostel-test-tramp-shell-spec-no-args ()
+  "An entry without an args slot yields no extra args."
+  (let ((ghostel-tramp-shells '(("docker" "/bin/sh"))))
+    (should (equal '("/bin/sh") (ghostel--tramp-shell-spec "docker"))))
+  (let ((ghostel-tramp-shells '(("ssh" "/bin/zsh"))))
+    (should (equal '("/bin/zsh") (ghostel--tramp-shell-spec "ssh")))))
+
+(ert-deftest ghostel-test-tramp-shell-spec-unknown-method ()
+  "An unknown method resolves to nil."
+  (let ((ghostel-tramp-shells '(("ssh" "/bin/zsh"))))
+    (should-not (ghostel--tramp-shell-spec "docker"))))
+
+(ert-deftest ghostel-test-tramp-shell-spec-login-shell-fallback-args ()
+  "Login-shell detection failure falls back, preserving explicit args."
+  (cl-letf (((symbol-function 'process-file-shell-command)
+             (lambda (&rest _) 1)))     ; simulate getent failure
+    (let ((ghostel-tramp-shells '(("ssh" login-shell "/bin/sh" "-i"))))
+      (should (equal '("/bin/sh" "-i") (ghostel--tramp-shell-spec "ssh"))))))
+
+(ert-deftest ghostel-test-resolve-shell-spec-remote-default-no-args ()
+  "Remote resolve returns the program alone when no explicit args are configured.
+The type-aware default is applied later, at spawn time."
+  (let ((default-directory "/ssh:host:/home/u/")
+        (ghostel-tramp-shells '(("ssh" "/bin/zsh"))))
+    (should (equal '("/bin/zsh") (ghostel--resolve-shell-spec)))))
+
+(ert-deftest ghostel-test-start-process-remote-adds-login-interactive ()
+  "A recognized remote shell is started login+interactive by default."
+  (ghostel-test--with-spawn-capture spawn
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 24
+                  ghostel--term-cols 80)
+      (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+             (ghostel-tramp-shells '(("ssh" "/bin/zsh")))
+             (ghostel-shell-integration nil)
+             (ghostel-macos-login-shell nil)
+             (default-directory "/ssh:host:/home/u/"))
+        (ghostel--start-process)
+        (should (equal "/bin/zsh" (car spawn)))
+        (should (equal '("-l" "-i") (cdr spawn)))))))
+
+(ert-deftest ghostel-test-start-process-remote-unrecognized-no-args ()
+  "An unrecognized remote shell gets no auto args."
+  (ghostel-test--with-spawn-capture spawn
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 24
+                  ghostel--term-cols 80)
+      (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+             (ghostel-tramp-shells '(("ssh" "/bin/sh")))
+             (ghostel-shell-integration nil)
+             (ghostel-macos-login-shell nil)
+             (default-directory "/ssh:host:/home/u/"))
+        (ghostel--start-process)
+        (should (equal "/bin/sh" (car spawn)))
+        (should-not (cdr spawn))))))
+
+(ert-deftest ghostel-test-start-process-remote-explicit-args-override ()
+  "Explicit per-method args replace the type-aware default."
+  (ghostel-test--with-spawn-capture spawn
+    (with-temp-buffer
+      (setq-local ghostel--term-rows 24
+                  ghostel--term-cols 80)
+      (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+             (ghostel-tramp-shells '(("ssh" "/bin/zsh" nil "-i")))
+             (ghostel-shell-integration nil)
+             (ghostel-macos-login-shell nil)
+             (default-directory "/ssh:host:/home/u/"))
+        (ghostel--start-process)
+        (should (equal "/bin/zsh" (car spawn)))
+        (should (equal '("-i") (cdr spawn)))))))
+
+(ert-deftest ghostel-test-start-process-remote-bash-integration-interactive-no-login ()
+  "Bash integration: shell is made interactive (`-i') but not login.
+A login bash ignores the `--rcfile' the bash integration relies on, so
+`-l' must be omitted; `-i' is still added so the rcfile (and the user's
+`~/.bashrc') loads on TRAMP methods where the remote stdin isn't a tty."
+  (cl-letf (((symbol-function 'ghostel--setup-remote-integration)
+             (lambda (_type)
+               (list :env nil :args '("--rcfile" "/tmp/ghostel.bash")
+                     :temp-files nil :temp-dirs nil))))
+    (ghostel-test--with-spawn-capture spawn
+      (with-temp-buffer
+        (setq-local ghostel--term-rows 24
+                    ghostel--term-cols 80)
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-tramp-shells '(("ssh" "/bin/bash")))
+               (ghostel-shell-integration t)
+               (ghostel-tramp-shell-integration t)
+               (ghostel-macos-login-shell nil)
+               (default-directory "/ssh:host:/home/u/"))
+          (ghostel--start-process)
+          (should (equal "/bin/bash" (car spawn)))
+          (should (equal '("-i" "--rcfile" "/tmp/ghostel.bash") (cdr spawn)))
+          (should-not (member "-l" (cdr spawn))))))))
+
+(ert-deftest ghostel-test-start-process-remote-zsh-integration-login-interactive ()
+  "Zsh integration: the shell still starts login+interactive (`-l -i').
+`-l -i' composes cleanly with the ZDOTDIR-based zsh integration, so the
+user's `.zprofile'/`.zshrc' load alongside it."
+  (cl-letf (((symbol-function 'ghostel--setup-remote-integration)
+             (lambda (_type)
+               (list :env '("ZDOTDIR=/tmp/ghostel-zdot") :args nil
+                     :temp-files nil :temp-dirs nil))))
+    (ghostel-test--with-spawn-capture spawn
+      (with-temp-buffer
+        (setq-local ghostel--term-rows 24
+                    ghostel--term-cols 80)
+        (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+               (ghostel-tramp-shells '(("ssh" "/usr/bin/zsh")))
+               (ghostel-shell-integration t)
+               (ghostel-tramp-shell-integration t)
+               (ghostel-macos-login-shell nil)
+               (default-directory "/ssh:host:/home/u/"))
+          (ghostel--start-process)
+          (should (equal "/usr/bin/zsh" (car spawn)))
+          (should (equal '("-l" "-i") (cdr spawn))))))))
+
+(ert-deftest ghostel-test-start-process-remote-defers-temp-cleanup ()
+  "Remote integration temp paths are cleaned on buffer-kill, not at spawn.
+Deleting them at spawn time would race the just-spawned async remote
+shell, which has not yet read its bootstrap (ZDOTDIR/.zshenv etc.); the
+pushed terminfo dir is needed for the whole session besides."
+  (let (cleaned)
+    (cl-letf (((symbol-function 'ghostel--setup-remote-integration)
+               (lambda (_type)
+                 (list :env nil :args nil
+                       :temp-files '("/tmp/ghostel-x.zsh")
+                       :temp-dirs '("/tmp/ghostel-zdot"))))
+              ((symbol-function 'ghostel--cleanup-temp-paths)
+               (lambda (files dirs) (setq cleaned (list files dirs))))
+              ((symbol-function 'ghostel--spawn-pty) (lambda (&rest _) nil)))
+      (let ((buf (generate-new-buffer " *ghostel-test-defer*")))
+        (unwind-protect
+            (progn
+              (with-current-buffer buf
+                (setq-local ghostel--term-rows 24
+                            ghostel--term-cols 80)
+                (let* ((process-environment '("PATH=/usr/bin:/bin" "HOME=/tmp"))
+                       (ghostel-tramp-shells '(("ssh" "/usr/bin/zsh")))
+                       (ghostel-shell-integration t)
+                       (ghostel-tramp-shell-integration t)
+                       (ghostel-macos-login-shell nil)
+                       (default-directory "/ssh:host:/home/u/"))
+                  (ghostel--start-process)))
+              ;; Not deleted at spawn time.
+              (should-not cleaned)
+              ;; Buffer-kill triggers the deferred cleanup with the paths.
+              (kill-buffer buf)
+              (should (equal cleaned
+                             '(("/tmp/ghostel-x.zsh") ("/tmp/ghostel-zdot")))))
+          (when (buffer-live-p buf) (kill-buffer buf)))))))
 
 (ert-deftest ghostel-test-macos-login-wrap-basic ()
   "Login wrap produces /usr/bin/login + bash shim with exec -l <prog>."
@@ -425,7 +597,7 @@ not the old ones — verified on both PTY backends."
                         (lambda () (ghostel-test--latest-winsize "INIT")) proc 6)))
         ;; Stage a new size and commit it with a redraw, which fires SIGWINCH.
         (ghostel--set-size-with-cell-dims ghostel--term 30 100)
-        (ghostel--redraw ghostel--term t)
+        (ghostel-test--redraw ghostel--term t)
         ;; The child's SIGWINCH handler must report the new size, not the old.
         (should (ghostel-test--wait-until
                  (lambda () (equal '(30 . 100)

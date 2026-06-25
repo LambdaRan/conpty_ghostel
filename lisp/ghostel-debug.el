@@ -325,24 +325,28 @@ computed viewport-start, and per-window ws/we/wp/body-height."
                        (plist-get w :wp) (plist-get w :body)))
    wins " | "))
 
-(defun ghostel-debug--log-redraw (orig-fn buffer)
+(defun ghostel-debug--log-redraw (orig-fn buffer &optional force)
   "Log redraw decisions: skip vs execute, DEC 2026 state, timing.
-ORIG-FN is `ghostel--redraw-now', BUFFER is the target buffer."
+ORIG-FN is `ghostel--redraw-now', BUFFER is the target buffer, FORCE is
+its optional force-past-synchronized-output argument (forwarded)."
   (when ghostel-debug--log-buffer
-    (let ((before (ghostel-debug--snapshot buffer))
-          (t0 (current-time)))
-      (funcall orig-fn buffer)
+    (let* ((before (ghostel-debug--snapshot buffer))
+           ;; `force' set via the snapshotted buffer-local flag OR passed as
+           ;; an argument both bypass the DEC 2026 skip in `ghostel--redraw-now'.
+           (force-in (or (plist-get before :force) force))
+           (t0 (current-time)))
+      (funcall orig-fn buffer force)
       (let* ((elapsed (* 1000 (float-time (time-subtract (current-time) t0))))
              (after (ghostel-debug--snapshot buffer)))
         (with-current-buffer ghostel-debug--log-buffer
           (goto-char (point-max))
-          (if (and (plist-get before :sync) (not (plist-get before :force)))
+          (if (and (plist-get before :sync) (not force-in))
               (insert (format "[%s] REDRAW: SKIPPED (DEC2026 active, force=nil)\n"
                               (format-time-string "%T.%3N")))
             (insert (format "[%s] REDRAW: %.1fms force=%s→%s dec2026=%s buf=%d→%d trailNL=%s→%s pt=%d→%d cursor=%S→%S cursor-char=%S→%S rows=%s vs=%s→%s\n"
                             (format-time-string "%T.%3N")
                             elapsed
-                            (plist-get before :force) (plist-get after :force)
+                            force-in (plist-get after :force)
                             (plist-get before :sync)
                             (plist-get before :buf-size) (plist-get after :buf-size)
                             (plist-get before :trailing-nl) (plist-get after :trailing-nl)
@@ -356,16 +360,17 @@ ORIG-FN is `ghostel--redraw-now', BUFFER is the target buffer."
             (insert (format "           wins-after:  %s\n"
                             (ghostel-debug--fmt-wins (plist-get after :wins))))))))))
 
-(defun ghostel-debug--log-resize (orig-fn window)
+(defun ghostel-debug--log-resize (orig-fn window &optional force)
   "Log resize events with old/new dimensions and timing.
-ORIG-FN is `ghostel--adjust-size'.  WINDOW is passed through."
+ORIG-FN is `ghostel--adjust-size'.  WINDOW and its optional FORCE
+argument are passed through."
   (let* ((buffer (and (window-live-p window) (window-buffer window)))
          (old-rows (and (buffer-live-p buffer)
                         (buffer-local-value 'ghostel--term-rows buffer)))
          (old-cols (and (buffer-live-p buffer)
                         (buffer-local-value 'ghostel--term-cols buffer)))
          (t0 (current-time))
-         (result (funcall orig-fn window))
+         (result (funcall orig-fn window force))
          (elapsed (* 1000 (float-time (time-subtract (current-time) t0))))
          (new-rows (and (buffer-live-p buffer)
                         (buffer-local-value 'ghostel--term-rows buffer)))
@@ -439,8 +444,9 @@ The latency breakdown shows:
             ghostel-debug--latency-log)
       (setq ghostel-debug--latency-send-time nil))))
 
-(defun ghostel-debug--latency-on-render (_buffer)
-  "Record render-completion time and finalize latency entry."
+(defun ghostel-debug--latency-on-render (_buffer &rest _)
+  "Record render-completion time and finalize latency entry.
+Ignores `ghostel--redraw-now's optional force argument."
   (when ghostel-debug--latency-active
     (let ((render-time (current-time)))
       ;; Complete the most recent entry that has no render time

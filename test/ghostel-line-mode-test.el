@@ -22,7 +22,7 @@ native module."
      (unwind-protect
          (with-current-buffer buf
            (ghostel-mode)
-           (let ((inhibit-read-only t))
+           (ghostel-test--with-rendered-output
              (insert (propertize ,prompt 'ghostel-prompt t))
              (insert ,input))
            (setq ghostel--term 'fake)
@@ -45,8 +45,7 @@ not clobbered."
     (setq ghostel--process 'fake-proc)
     ;; First prompt with OSC 133 A/B markers.
     (ghostel--write-vt term "\e]133;A\e\\$ \e]133;B\e\\")
-    (let ((inhibit-read-only t))
-      (ghostel--redraw term t))
+    (ghostel-test--redraw term t)
     (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
               ((symbol-function 'ghostel--write-pty) #'ignore)
               ((symbol-function 'ghostel--invalidate) #'ignore))
@@ -110,12 +109,12 @@ available (unit tests, native module not loaded)."
     (should-not (ghostel-input-start-point))
     ;; With prompt property
     (erase-buffer)
-    (insert (propertize "$ " 'ghostel-prompt t))
+    (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
     (insert "")  ; cursor right after prompt
     (should (= (ghostel-input-start-point) 3))
     ;; With prompt property followed by user-typed content
     (erase-buffer)
-    (insert (propertize "$ " 'ghostel-prompt t))
+    (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
     (insert "ls -la")
     (should (= (ghostel-input-start-point) 3))))
 
@@ -126,7 +125,7 @@ cursor sits at the end of the `>>> ' prompt the REPL printed."
   (let ((buf (generate-new-buffer " *ghostel-test-line-cursor*")))
     (unwind-protect
         (with-current-buffer buf
-          (insert ">>> \n")
+          (ghostel-test--insert-rendered ">>> \n")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
           (setq ghostel--cursor-char-pos 5)
@@ -146,10 +145,10 @@ onto the bash prompt."
     (unwind-protect
         (with-current-buffer buf
           ;; 3 renderer rows: bash row + 2 python rows.
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (insert "python3\n")
           (insert "Python 3.x\n")
-          (insert ">>> \n")
+          (ghostel-test--insert-rendered ">>> \n")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 3)
           (setq ghostel--cursor-char-pos (1- (point-max)))
@@ -173,7 +172,7 @@ have a usable input boundary."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             ;; Line has no prompt prefix and no prompt char anywhere —
             ;; `ghostel-prompt-regexp' can't match, so the cursor wins.
             (insert "plain text line"))
@@ -190,7 +189,7 @@ have a usable input boundary."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             ;; Python REPL line — no prop, but `>>> ' matches the regex.
             (insert ">>> hello"))
           (setq ghostel--term 'fake)
@@ -207,8 +206,7 @@ have a usable input boundary."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (let ((inhibit-read-only t))
-            (insert "λ ls"))
+          (ghostel-test--insert-rendered "λ ls")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
           (setq ghostel--cursor-char-pos (point))
@@ -227,13 +225,13 @@ result must be 2 to prove the prop branch is consulted first."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             ;; Prop ONLY on the `$' — not the space.  The walk-back in
             ;; `ghostel-input-start-point' stops as soon as it finds any
             ;; `ghostel-prompt' char, so it returns the position right after
             ;; the `$' (= 2).  The regex would match `$ ' (end = 3).
             ;; Different answers → precedence matters.
-            (insert (propertize "$" 'ghostel-prompt t))
+            (ghostel-test--insert-rendered (propertize "$" 'ghostel-prompt t))
             (insert " ls"))
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
@@ -248,7 +246,7 @@ result must be 2 to prove the prop branch is consulted first."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             (insert ">>> hello"))
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
@@ -286,9 +284,9 @@ Also verifies the documented nil-return when no cursor is available."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             (insert "first line\n")
-            (insert (propertize "$ " 'ghostel-prompt t))
+            (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
             (insert "second"))
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 2)
@@ -312,6 +310,44 @@ Also verifies the documented nil-return when no cursor is available."
               (should-error (ghostel-line-mode) :type 'user-error))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-line-mode-enters-without-osc133 ()
+  "Line mode enters successfully in a REPL with no shell integration.
+Reproduces the python3 case: no `ghostel-prompt' chars anywhere,
+but the cursor is at the end of the REPL's prompt."
+  (let ((buf (generate-new-buffer " *ghostel-test-line-nointegration*"))
+        (sent nil)
+        (encoded nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (ghostel-test--insert-rendered ">>> \n")
+          (setq ghostel--term 'fake)
+          (setq ghostel--term-rows 1)
+          (setq ghostel--process 'fake-proc)
+          (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                     (lambda (&rest _) nil))
+                    (ghostel--cursor-char-pos 4)
+                    ((symbol-function 'process-live-p) (lambda (_p) t))
+                    ((symbol-function 'ghostel--write-pty)
+                     (lambda (_term s) (setq sent s)))
+                    ((symbol-function 'ghostel--send-encoded)
+                     (lambda (key _mods &optional _utf8)
+                       (setq encoded key)))
+                    ((symbol-function 'ghostel--redraw) #'ignore)
+                    ((symbol-function 'ghostel--invalidate) #'ignore))
+            (ghostel-line-mode)
+            (should (eq ghostel--input-mode 'line))
+            (should-not buffer-read-only)
+            (goto-char (marker-position ghostel--line-input-end))
+            (insert "1+1")
+            (ghostel-line-mode-send)
+            (should-not buffer-read-only)
+            (ghostel-semi-char-mode)
+            (should buffer-read-only)
+            (should (equal sent "1+1"))
+            (should (equal encoded "return"))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-copy-to-line-restarts-redraw-timer ()
   "Copy → line transition re-arms the redraw timer.
 Copy mode freezes the timer; line mode is live, so redraws must resume
@@ -321,7 +357,7 @@ without waiting for another PTY byte."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert ">>> \n")
+          (ghostel-test--insert-rendered ">>> \n")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
           (setq ghostel--process 'fake-proc)
@@ -353,7 +389,7 @@ the hot path."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert ">>> \n")
+          (ghostel-test--insert-rendered ">>> \n")
           (setq ghostel--term 'fake)
           (setq ghostel--term-rows 1)
           (setq ghostel--process 'fake-proc)
@@ -383,7 +419,7 @@ sentinel and enters line mode for real once the TUI exits."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
                        (lambda (_term mode) (= mode 1049))))
@@ -408,7 +444,7 @@ preserved."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((alt-on nil)
                 (ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
@@ -448,7 +484,7 @@ restored."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((alt-on nil)
                 (ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
@@ -487,7 +523,7 @@ restored."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((alt-on nil)
                 (ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
@@ -506,7 +542,7 @@ restored."
               ;; Drop the prompt before alt-screen-off — simulates
               ;; a redraw cycle where the new post-TUI prompt has
               ;; not been painted yet.
-              (let ((inhibit-read-only t)) (erase-buffer))
+              (ghostel-test--with-rendered-output (erase-buffer))
               (setq alt-on nil)
               (ghostel--line-mode-post-redraw)
               ;; Still paused (sentinel intact), mode still semi-char.
@@ -515,7 +551,7 @@ restored."
               (should (equal (plist-get ghostel--line-mode-paused :input) ""))
               ;; Add the new prompt and run another post-redraw —
               ;; resume succeeds.
-              (insert (propertize "$ " 'ghostel-prompt t))
+              (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
               (ghostel--line-mode-post-redraw)
               (should (eq ghostel--input-mode 'line))
               (should-not ghostel--line-mode-paused)
@@ -528,7 +564,7 @@ restored."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((alt-on t)
                 (ghostel--term 'fake))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -555,7 +591,7 @@ a literal newline."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -598,8 +634,8 @@ a literal newline."
         (with-current-buffer buf
           (ghostel-mode)
           ;; Scrollback line carrying a help-echo (linkified).
-          (insert (propertize "see ./README.md\n" 'help-echo "fileref:./README.md"))
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "see ./README.md\n" 'help-echo "fileref:./README.md"))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -630,7 +666,7 @@ pi), the trailing encoded `return' is the submit and any embedded
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -661,8 +697,8 @@ pi), the trailing encoded `return' is the submit and any embedded
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "scrollback line\n")
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "scrollback line\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -691,7 +727,7 @@ pi), the trailing encoded `return' is the submit and any embedded
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -729,10 +765,10 @@ a duplicated line."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           ;; Adopted input as the renderer would have painted it for
           ;; chars typed via the PTY in a previous mode.
-          (insert (propertize "ls -la" 'ghostel-input t))
+          (ghostel-test--insert-rendered (propertize "ls -la" 'ghostel-input t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -775,7 +811,7 @@ a duplicated line."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -809,8 +845,8 @@ should land at the position right after the prompt prefix."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
-          (insert "ls -la")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "ls -la")
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -843,8 +879,8 @@ back to the active prompt's input area."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "scrollback line one\nscrollback line two\n")
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "scrollback line one\nscrollback line two\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -883,7 +919,7 @@ prefix on a Python REPL line."
         (with-current-buffer buf
           (ghostel-mode)
           ;; No prop — the line just looks like a Python REPL line.
-          (insert ">>> import os")
+          (ghostel-test--insert-rendered ">>> import os")
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
@@ -900,7 +936,7 @@ prefix on a Python REPL line."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "λ ls")
+          (ghostel-test--insert-rendered "λ ls")
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
@@ -918,7 +954,7 @@ Without prop, marker, or regex, the command falls through to BOL."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert ">>> import os")
+          (ghostel-test--insert-rendered ">>> import os")
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc)
                 (ghostel-prompt-regexp nil))
@@ -941,7 +977,7 @@ types produces a row like `> ' with no trailing input, and pressing
           (ghostel-mode)
           ;; Empty continuation row — bash/zsh PS2 default is `> '.
           ;; No `ghostel-prompt' prop, no trailing input.
-          (insert "> ")
+          (ghostel-test--insert-rendered "> ")
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
@@ -984,7 +1020,7 @@ on every empty prompt the user pressed `RET' to.)"
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1017,7 +1053,7 @@ user can continue editing at the shell prompt."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1044,7 +1080,7 @@ user can continue editing at the shell prompt."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1066,7 +1102,7 @@ user can continue editing at the shell prompt."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1098,8 +1134,8 @@ normally."
         (with-current-buffer buf
           (ghostel-mode)
           ;; Buffer: some previous output, then a prompt.
-          (insert "earlier output\n")
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "earlier output\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1134,8 +1170,8 @@ normally."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "earlier output\n")
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "earlier output\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1165,7 +1201,7 @@ normally."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1191,8 +1227,8 @@ normally."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "earlier output\n")
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "earlier output\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1220,8 +1256,8 @@ normally."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "earlier output\n")
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "earlier output\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc)
                 (ghostel-line-mode-completion-at-point-functions
@@ -1267,7 +1303,7 @@ ambiguous)."
           (with-current-buffer buf
             (setq default-directory tmpdir)
             (ghostel-mode)
-            (insert (propertize "$ " 'ghostel-prompt t))
+            (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
             (let ((ghostel--term 'fake)
                   (ghostel--process 'fake-proc)
                   (ghostel-line-mode-use-bash-completion nil)
@@ -1295,7 +1331,7 @@ ambiguous)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc)
                 (ghostel-line-mode-use-bash-completion nil)
@@ -1319,8 +1355,8 @@ ambiguous)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert "earlier output\n")
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "earlier output\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc)
                 (ghostel-line-mode-use-bash-completion nil)
@@ -1347,7 +1383,7 @@ ambiguous)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc)
                 (ghostel-line-mode-use-bash-completion nil)
@@ -1402,7 +1438,7 @@ ambiguous)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1433,7 +1469,7 @@ ambiguous)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1459,7 +1495,7 @@ ambiguous)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1473,10 +1509,10 @@ ambiguous)."
                 ;; would re-emit the prompt at a (potentially new)
                 ;; position.  Erase and rebuild with a longer
                 ;; preamble.
-                (let ((inhibit-read-only t))
+                (ghostel-test--with-rendered-output
                   (erase-buffer)
                   (insert "background line\n")
-                  (insert (propertize "$ " 'ghostel-prompt t)))
+                  (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t)))
                 (should (ghostel--line-mode-restore snap))
                 ;; Input is back, marker points at the new prompt-end.
                 (should (equal (ghostel--line-mode-input-text) "command"))
@@ -1506,7 +1542,7 @@ not get linkified (which would steal RET from line-mode-send)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1517,9 +1553,9 @@ not get linkified (which would steal RET from line-mode-send)."
               (insert "cd src/main.rs")
               (let ((snap (ghostel--line-mode-snapshot)))
                 ;; Simulate redraw rewriting buffer with same prompt.
-                (let ((inhibit-read-only t))
+                (ghostel-test--with-rendered-output
                   (erase-buffer)
-                  (insert (propertize "$ " 'ghostel-prompt t)))
+                  (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t)))
                 (should (ghostel--line-mode-restore snap))
                 ;; Every char in the input region carries `ghostel-input'.
                 (let ((start (marker-position
@@ -1540,8 +1576,8 @@ snapshot/restore must leave the status-bar text untouched."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
-          (insert "\n--- status ---\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "\n--- status ---\n")
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1582,9 +1618,9 @@ instead of being discarded."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           ;; Pre-existing typed chars marked with `ghostel-input'.
-          (insert (propertize "cd src" 'ghostel-input t))
+          (ghostel-test--insert-rendered (propertize "cd src" 'ghostel-input t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1611,8 +1647,8 @@ running through a redraw cycle."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
-          (insert "\n[status: ok]\n")
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered "\n[status: ok]\n")
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1633,7 +1669,7 @@ running through a redraw cycle."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc)
                 (ghostel-full-redraw nil))
@@ -1664,7 +1700,7 @@ Entering line mode forces the editor default; teardown restores the saved value.
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (cl-letf (((symbol-function 'ghostel--mode-enabled)
@@ -1696,7 +1732,7 @@ enter at that prompt instead of arming."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (setq ghostel--cursor-char-pos (point))
@@ -1725,7 +1761,7 @@ it would scrape garbage.  It arms a deferred sentinel instead."
         (with-current-buffer buf
           (ghostel-mode)
           ;; vim-like row: plain text, no prompt prop.
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             (insert "~ NORMAL line one"))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
@@ -1751,7 +1787,7 @@ cursor to anchor on, a prefix arg bypasses the gate and enters."
         (with-current-buffer buf
           (ghostel-mode)
           ;; No prompt prop — only a cursor anchors the boundary.
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             (insert "bash-5.2$ "))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc)
@@ -1781,7 +1817,7 @@ rather than leave the mode unchanged."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             (insert "no prompt here"))
           (let ((ghostel--term 'fake)
                 (ghostel--cursor-char-pos nil))
@@ -1802,7 +1838,7 @@ alt-screen is still on, making the whole entry a no-op."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (setq ghostel--cursor-char-pos (point))
@@ -1830,7 +1866,7 @@ transition pauses as before (type-ahead discarded)."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((alt-on nil)
                 (ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
@@ -1865,17 +1901,17 @@ the `ghostel-prompt' prop is present."
         (with-current-buffer buf
           (ghostel-mode)
           ;; Row matches `ghostel-prompt-regexp' (`$ ') but has no prop.
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             (insert "$ ls -la"))
           (setq ghostel--term 'fake)
           (setq ghostel--cursor-char-pos (point))
           (should (ghostel--regex-prompt-end ghostel--cursor-char-pos))
           (should-not (ghostel--line-mode-prompt-on-screen-p))
           ;; Now add a real prop on the cursor row → non-nil.
-          (let ((inhibit-read-only t))
+          (ghostel-test--with-rendered-output
             (erase-buffer)
-            (insert (propertize "$ " 'ghostel-prompt t))
-            (insert "ls -la"))
+            (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
+            (ghostel-test--insert-rendered "ls -la"))
           (setq ghostel--cursor-char-pos (point))
           (should (ghostel--line-mode-prompt-on-screen-p)))
       (kill-buffer buf))))
@@ -1897,7 +1933,7 @@ the saved `ghostel-full-redraw' state captured on first entry."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (setq ghostel--cursor-char-pos (point))
@@ -1946,7 +1982,7 @@ the flag must not keep suppressing the pause forever."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
-          (insert (propertize "$ " 'ghostel-prompt t))
+          (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
           (let ((ghostel--term 'fake)
                 (ghostel--process 'fake-proc))
             (setq ghostel--cursor-char-pos (point))
@@ -1981,7 +2017,7 @@ the flag must not keep suppressing the pause forever."
   "`ghostel--apply-initial-input-mode' arms deferred entry for `line'.
 The buffer stays in semi-char until a prompt renders."
   :tags '(native)
-  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+  (ghostel-test--with-terminal-buffer (buf _term 5 80 1000)
     (with-current-buffer buf
       (let ((ghostel-initial-input-mode 'line))
         (ghostel--apply-initial-input-mode))
@@ -1991,7 +2027,7 @@ The buffer stays in semi-char until a prompt renders."
 (ert-deftest ghostel-test-initial-input-mode-char-applies-immediately ()
   "`ghostel-initial-input-mode' = `char' enters char mode at startup."
   :tags '(native)
-  (ghostel-test--with-terminal-buffer (buf term 5 80 1000)
+  (ghostel-test--with-terminal-buffer (buf _term 5 80 1000)
     (set-window-buffer (selected-window) buf)
     (with-current-buffer buf
       (cl-letf (((symbol-function 'ghostel--invalidate) #'ignore))
@@ -2045,6 +2081,67 @@ prompt and engages on the redraw that exposes one."
       (ghostel--redraw-now buf)
       (should (eq ghostel--input-mode 'char))
       (should-not ghostel--pending-initial-line-mode))))
+
+(ert-deftest ghostel-test-anchor-window-line-mode-keeps-point ()
+  "`ghostel--anchor-window' anchors the line-mode viewport but keeps point.
+In line mode the input region between `ghostel--line-input-start' and
+`ghostel--line-input-end' is user-owned, so an anchor (minibuffer grow, window
+resize, redisplay) must scroll the viewport to the bottom WITHOUT snapping point
+to the terminal cursor.  The semi-char control sub-case proves the
+snap-to-`ghostel--cursor-char-pos' behaviour is preserved for the other modes."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-line*"))
+        (previous-buffer (window-buffer (selected-window))))
+    (unwind-protect
+        ;; No native module: stub the alt-screen DEC-mode query so line-mode
+        ;; entry takes the primary-screen path.
+        (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                   (lambda (&rest _) nil)))
+          (set-window-buffer (selected-window) buf)
+          (with-current-buffer buf
+            (ghostel-mode)
+            (setq ghostel--term 'fake)
+            ;; Scrollback above the prompt so a bottom-anchor is observable.
+            (let ((rows (max 1 (window-body-height))))
+              (ghostel-test--with-rendered-output
+                (dotimes (i (+ rows 20))
+                  (insert (format "row-%02d\n" i)))))
+            ;; A prompt carrying `ghostel-prompt' on the cursor's row, with the
+            ;; terminal cursor (= the input boundary) right after it.
+            (ghostel-test--insert-rendered (propertize "$ " 'ghostel-prompt t))
+            (setq ghostel--cursor-char-pos (point))
+            (setq ghostel--cursor-pos (cons (current-column) 0))
+            ;; Enter line mode: markers now wrap the (empty) input region.
+            (ghostel-line-mode)
+            (should (eq ghostel--input-mode 'line))
+            (should (markerp ghostel--line-input-start))
+            ;; Type input locally; the end marker grows to include it.
+            (goto-char (marker-position ghostel--line-input-end))
+            (insert "echo hello world")
+            (should (equal (ghostel--line-mode-input-text) "echo hello world"))
+            (let* ((win (selected-window))
+                   (start (marker-position ghostel--line-input-start))
+                   ;; Point mid-input: distinct from `ghostel--cursor-char-pos'
+                   ;; (= input start) and from `point-max' (= input end).
+                   (mid (+ start 5)))
+              (should (= ghostel--cursor-char-pos start))
+              (should (< start mid))
+              (should (< mid (point-max)))
+              ;; Park point mid-input and scroll the window off the bottom.
+              (goto-char mid)
+              (set-window-point win mid)
+              (set-window-start win (point-min) t)
+              ;; Line mode anchors the viewport but leaves point put.
+              (ghostel--anchor-window win)
+              (should (= (window-point win) mid))
+              (should (> (window-start win) (point-min)))
+              ;; Control: semi-char mode still snaps point to the live cursor.
+              (setq ghostel--input-mode 'semi-char)
+              (set-window-start win (point-min) t)
+              (ghostel--anchor-window win)
+              (should (= (window-point win) ghostel--cursor-char-pos))
+              (should (> (window-start win) (point-min))))))
+      (set-window-buffer (selected-window) previous-buffer)
+      (kill-buffer buf))))
 
 (provide 'ghostel-line-mode-test)
 ;;; ghostel-line-mode-test.el ends here

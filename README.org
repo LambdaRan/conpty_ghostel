@@ -307,13 +307,13 @@ Ghostel offers five eat.el-style input modes.  You enter a ghostel buffer in
 *semi-char mode*; switch modes with the key bindings below and watch
 =mode-line-process= for the current mode indicator.
 
-| Mode      | Indicator | Terminal | Buffer    | Purpose                                      |
-|-----------+-----------+----------+-----------+----------------------------------------------|
-| semi-char | /(none)/    | live     | editable  | default - type to terminal, =C-c= reserved    |
-| char      | =:Char=     | live     | editable  | TUI apps - /all/ keys go to the terminal       |
-| Emacs     | =:Emacs=    | live     | read-only | search/read while the terminal keeps running |
-| copy      | =:Copy=     | frozen   | read-only | precise text selection without scroll churn  |
-| line      | =:Line=     | live     | editable  | compose input with Emacs keys, send on =RET=   |
+| Mode      | Indicator | Terminal | Input handling                               |
+|-----------+-----------+----------+----------------------------------------------|
+| semi-char | /(none)/    | live     | type to terminal, =C-c= reserved              |
+| char      | =:Char=     | live     | /all/ keys go to the terminal                 |
+| Emacs     | =:Emacs=    | live     | Emacs navigation/search/copy                 |
+| copy      | =:Copy=     | frozen   | Emacs navigation/search/copy, stable output  |
+| line      | =:Line=     | live     | compose input with Emacs keys, send on =RET=   |
 
 ** Mode-switch keybindings
 
@@ -598,6 +598,23 @@ filters byte-for-byte.
 Remote TRAMP buffers still use Emacs process machinery so TRAMP can spawn the
 shell on the remote host and apply its file handlers.  The rendering and input
 APIs are shared by both paths.
+
+** Bookmarks
+:properties:
+:custom_id: bookmarks
+:end:
+
+Ghostel buffers work with Emacs's built-in bookmarks.  =bookmark-set= (=C-x r
+m=) records the terminal's working directory and buffer name; =bookmark-jump=
+(=C-x r b=) reopens it — reusing a live ghostel buffer of that name, or starting
+a fresh shell in the bookmarked directory when none exists.  Bookmarks capture
+the directory and name only (not scrollback or session contents), matching
+vterm.
+
+=ghostel-bookmark-check-dir= (default =t=) controls directory restoration: a
+fresh buffer starts its shell in the bookmarked directory, and a reused buffer
+that has since moved elsewhere gets a =cd= typed into its shell.  Set it to =nil=
+to leave the directory alone.
 
 ** Links and file detection
 :properties:
@@ -908,9 +925,25 @@ ghostel= spawns a shell on the remote host via TRAMP's process machinery.  The
         ("docker" "/bin/sh")))       ; fixed shell for containers
 #+end_src
 
-Each entry is =(METHOD SHELL [FALLBACK])=.  =SHELL= can be a path like ="/bin/bash"=
-or the symbol =login-shell= to auto-detect the remote user's login shell via
-=getent passwd=.  =FALLBACK= is used when detection fails.
+Each entry is =(METHOD SHELL [FALLBACK [ARG...]])=.  =SHELL= can be a path like
+="/bin/bash"= or the symbol =login-shell= to auto-detect the remote user's login
+shell via =getent passwd=.  =FALLBACK= is used when detection fails.
+
+Any elements after =FALLBACK= are extra arguments for the shell.  When none are
+given, ghostel supplies a type-aware default: recognized shells (bash, zsh,
+fish) are started as login+interactive shells (=-l -i=) so they source the
+user's rc/profile files, mirroring an interactive =ssh host= login; unrecognized
+shells (e.g. =/bin/sh=) get no args.  This default also applies when remote shell
+integration (see below) is enabled, so your own config still loads alongside it
+— except bash uses =-i= only there, since a login bash ignores the =--rcfile= the
+integration relies on.  To override, list the arguments explicitly after
+=FALLBACK=:
+
+#+begin_src emacs-lisp
+(setq ghostel-tramp-shells
+      '(("ssh" login-shell nil "-i")    ; interactive only, no login
+        ("docker" "/bin/sh")))
+#+end_src
 
 OSC 7 directory tracking is TRAMP-aware: when the shell reports a remote
 hostname, =default-directory= is set to the corresponding TRAMP path, reusing the
@@ -1149,6 +1182,7 @@ tables below group them by area; defaults shown are the out-of-the-box values.
 | =ghostel-exit-functions=           | =nil=                                           | Hook run with =(BUFFER EVENT)= when the terminal process exits.                                                 |
 | =ghostel-command-start-functions=  | =(ghostel--query-before-killing-on-cmd-start)=  | Hook run with =(BUFFER)= on OSC 133 C (command start).                                                          |
 | =ghostel-command-finish-functions= | =(ghostel--query-before-killing-on-cmd-finish)= | Hook run with =(BUFFER EXIT-STATUS)= on OSC 133 D (command finish).                                             |
+| =ghostel-bookmark-check-dir=       | =t=                                             | Restore the working directory when jumping to a ghostel [[#bookmarks][bookmark]] (=cd= into a reused buffer that moved).      |
 
 ** Native module
 
@@ -1336,7 +1370,7 @@ Commands:
 | Command                         | Description                                                                |
 |---------------------------------+----------------------------------------------------------------------------|
 | =M-x ghostel-compile=             | Run a command in a read-only ghostel buffer (uses =compile-command=).        |
-| =C-u M-x ghostel-compile=         | Prompt for the command and run it in an /interactive/ (writable) buffer.     |
+| =C-u M-x ghostel-compile=         | Prompt for the command and run it with /interactive/ terminal input.        |
 | =M-x ghostel-recompile=           | Re-run the last command in its original directory (preserves launch mode). |
 | =M-x ghostel-compile-global-mode= | Route /all/ =compile=-style calls through ghostel (opt-in).                    |
 
@@ -1360,10 +1394,10 @@ process, so the "compile-mode" UX (read coloured output, kill with =C-c C-c=) is
 available even mid-run.
 
 Pass a prefix arg (=C-u M-x ghostel-compile=, mirroring =C-u M-x compile=) to launch
-in *interactive* mode instead - the buffer stays writable for the duration of the
-run, so programs like =htop= and =less=, test runners that prompt for input, or
-anything that wants live keystrokes work.  =ghostel-recompile= (=g=) preserves
-whichever mode the buffer was launched in.
+in *interactive* mode instead - keystrokes are forwarded to the running process,
+so programs like =htop= and =less=, test runners that prompt for input, or
+anything that wants live keystrokes work.  The rendered buffer remains read-only.
+=ghostel-recompile= (=g=) preserves whichever mode the buffer was launched in.
 
 When the command finishes, the live process and ghostel renderer are torn down
 and the buffer's major mode is switched to =ghostel-compile-view-mode= (derived
@@ -1378,8 +1412,8 @@ Two keys switch the buffer's state without restarting the process:
 
 | Key                   | Action                                        |
 |-----------------------+-----------------------------------------------|
-| =C-c C-j=               | Switch to interactive (writable terminal)     |
-| =C-c C-e= / =C-c C-t=     | Switch back to read-only / compile-mode-style |
+| =C-c C-j=               | Switch to interactive terminal input |
+| =C-c C-e= / =C-c C-t=     | Switch back to compilation-style navigation |
 
 (=C-c C-t= mirrors =ghostel-mode='s key for entering copy-mode, so the same muscle
 memory works in compile buffers.)  Both keys are bound by
@@ -1396,7 +1430,7 @@ buffers.  Subsequent recompiles preserve whichever state you last switched to.
 | =M-g n= / =M-g p=               | Standard =next-error= / =previous-error=               |
 | =C-c C-c=                     | =compile-goto-error= (same as RET)                   |
 | =C-c C-k=                     | =kill-compilation= - interrupt the running process   |
-| =C-c C-j= / =C-c C-e= / =C-c C-t= | Switch to interactive / read-only (see above)      |
+| =C-c C-j= / =C-c C-e= / =C-c C-t= | Switch interactive input / compilation-style navigation |
 
 These standard =compile= options are honoured: =compile-command= /
 =compile-history= (shared with =M-x compile=), =compilation-read-command=,
@@ -1828,6 +1862,7 @@ while ghostel and vterm trade a compile step for a C/Zig engine.
 | Elisp eval from shell         | ✅      | ✅       | ❌       |
 | TRAMP remote terminals        | ✅      | ✅       | ✅       |
 | Eshell integration            | ✅      | ❌       | ✅       |
+| Bookmark support              | ✅      | ✅       | ❌       |
 |-------------------------------+---------+----------+----------|
 | Input modes (char/semi/emacs) | ✅      | partial  | ✅       |
 | Line mode (local editing)     | ✅      | ❌       | ✅       |

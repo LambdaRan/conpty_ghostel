@@ -166,9 +166,12 @@ pub fn ptyWrite(self: *Self, data: []const u8) !void {
     }
 }
 
-pub fn funcall(_: *Self, comptime func: []const u8, args: anytype) void {
+pub fn effect(_: *Self, comptime func: []const u8, args: anytype) void {
     if (emacs.current_env) |env| {
-        _ = env.f(func, args);
+        _ = env.f(
+            "ghostel--defer",
+            &(env.makeValues(.{@field(emacs.sym, func)}) ++ env.makeValues(args)),
+        );
     }
 }
 
@@ -357,16 +360,27 @@ fn getProcessEnvironment(alloc: Allocator, env: emacs.Env) !std.process.EnvMap {
     var env_map = std.process.EnvMap.init(alloc);
     errdefer env_map.deinit();
 
-    var penv = env.symbolValue("process-environment");
+    var display_explicit = false;
+    var penv = env.f("reverse", .{env.symbolValue("process-environment")});
     while (!env.isNil(penv)) : (penv = env.f("cdr", .{penv})) {
         const item = env.f("car", .{penv});
         const str = try env.extractStringAlloc(alloc, item, &buf);
-        if (std.mem.indexOfScalar(u8, str, '=')) |pos| {
-            const key = str[0..pos];
-            const value = str[(pos + 1)..str.len];
-            if (env_map.get(key) == null) {
-                try env_map.put(key, value);
-            }
+        const key, const value = if (std.mem.indexOfScalar(u8, str, '=')) |pos|
+            .{ str[0..pos], str[(pos + 1)..str.len] }
+        else
+            .{ str, null };
+        if (std.mem.eql(u8, key, "DISPLAY")) display_explicit = true;
+        if (value) |v| {
+            try env_map.put(key, v);
+        } else {
+            env_map.remove(key);
+        }
+    }
+
+    if (!display_explicit and env.isNotNil(env.f("display-graphic-p", .{}))) {
+        const display = env.f("getenv", .{env.makeString("DISPLAY")});
+        if (env.isNotNil(display)) {
+            try env_map.put("DISPLAY", try env.extractStringAlloc(alloc, display, &buf));
         }
     }
 
@@ -511,42 +525,6 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 } else 1;
                 try term.resize(cols, rows, cell_w, cell_h);
                 return env.nil();
-            }
-        },
-    },
-    .{
-        .name = "ghostel--get-title",
-        .arity = .{ 1, 1 },
-        .doc =
-        \\Get the terminal title.
-        \\
-        \\(ghostel--get-title TERM)
-        ,
-        .impl = struct {
-            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
-                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
-                term.lockTerm();
-                defer term.unlockTerm();
-                const title = term.terminal.getTitle();
-                return if (title) |t| env.makeString(t) else env.nil();
-            }
-        },
-    },
-    .{
-        .name = "ghostel--get-pwd",
-        .arity = .{ 1, 1 },
-        .doc =
-        \\Get the terminal's working directory from OSC 7.
-        \\
-        \\(ghostel--get-pwd TERM)
-        ,
-        .impl = struct {
-            pub fn call(env: emacs.Env, _: isize, args: [*c]emacs.Value) !emacs.Value {
-                const term = env.getUserPtr(Self, args[0]) orelse return error.InvalidTerminalHandle;
-                term.lockTerm();
-                defer term.unlockTerm();
-                const pwd = term.terminal.getPwd();
-                return if (pwd) |p| env.makeString(p) else env.nil();
             }
         },
     },

@@ -67,16 +67,55 @@ through the production `ghostel--create' path."
   (string-match-p (concat "\\(?:\\`\\|\n\\)[[:blank:]]*" (regexp-quote prefix))
                   (or text (ghostel-test--terminal-text))))
 
+(defmacro ghostel-test--with-rendered-output (&rest body)
+  "Run BODY while mutating fake renderer-owned buffer text."
+  (declare (indent 0) (debug t))
+  `(let ((inhibit-read-only t))
+     ,@body))
+
+(defun ghostel-test--insert-rendered (&rest args)
+  "Insert ARGS as fake renderer-owned output in the current buffer."
+  (ghostel-test--with-rendered-output
+    (apply #'insert args)))
+
+(defun ghostel-test--redraw (term &optional full)
+  "Redraw TERM as renderer-owned test output.
+When FULL is non-nil, request a full redraw.  This mirrors
+`ghostel--redraw-now', which allows terminal renderer mutations
+even when the ghostel buffer is read-only."
+  (ghostel-test--with-rendered-output
+    (ghostel--redraw term full)))
+
 (defun ghostel-test--cursor (term)
   "Return (COL . ROW) cursor position for TERM via redraw."
-  (ghostel--redraw term)
+  (ghostel-test--redraw term)
   ghostel--cursor-pos)
+
+(defconst ghostel-test--timeout-scale
+  ;; Gate on a *positive numeric* parse, not mere presence: `getenv'
+  ;; returns "" (non-nil) for a set-but-empty var, and
+  ;; `string-to-number' maps "" and garbage to 0 — which would zero
+  ;; every timeout and fail every wait instantly.  A bad override
+  ;; falls through to the CI/default logic instead.
+  (let* ((env (getenv "GHOSTEL_TEST_TIMEOUT_SCALE"))
+         (n (and env (string-to-number env))))
+    (cond ((and n (> n 0)) n)
+          ((getenv "CI") 4)             ; GitHub Actions et al. set CI=true
+          (t 1)))
+  "Multiplier applied to every polling-wait timeout.
+Heavily-loaded CI runners (`make -jN test-native' spawns a real PTY
+child per test file in parallel) can take far longer than the local
+default to reach a predicate.  The wait helpers early-exit the moment
+their predicate holds, so a larger ceiling costs nothing on a passing
+run; only a genuinely slow startup (or a failing predicate) waits the
+extra time.  Override with the `GHOSTEL_TEST_TIMEOUT_SCALE'
+environment variable (must parse to a positive number).")
 
 (defun ghostel-test--wait-for (proc pred &optional timeout)
   "Poll PROC until PRED returns non-nil, or TIMEOUT seconds (default 5).
 Signal an ERT failure if TIMEOUT is reached or PROC exits before PRED
-succeeds."
-  (let* ((timeout (or timeout 5))
+succeeds.  TIMEOUT is scaled by `ghostel-test--timeout-scale'."
+  (let* ((timeout (* (or timeout 5) ghostel-test--timeout-scale))
          (deadline (+ (float-time) timeout))
          result)
     (while (and (not (setq result (funcall pred)))
@@ -265,8 +304,9 @@ Return the matching payload.  PROCESS and TIMEOUT are passed to
 (defun ghostel-test--wait-until (pred &optional process timeout)
   "Poll until PRED returns non-nil, or TIMEOUT seconds elapse.
 PROCESS, when non-nil, is passed to `accept-process-output' so both
-Emacs PTY and native event output can be drained."
-  (let* ((timeout (or timeout 5))
+Emacs PTY and native event output can be drained.  TIMEOUT is scaled
+by `ghostel-test--timeout-scale'."
+  (let* ((timeout (* (or timeout 5) ghostel-test--timeout-scale))
          (deadline (+ (float-time) timeout))
          result)
     (while (and (not (setq result (funcall pred)))
@@ -296,7 +336,7 @@ PROCESS and TIMEOUT are passed to `ghostel-test--wait-until'."
 ROWS, COLS, and TIMEOUT control the fresh terminal and wait.
 Return the terminal text after TEXT appears.  Dynamic process-spawn
 bindings from the caller are honored."
-  (ghostel-test--with-terminal-buffer (buf term (or rows 24) (or cols 80) 1000)
+  (ghostel-test--with-terminal-buffer (buf _term (or rows 24) (or cols 80) 1000)
     (let ((proc (ghostel--start-process)))
       (ghostel-test--wait-for-text text proc timeout)
       (ghostel-test--terminal-text))))

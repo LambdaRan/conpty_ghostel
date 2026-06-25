@@ -8,8 +8,6 @@ const emacs = @import("emacs.zig");
 const gt = @import("ghostty-vt");
 const GhostelTerm = @import("GhostelTerm.zig");
 
-const log = std.log.scoped(.handler);
-
 pub fn GhostelHandler(Context: type) type {
     return struct {
         const Self = @This();
@@ -77,7 +75,7 @@ pub fn GhostelHandler(Context: type) type {
         /// Called when the terminal receives BEL.
         fn bellCallback(handler: *gt.TerminalStream.Handler) void {
             const self: *Self = @fieldParentPtr("inner", handler);
-            self.context.funcall("ding", .{});
+            self.context.effect("ding", .{});
         }
 
         // TODO: DeviceAttributes is not exported from ghostty-vt for some reason.
@@ -123,7 +121,7 @@ pub fn GhostelHandler(Context: type) type {
             const self: *Self = @fieldParentPtr("inner", handler);
             const title = handler.terminal.getTitle();
             if (title) |t| {
-                self.context.funcall("ghostel--set-title", .{t});
+                self.context.effect("ghostel--set-title", .{t});
             }
         }
 
@@ -152,21 +150,17 @@ pub fn GhostelHandler(Context: type) type {
             else
                 null;
 
-            self.context.funcall("ghostel--osc133-marker", .{ &type_str, param_val });
+            self.context.effect("ghostel--osc133-marker", .{ &type_str, param_val });
         }
 
         // ---------------------------------------------------------------------------
         // OSC 7 / OSC 9;9 — report PWD
         // ---------------------------------------------------------------------------
 
-        /// Save the reported PWD on the terminal and update it in Emacs.
+        /// Update Emacs from the reported PWD.
         fn handleReportPwd(self: *Self, v: gt.StreamAction.ReportPwd) void {
             if (v.url.len == 0) return;
-            self.inner.terminal.setPwd(v.url) catch |err| {
-                log.warn("setPwd failed: {any}", .{err});
-            };
-
-            self.context.funcall("ghostel--update-directory", .{v.url});
+            self.context.effect("ghostel--update-directory", .{v.url});
         }
 
         // ---------------------------------------------------------------------------
@@ -185,10 +179,10 @@ pub fn GhostelHandler(Context: type) type {
             if (v.data.len == 1 and v.data[0] == '?') return;
 
             switch (v.kind) {
-                'e' => _ = self.context.funcall("ghostel--osc52-eval", .{v.data}),
+                'e' => _ = self.context.effect("ghostel--osc52-eval", .{v.data}),
                 else => {
                     const kind_str: [1]u8 = .{v.kind};
-                    _ = self.context.funcall("ghostel--osc52-handle", .{ &kind_str, v.data });
+                    _ = self.context.effect("ghostel--osc52-handle", .{ &kind_str, v.data });
                 },
             }
         }
@@ -203,7 +197,7 @@ pub fn GhostelHandler(Context: type) type {
         /// it at the FFI boundary rather than pay the call for nothing.
         fn handleNotification(self: *Self, v: gt.StreamAction.ShowDesktopNotification) void {
             if (v.title.len == 0 and v.body.len == 0) return;
-            self.context.funcall("ghostel--handle-notification", .{ v.title, v.body });
+            self.context.effect("ghostel--handle-notification", .{ v.title, v.body });
         }
 
         // ---------------------------------------------------------------------------
@@ -220,7 +214,7 @@ pub fn GhostelHandler(Context: type) type {
                 .pause => "pause",
             };
             const progress_val = if (v.progress) |p| p else null;
-            self.context.funcall("ghostel--osc-progress", .{ state_str, progress_val });
+            self.context.effect("ghostel--osc-progress", .{ state_str, progress_val });
         }
 
         // ---------------------------------------------------------------------------

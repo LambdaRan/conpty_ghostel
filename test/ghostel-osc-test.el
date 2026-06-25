@@ -2,7 +2,7 @@
 
 ;;; Commentary:
 
-;; OSC 4/9/10/11/51/52/777 handling, color queries, progress / notification
+;; OSC 2/4/9/10/11/51/52/777 handling, color queries, progress / notification
 ;; dispatch, spinners.  OSC 8 hyperlink behavior lives in `ghostel-links-test'.
 
 ;;; Code:
@@ -43,6 +43,23 @@
                             "\e]52;c;?\e\\GHOSTEL_OSC52_QUERY_DRAIN")
         (ghostel-test--wait-for-text "GHOSTEL_OSC52_QUERY_DRAIN" proc 5)
         (should (equal nil kill-ring))))))
+
+(ert-deftest ghostel-test-osc2-title-tracking ()
+  "OSC 2 child output updates title state and title-tracks the buffer name."
+  :tags '(native)
+  (let ((ghostel-buffer-name-function #'ghostel-buffer-name-by-title))
+    (ghostel-test--with-pty-matrix backend
+      (ghostel-test--with-raw-cat-buffer (buf proc)
+        (let* ((title (format "Matrix Title %S" backend))
+               (expected (format "*ghostel: %s*" title)))
+          (ghostel--write-pty ghostel--term (format "\e]2;%s\e\\" title))
+          (ghostel-test--wait-until
+           (lambda ()
+             (and (equal title ghostel--title)
+                  (equal expected (buffer-name))))
+           proc 5)
+          (should (equal title ghostel--title))
+          (should (equal expected (buffer-name))))))))
 
 (ert-deftest ghostel-test-osc9-notification ()
   "OSC 9 iTerm2-style notifications reach `ghostel-notification-function'."
@@ -149,10 +166,9 @@ authority for OSC 9 disambiguation."
           (should (equal '(("" . "10;abc")) calls)))))))
 
 (ert-deftest ghostel-test-osc9-cwd-routing ()
-  "OSC 9;9;PATH updates the terminal's working directory.
-ConEmu's CWD-reporting alias is routed through libghostty's `setPwd'
-\(the same plumbing OSC 7 uses), so `ghostel--get-pwd' reflects the
-reported path and no notification fires."
+  "OSC 9;9;PATH updates the buffer-local working-directory report.
+ConEmu's CWD-reporting alias uses the same callback as OSC 7, so
+`ghostel--last-directory' records the reported path and no notification fires."
   :tags '(native)
   (ghostel-test--with-pty-matrix backend
     (ghostel-test--with-raw-cat-buffer (buf proc)
@@ -161,7 +177,7 @@ reported path and no notification fires."
                    (lambda (title body) (push (cons title body) notifs))))
           (ghostel--write-pty ghostel--term "\e]9;9;/tmp/ghostel-cwd\e\\")
           (ghostel-test--wait-until
-           (lambda () (equal "/tmp/ghostel-cwd" (ghostel--get-pwd ghostel--term)))
+           (lambda () (equal "/tmp/ghostel-cwd" ghostel--last-directory))
            proc 5)
           (should (equal nil notifs)))))))
 
@@ -300,6 +316,22 @@ that emitted the escape as `current-buffer'."
                (lambda (_title _body) (setq captured-name (buffer-name)))))
           (ghostel--handle-notification "" "hi")
           (should (equal captured-name "*ghostel: origin*")))))))
+
+(ert-deftest ghostel-test-defer-runs-in-originating-buffer ()
+  "`ghostel--defer' runs callbacks in the buffer that scheduled them."
+  (cl-letf (((symbol-function 'run-at-time)
+             (lambda (_secs _rep fn &rest args)
+               (with-temp-buffer
+                 (rename-buffer " *unrelated*" t)
+                 (apply fn args)))))
+    (let (captured)
+      (with-temp-buffer
+        (rename-buffer " *ghostel: origin*" t)
+        (ghostel--defer
+         (lambda (value)
+           (setq captured (list value (buffer-name))))
+         'ok))
+      (should (equal captured '(ok " *ghostel: origin*"))))))
 
 (ert-deftest ghostel-test-notification-dispatch-real-timer ()
   "Async path runs end-to-end through a real `run-at-time'.
@@ -570,12 +602,12 @@ fresh."
         (ghostel-test--wait-until
          (lambda ()
            (and kill-ring
-                (equal "PARTIAL" (ghostel--get-pwd ghostel--term))))
+                (equal "PARTIAL" ghostel--last-directory)))
          proc 5)
         ;; OSC 52 dispatched: "hello" in kill-ring.
         (should (equal "hello" (car kill-ring)))
         ;; OSC 7 dispatched with the truncated payload "PARTIAL".
-        (should (equal "PARTIAL" (ghostel--get-pwd ghostel--term)))))))
+        (should (equal "PARTIAL" ghostel--last-directory))))))
 
 (ert-deftest ghostel-test-osc-color-query ()
   "Test that OSC 4/10/11 color queries get responses."
@@ -739,23 +771,23 @@ call.  The OSC 51 scanner this replaces could not handle this case."
         (should (equal "hello" (car kill-ring)))))))
 
 (ert-deftest ghostel-test-osc7-parsing ()
-  "OSC 7 child output updates the terminal working directory."
+  "OSC 7 child output updates the buffer-local directory report."
   :tags '(native)
   (ghostel-test--with-pty-matrix backend
     (ghostel-test--with-raw-cat-buffer (buf proc)
-      (should (equal nil (ghostel--get-pwd ghostel--term)))
+      (should (equal nil ghostel--last-directory))
 
       (ghostel--write-pty ghostel--term "\e]7;file:///tmp/testdir\e\\")
       (ghostel-test--wait-until
-       (lambda () (equal "file:///tmp/testdir" (ghostel--get-pwd ghostel--term)))
+       (lambda () (equal "file:///tmp/testdir" ghostel--last-directory))
        proc 5)
-      (should (equal "file:///tmp/testdir" (ghostel--get-pwd ghostel--term)))
+      (should (equal "file:///tmp/testdir" ghostel--last-directory))
 
       (ghostel--write-pty ghostel--term "\e]7;file:///home/user\a")
       (ghostel-test--wait-until
-       (lambda () (equal "file:///home/user" (ghostel--get-pwd ghostel--term)))
+       (lambda () (equal "file:///home/user" ghostel--last-directory))
        proc 5)
-      (should (equal "file:///home/user" (ghostel--get-pwd ghostel--term))))))
+      (should (equal "file:///home/user" ghostel--last-directory)))))
 
 (ert-deftest ghostel-test-osc133-parsing ()
   "OSC 133 child output dispatches prompt markers."
@@ -817,6 +849,24 @@ call.  The OSC 51 scanner this replaces could not handle this case."
           (ghostel-test--wait-until
            (lambda () (equal "aid=42" (cdr (assoc "A" markers))))
            proc 5))))))
+
+(ert-deftest ghostel-test-deferred-vt-effect-restores-current-buffer ()
+  "Deferred VT effects run in the buffer that produced the terminal output."
+  :tags '(native)
+  (ghostel-test--with-pty-matrix backend
+    (ghostel-test--with-raw-cat-buffer (buf proc)
+      (let ((other (generate-new-buffer " *ghostel-test-vt-effect-other*"))
+            captured)
+        (unwind-protect
+            (cl-letf (((symbol-function 'ghostel--osc133-marker)
+                       (lambda (type param)
+                         (setq captured (list (current-buffer) type param)))))
+              (ghostel--write-pty ghostel--term "\e]133;C\e\\")
+              (with-current-buffer other
+                (ghostel-test--wait-until (lambda () captured) proc 5))
+              (should (eq (car captured) buf))
+              (should (equal (cdr captured) '("C" nil))))
+          (kill-buffer other))))))
 
 (ert-deftest ghostel-test-command-finish-hook ()
   "OSC 133 D fires `ghostel-command-finish-functions'."
