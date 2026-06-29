@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.38.0
+;; Version: 0.39.0
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1") (compat "30.1.0.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -121,6 +121,9 @@ element is the executable path and whose remaining elements are
 arguments passed to that executable.  For example:
 
   (setq ghostel-shell \\='(\"/bin/zsh\" \"--login\"))
+
+For bash, list long options (e.g. `--rcfile') before single-character
+ones (e.g. `-i'); bash rejects long options that follow short ones.
 
 On macOS, ghostel additionally wraps the shell via `login(1)' by
 default so the shell starts as a login shell (matching Apple's
@@ -245,7 +248,10 @@ When none are given, ghostel supplies a type-aware default: recognized shells
 source the user's rc/profile files, mirroring an interactive `ssh host' login.
 Unrecognized shells (e.g. /bin/sh) get no args.
 To override, list the arguments explicitly after FALLBACK,
-e.g. (\"ssh\" login-shell nil \"-i\")."
+e.g. (\"ssh\" login-shell nil \"-i\").
+
+For bash, list long options (e.g. `--rcfile') before single-character
+ones (e.g. `-i'); bash rejects long options that follow short ones."
   :type '(alist :key-type (choice string (const t))
                 :value-type
                 (list (choice :tag "Shell" string (const login-shell))
@@ -2917,11 +2923,13 @@ Skips regions that already have a `help-echo' property (e.g. from OSC 8)
 and the user's active input on the current prompt line.
 Bounding the scan keeps streaming output from re-scanning the entire
 materialized scrollback on every redraw.
-Binds `inhibit-read-only' so the scan can attach text properties even
-when called from the deferred-detection timer outside the redraw scope."
+Binds `inhibit-read-only' and suppresses modification hooks so the scan
+can attach text properties when called from the deferred-detection timer
+outside the redraw scope."
   (let* ((begin (or begin (point-min)))
          (end (or end (point-max)))
          (inhibit-read-only t)
+         (inhibit-modification-hooks t)
          ;; `ghostel--cursor-char-pos' is the live terminal cursor after a redraw;
          ;; its line is the prompt the user is currently editing.  Capture as
          ;; buffer-position bounds so the per-match skip check is O(1).
@@ -3472,33 +3480,6 @@ PROGRESS is an integer 0-100 or nil."
            (message "ghostel: progress handler error: %s"
                     (error-message-string err))))))))
 
-(defvar-local ghostel--face-cookie nil
-  "Cookie from `face-remap-add-relative' for the terminal default face.")
-
-(defvar-local ghostel--face-cookie-fg-bg nil
-  "Cached (FG . BG) pair backing `ghostel--face-cookie'.
-The native render path calls `ghostel--set-buffer-face' on every
-dirty redraw, even when the default colors have not changed.
-`face-remap-remove-relative' / `-add-relative' both call
-`force-mode-line-update' internally, so the unconditional remap
-generated a hundreds-of-Hz FMLU storm that starved the minibuffer
-of redisplay slots.  Comparing against this cache short-circuits
-the no-op case.")
-
-(defun ghostel--set-buffer-face (fg bg)
-  "Set the buffer's default face to FG foreground and BG background.
-This ensures terminal text is visible regardless of the Emacs theme.
-No-op when FG/BG match the cached values from the previous call."
-  (let ((pair (cons fg bg)))
-    (unless (equal pair ghostel--face-cookie-fg-bg)
-      (when ghostel--face-cookie
-        (face-remap-remove-relative ghostel--face-cookie))
-      (setq ghostel--face-cookie
-            (face-remap-add-relative 'default
-                                     :foreground fg
-                                     :background bg))
-      (setq ghostel--face-cookie-fg-bg pair))))
-
 (defun ghostel-buffer-name-by-title (title)
   "Return \"*ghostel: TITLE*\", or nil when TITLE is nil or empty.
 A `ghostel-buffer-name-function' that names the buffer after the title."
@@ -3647,7 +3628,7 @@ file:// URL does not match the local machine, construct a TRAMP path."
 ;;; Palette
 
 (defun ghostel--apply-palette (term)
-  "Apply colors from `ghostel-color-palette' faces and default fg/bg to TERM."
+  "Apply face-derived protocol defaults and palette colors to TERM."
   (when term
     (ghostel--set-default-colors
      term
@@ -4531,11 +4512,11 @@ run the shell on the remote host."
          ;; adapts per shell (bash drops `-l' to keep `--rcfile').  Explicit
          ;; per-method args from `ghostel-tramp-shells' override the default.
          (shell-args (append
+                      integration-args
                       (or extra-shell-args
                           (and remote-p
                                (ghostel--default-remote-shell-args
-                                shell remote-integration)))
-                      integration-args))
+                                shell remote-integration)))))
          (extra-env (append
                      (unless remote-p
                        (list (format "EMACS_GHOSTEL_PATH=%s" ghostel-dir)))
@@ -4999,6 +4980,7 @@ for both native and Emacs PTY paths."
     (setq-local ghostel-environment value))
   (buffer-disable-undo)
   (font-lock-mode -1)
+  (face-remap-add-relative 'default 'ghostel-default)
   ;; `font-lock-mode' can still be re-enabled by user configuration that
   ;; forces `font-lock-defaults' globally (e.g. Doom Emacs).  When active,
   ;; JIT-lock calls `font-lock-unfontify-region' on every redraw, which
