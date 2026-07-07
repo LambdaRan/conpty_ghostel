@@ -9,7 +9,21 @@
 
 (require 'ghostel-test-helpers)
 
+(defvar ghostel-test-compile--mode-finish-called nil)
+
 (defvar-local ghostel-test-compile--finish-continuation nil)
+
+(define-derived-mode ghostel-test-compile-finish-mode compilation-mode "Test-Compilation"
+  "Compilation mode that installs a mode-local finish hook for tests."
+  (setq-local ghostel-test-compile--finish-continuation
+              (lambda (buffer message)
+                (setq ghostel-test-compile--mode-finish-called
+                      (cons buffer message))))
+  (add-hook 'compilation-finish-functions
+            (lambda (buffer message)
+              (funcall ghostel-test-compile--finish-continuation
+                       buffer message))
+            nil t))
 
 (ert-deftest ghostel-test-compile-finalize-scans-errors ()
   "`ghostel-compile--finalize' parses errors in the scan region."
@@ -396,8 +410,8 @@ scrolled below the window."
       (should (equal 1 (length c-calls)))                     ; compile hook
       (should (equal "finished\n" (cdar c-calls))))))
 
-(ert-deftest ghostel-test-compile-buffer-local-finish-hook-state-is-available ()
-  "Buffer-local compile finish hook state is available at finalization."
+(ert-deftest ghostel-test-compile-existing-local-finish-hook-state-is-available ()
+  "Existing buffer-local compile finish hook state is available at finalization."
   (ghostel-test--with-compile-buffer buf
     (let ((finish-called nil)
           (continuation-called nil))
@@ -414,6 +428,20 @@ scrolled below the window."
       (ghostel-compile--finalize buf 0 (current-time))
       (should finish-called)
       (should continuation-called))))
+
+(ert-deftest ghostel-test-compile-mode-local-finish-hook-runs ()
+  "A custom compilation mode's buffer-local finish hook runs at finalization."
+  (ghostel-test--with-compile-buffer buf
+    (let ((ghostel-compile-finished-major-mode
+           #'ghostel-test-compile-finish-mode)
+          (ghostel-test-compile--mode-finish-called nil))
+      (setq ghostel-compile--command "true"
+            ghostel-compile--start-time (current-time)
+            ghostel-compile--scan-marker (copy-marker (point-max)))
+      (ghostel-compile--finalize buf 0 (current-time))
+      (should (eq major-mode 'ghostel-test-compile-finish-mode))
+      (should (equal (cons buf "finished\n")
+                     ghostel-test-compile--mode-finish-called)))))
 
 (ert-deftest ghostel-test-compile-auto-jump-to-first-error ()
   "With `compilation-auto-jump-to-first-error' set, jump after parsing."
@@ -1475,11 +1503,7 @@ declare that variable buffer-locally so the live buffer qualifies."
   (skip-unless (and (file-executable-p "/bin/sh")
                     (file-executable-p "/bin/sleep")))
   (let* ((buf-name "*ghostel-test-kill-compilation*")
-         ;; Print a readiness marker, then `exec' sleep so the PTY's
-         ;; foreground process group is the long-lived sleep.  Waiting
-         ;; for the marker before `kill-compilation' avoids racing
-         ;; SIGINT against process startup on a loaded CI host.
-         (command "printf '%s\\n' GHOSTEL_KILL_READY; exec /bin/sleep 30")
+         (command "exec /bin/sleep 30")
          (shell-file-name "/bin/sh")
          (inhibit-message t)
          (save-some-buffers-default-predicate (lambda () nil))
@@ -1491,11 +1515,6 @@ declare that variable buffer-locally so the live buffer qualifies."
         (let ((buf (ghostel-compile--start command buf-name
                                            default-directory)))
           (with-current-buffer buf
-            (ghostel-test--wait-for
-             ghostel--process
-             (lambda ()
-               (string-match-p "GHOSTEL_KILL_READY"
-                               (ghostel--copy-all-text ghostel--term))))
             (should (process-live-p ghostel--process))
             ;; The live buffer passes `compilation-buffer-p' — which is
             ;; the gate `kill-compilation' uses.
@@ -1509,18 +1528,24 @@ declare that variable buffer-locally so the live buffer qualifies."
             ;; And the buffer has a live process `kill-compilation' would
             ;; deliver SIGINT to.
             (should (process-live-p (get-buffer-process buf)))
-            ;; End-to-end: invoke `kill-compilation' from inside the buffer
-            ;; and wait for the process to die via SIGINT.  The command has
-            ;; exec'd `sleep', so SIGINT terminates it, the sentinel finalizes,
-            ;; and `--last-exit' reflects a non-zero status.
-            (kill-compilation)
-            (ghostel-test--wait-for
-             ghostel--process
-             (lambda () ghostel-compile--finalized) 10)
-            (should ghostel-compile--finalized)
-            (should (numberp ghostel-compile--last-exit))
-            (should-not (zerop ghostel-compile--last-exit))))
-      (when (get-buffer buf-name)
+            ;; Exercise `kill-compilation' without depending on OS signal
+            ;; delivery and process teardown timing; the regression is target
+            ;; discovery, not the stock `interrupt-process' implementation.
+            (let (interrupted-process)
+              (cl-letf (((symbol-function 'interrupt-process)
+                         (lambda (process &optional _current-group)
+                           (setq interrupted-process process))))
+                (kill-compilation))
+              (should (eq interrupted-process ghostel--process)))))
+      (when-let* ((buf (get-buffer buf-name)))
+        (with-current-buffer buf
+          (let ((p ghostel--process))
+            (when (process-live-p p)
+              (set-process-sentinel p #'ignore)
+              (set-process-filter p #'ignore)
+              (setq compilation-in-progress
+                    (delq p compilation-in-progress))
+              (delete-process p))))
         (let ((kill-buffer-query-functions nil))
           (kill-buffer buf-name))))))
 

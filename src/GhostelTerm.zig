@@ -67,7 +67,7 @@ pub fn deinit(self: *Self) void {
         self.alloc.destroy(process);
     }
 
-    self.renderer.deinit(self.alloc);
+    self.renderer.deinit();
     self.stream.deinit();
     self.terminal.deinit(self.alloc);
     if (self.string_buffer) |buf| self.alloc.free(buf);
@@ -80,7 +80,7 @@ pub fn redraw(self: *Self, force_full: bool) !void {
 
     const env = emacs.current_env orelse return;
     const pre_size = .{ self.terminal.cols, self.terminal.rows };
-    try self.renderer.redraw(self.alloc, env, force_full);
+    try self.renderer.redraw(env, force_full);
     _ = env.f("ghostel--kitty-clear", .{});
     try kitty_graphics.emitPlacements(env, self);
     const post_size = .{ self.terminal.cols, self.terminal.rows };
@@ -165,10 +165,11 @@ pub fn effect(_: *Self, comptime func: []const u8, args: anytype) void {
 
 pub fn encode(
     self: *Self,
+    buf: []u8,
     key: gt.input.Key,
     mods: gt.input.KeyMods,
     utf8: ?[]const u8,
-) !bool {
+) !?[]const u8 {
     const options = gt.input.KeyEncodeOptions.fromTerminal(&self.terminal);
     var event = gt.input.KeyEvent{ .action = .press, .key = key, .mods = mods };
     if (utf8) |text| {
@@ -176,14 +177,13 @@ pub fn encode(
     }
 
     // Encode
-    var buf: [128]u8 = undefined;
-    var writer = std.io.Writer.fixed(&buf);
+    var writer = std.io.Writer.fixed(buf);
     try gt.input.encodeKey(&writer, event, options);
     const encoded = writer.buffered();
 
-    if (encoded.len == 0) return false;
+    if (encoded.len == 0) return null;
     try self.ptyWrite(encoded);
-    return true;
+    return encoded;
 }
 
 pub fn encodeMouse(
@@ -392,6 +392,10 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         \\0 disables kitty graphics entirely.
         \\KITTY-MEDIUMS is a bitfield: bit 0 = file medium, bit 1 = temp-file medium,
         \\bit 2 = shared-memory medium (default 0 = direct only).
+        \\
+        \\The returned handle is buffer-affine: `ghostel--new' initializes
+        \\renderer-owned buffer-local state in the current buffer, and later
+        \\GhostelTerm operations must be called with that same buffer current.
         ,
         .impl = struct {
             pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) !emacs.Value {
@@ -542,6 +546,9 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
         \\Encode a key event using the terminal's key encoder.
         \\
         \\(ghostel--encode-key TERM KEY MODS &optional UTF8)
+        \\
+        \\Writes the encoded bytes to the PTY and returns them as a unibyte
+        \\string, or nil when the encoder produced no output.
         ,
         .impl = struct {
             pub fn call(env: emacs.Env, nargs: isize, args: [*c]emacs.Value) !emacs.Value {
@@ -558,8 +565,12 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                     null;
                 const key = input.mapKey(key_name);
                 const mods = input.parseMods(mod_str);
-                const sent = try term.encode(key, mods, utf8);
-                return if (sent) env.t() else env.nil();
+                var encode_buf: [128]u8 = undefined;
+                const sent = try term.encode(&encode_buf, key, mods, utf8);
+                return if (sent) |bytes|
+                    env.makeUnibyteString(bytes) orelse env.t()
+                else
+                    env.nil();
             }
         },
     },

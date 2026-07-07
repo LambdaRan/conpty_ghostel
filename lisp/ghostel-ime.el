@@ -94,7 +94,10 @@ to the PTY as UTF-8 only in terminal-input modes."
             ;; translator; calling it would silently skip composition.
             (eq original #'list))
         (list key)
-      (let ((events (let ((inhibit-read-only t))
+      ;; Bind `buffer-read-only' too: some Lisp IMEs (e.g. `hangul2-input-method')
+      ;; gate composition on the variable directly, not on `inhibit-read-only'.
+      (let ((events (let ((inhibit-read-only t)
+                          (buffer-read-only nil))
                       (funcall original key))))
         (let ((after-point (point)))
           (when (> after-point before-point)

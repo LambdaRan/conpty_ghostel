@@ -618,7 +618,19 @@ are retained — only unwritten padding cells are trimmed."
   (let ((s (concat "aaa" (propertize "\n" 'ghostel-wrap t) "bbb\nccc")))
     (should (equal "aaabbb\nccc" (ghostel--filter-soft-wraps s)))))
 
-
+(ert-deftest ghostel-test-kill-ring-save-filters-soft-wraps ()
+  "Generic copy commands filter renderer-inserted soft-wrap newlines."
+  (let ((kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (interprogram-cut-function nil))
+    (with-temp-buffer
+      (ghostel-mode)
+      (let ((inhibit-read-only t))
+        (insert "hello")
+        (insert (propertize "\n" 'ghostel-wrap t))
+        (insert "world   "))
+      (kill-ring-save (point-min) (point-max))
+      (should (equal (car kill-ring) "helloworld")))))
 
 ;;; Palette, faces, and theme sync
 
@@ -927,6 +939,32 @@ scrolling libghostty's viewport."
             ;; Screen and scrollback should be empty
             (let ((content (buffer-substring-no-properties (point-min) (point-max))))
               (should-not (string-match-p "line [0-9]" content)))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-clear-scrollback-drops-stale-buffer-tail ()
+  "CSI H/2J/3J must not leave pre-clear buffer content above the prompt."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-clear-sb-stale-tail*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 24 80 10000))
+                 (inhibit-read-only t)
+                 (long-line (concat "wrapped " (make-string 160 ?Z))))
+            ;; Mixed line lengths reproduce the stale-tail shape without
+            ;; making libghostty's page layout part of the test contract.
+            (dotimes (i 300)
+              (ghostel--write-vt
+               term
+               (format "%04d %s\r\n" i (if (= (% i 3) 0) "short" long-line))))
+            (ghostel--write-vt term "$ ")
+            (ghostel--redraw term t)
+            (should (string-match-p
+                     "Z" (buffer-substring-no-properties (point-min) (point-max))))
+            (ghostel--write-vt term "\e[H\e[2J\e[3J$ ")
+            (ghostel--redraw term)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should-not (string-match-p "Z" content))
+              (should (string-prefix-p "$ " content)))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-scrollback-csi3j-then-refill ()

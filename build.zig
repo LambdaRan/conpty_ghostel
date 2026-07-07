@@ -55,8 +55,6 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    b.installArtifact(lib);
-
     const copy_step = b.addInstallFile(
         lib.getEmittedBin(),
         moduleOutputName(target_os),
@@ -65,11 +63,10 @@ pub fn build(b: *std.Build) void {
 
     // Sidecar version file sitting next to the binary.  The elisp loader
     // reads this before `module-load` to detect a stale module without
-    // mapping it into the process.  Mirrors the path of the .so/.dylib
-    // produced above.
+    // mapping it into the process.
     const version_wf = b.addWriteFiles();
     const version_file = version_wf.add("ghostel-module.version", module_version ++ "\n");
-    const copy_version_step = b.addInstallFile(version_file, "../ghostel-module.version");
+    const copy_version_step = b.addInstallFile(version_file, "ghostel-module.version");
     b.getInstallStep().dependOn(&copy_version_step.step);
 
     // ----------------------------------------------------------------
@@ -158,8 +155,8 @@ fn dirHasEmacsModuleHeader(allocator: std.mem.Allocator, dir: []const u8) bool {
 
 fn moduleOutputName(target_os: std.Target.Os.Tag) []const u8 {
     return switch (target_os) {
-        .macos => "../ghostel-module.dylib",
-        .windows => "../ghostel-module.dll",
-        else => "../ghostel-module.so",
+        .macos => "ghostel-module.dylib",
+        .windows => "ghostel-module.dll",
+        else => "ghostel-module.so",
     };
 }

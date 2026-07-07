@@ -4,8 +4,8 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.39.0
-;; Package-Requires: ((emacs "28.1") (evil "1.0") (ghostel "0.8.0"))
+;; Version: 0.41.0
+;; Package-Requires: ((emacs "28.1") (evil "1.0") (ghostel "0.41.0"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;; This file is NOT part of GNU Emacs.
@@ -150,7 +150,12 @@ ORIG-FN is the advised function (TERM, FULL).  Skipped in alt-screen (1049)."
              (saved-ve (and visual-p (bound-and-true-p evil-visual-end)
                             (marker-position evil-visual-end))))
         (funcall orig-fn term full)
-        (when (memq evil-state '(insert emacs))
+        ;; Don't drag point to the cursor while the user reads scrollback;
+        ;; redisplay would yank the viewport back to the bottom each frame.
+        ;; (No window showing the buffer → treat as following.)
+        (when (and (memq evil-state '(insert emacs))
+                   (let ((win (get-buffer-window (current-buffer) t)))
+                     (or (null win) (ghostel--window-anchored-p win))))
           (evil-ghostel--reset-cursor-point))
         (when visual-p
           (let ((pmax (point-max)))
@@ -159,6 +164,16 @@ ORIG-FN is the advised function (TERM, FULL).  Skipped in alt-screen (1049)."
             (when saved-ve
               (set-marker evil-visual-end (min saved-ve pmax))))))
     (funcall orig-fn term full)))
+
+(defun evil-ghostel--anchor-inhibit (_window force)
+  "Veto ghostel's redraw anchor while point roams off the live cursor.
+A `ghostel-inhibit-anchor-functions' entry: returns non-nil in a motion-capable
+evil state with point off the cursor, unless FORCE."
+  (and (not force)
+       (evil-ghostel--active-p)
+       (memq evil-state '(normal visual operator motion))
+       ghostel--cursor-char-pos
+       (/= (point) ghostel--cursor-char-pos)))
 
 ;; Cursor style: let evil control cursor shape
 
@@ -300,56 +315,31 @@ Loops `accept-process-output' (capped by
 
 (defun evil-ghostel-goto-input-position (pos)
   "Drive the terminal cursor and Emacs point to buffer position POS.
-Returns t when the cursor reached POS.  Only meaningful in semi-char mode."
+On the cursor row a rightward target is clamped to `evil-ghostel--input-end',
+so the move never right-arrows across a trailing autosuggestion, which the
+shell would accept (zsh-autosuggestions / fish).  Only meaningful in
+semi-char mode.  Returns non-nil when it ran."
   (when (and ghostel--term ghostel--cursor-pos)
-    (let* ((start-char-pos ghostel--cursor-char-pos)
-           (start-cursor ghostel--cursor-pos)
-           (start-col (car start-cursor))
-           (start-row-vp (cdr start-cursor))
-           (target-col (save-excursion (goto-char pos) (current-column)))
+    (let* ((start-col (car ghostel--cursor-pos))
+           (start-row-vp (cdr ghostel--cursor-pos))
            (target-row-vp (or (ghostel--viewport-row-at pos) start-row-vp))
-           (dy (- target-row-vp start-row-vp))
-           (dx (- target-col start-col))
-           (right-arrow-drained nil)
-           (reached
-            (progn
-              (cond ((> dy 0) (dotimes (_ dy) (ghostel--send-encoded "down" "")))
-                    ((< dy 0) (dotimes (_ (abs dy)) (ghostel--send-encoded "up" ""))))
-              (cond ((> dx 0) (dotimes (_ dx) (ghostel--send-encoded "right" "")))
-                    ((< dx 0) (dotimes (_ (abs dx)) (ghostel--send-encoded "left" ""))))
-              ;; Verify landing only on rightward moves (the ones that can
-              ;; trip literal-echo or autosuggest).  Echo detection needs a
-              ;; rendered baseline; without one, treat the send as success.
-              (if (or (<= dx 0) (null start-char-pos))
-                  t
-                (setq right-arrow-drained t)
-                (evil-ghostel--sync-render)
-                (let ((post-cur ghostel--cursor-char-pos))
-                  (cond
-                   ((and post-cur (= post-cur pos)) t)
-                   ;; Literal-echo: cursor advanced 4×dx and buffer ends
-                   ;; with "^[[C".  Echo is 4 chars per arrow; send 3
-                   ;; backspaces per arrow to undo.
-                   ((and post-cur (zerop dy)
-                         (= post-cur (+ start-char-pos (* 4 dx)))
-                         (save-excursion
-                           (goto-char post-cur)
-                           (looking-back (regexp-quote "^[[C") (min 4 post-cur))))
-                    (dotimes (_ (* 3 dx)) (ghostel--send-encoded "backspace" ""))
-                    nil)
-                   ;; Cursor jumped past target — autosuggest accepted.
-                   ((and post-cur (> post-cur pos))
-                    (ghostel--send-encoded "_" "ctrl")
-                    nil)
-                   (t nil)))))))
-      (when reached
-        ;; Drain so `ghostel--cursor-pos' reflects the move, unless the
-        ;; rightward branch already drained or no arrows were sent.
-        (when (and (not right-arrow-drained)
-                   (or (/= dx 0) (/= dy 0)))
+           (dy (- target-row-vp start-row-vp)))
+      ;; Clamp only a rightward, same-row target: at end-of-input a right
+      ;; arrow accepts the greyed suggestion.
+      ;; `input-end' excludes it, so stopping there means we never accept.
+      (when (and (zerop dy)
+                 ghostel--cursor-char-pos
+                 (> pos ghostel--cursor-char-pos))
+        (setq pos (min pos (or (evil-ghostel--input-end) pos))))
+      (let ((dx (- (save-excursion (goto-char pos) (current-column)) start-col)))
+        (cond ((> dy 0) (dotimes (_ dy) (ghostel--send-encoded "down" "")))
+              ((< dy 0) (dotimes (_ (abs dy)) (ghostel--send-encoded "up" ""))))
+        (cond ((> dx 0) (dotimes (_ dx) (ghostel--send-encoded "right" "")))
+              ((< dx 0) (dotimes (_ (abs dx)) (ghostel--send-encoded "left" ""))))
+        (when (or (/= dx 0) (/= dy 0))
           (evil-ghostel--sync-render))
-        (goto-char pos))
-      reached)))
+        (goto-char pos)
+        t))))
 
 (defun evil-ghostel-delete-input-region (beg end)
   "Delete BEG..END from input by backspacing over the PTY; return the count.
@@ -419,12 +409,15 @@ $ would walk into non-typed cells).  Off the cursor row, unchanged."
         (forward-line cursor-line)
         (move-to-column col)))))
 
-(defun evil-ghostel-goto-cursor ()
-  "Move point to the live terminal cursor."
-  (interactive)
-  (if (not (evil-ghostel--active-p))
-      (call-interactively #'evil-goto-line)
-    (evil-ghostel--reset-cursor-point)))
+(evil-define-motion evil-ghostel-goto-cursor (count)
+  "Move point to the live terminal cursor, or `evil-goto-line' when inactive."
+  ;; A motion, not a plain command: `:keep-visual t' stops evil's line-visual
+  ;; expand/contract from reverting the jumped point.
+  :type line
+  :jump t
+  (if (evil-ghostel--active-p)
+      (evil-ghostel--reset-cursor-point)
+    (evil-goto-line count)))
 
 
 ;; Insert / Append
@@ -652,7 +645,7 @@ unless at end-of-input, where a right arrow would accept a suggestion."
 (defun evil-ghostel-paste-after (&optional count register yank-handler)
   "Paste after the cursor via bracketed paste COUNT times from REGISTER.
 YANK-HANDLER is used by Evil outside live terminal input.  Covers p."
-  (interactive "*P")
+  (interactive "P")
   (if (evil-ghostel--active-p)
       (evil-ghostel--do-paste count register t)
     (evil-paste-after count register yank-handler)))
@@ -660,7 +653,7 @@ YANK-HANDLER is used by Evil outside live terminal input.  Covers p."
 (defun evil-ghostel-paste-before (&optional count register yank-handler)
   "Paste before the cursor via bracketed paste COUNT times from REGISTER.
 YANK-HANDLER is used by Evil outside live terminal input.  Covers P."
-  (interactive "*P")
+  (interactive "P")
   (if (evil-ghostel--active-p)
       (evil-ghostel--do-paste count register nil)
     (evil-paste-before count register yank-handler)))
@@ -865,6 +858,10 @@ Enabling installs global advice while any buffer has the mode enabled."
         ;; states expect point to follow the terminal cursor.
         (add-hook 'evil-emacs-state-entry-hook
                   #'evil-ghostel--insert-state-entry nil t)
+        ;; Let normal/visual/operator/motion-state navigation roam point off
+        ;; the live cursor without the per-redraw anchor snapping it back.
+        (add-hook 'ghostel-inhibit-anchor-functions
+                  #'evil-ghostel--anchor-inhibit nil t)
         (advice-add 'ghostel--redraw :around #'evil-ghostel--around-redraw)
         (advice-add 'ghostel--apply-cursor-style :around
                     #'evil-ghostel--override-cursor-style)
@@ -873,6 +870,8 @@ Enabling installs global advice while any buffer has the mode enabled."
                  #'evil-ghostel--insert-state-entry t)
     (remove-hook 'evil-emacs-state-entry-hook
                  #'evil-ghostel--insert-state-entry t)
+    (remove-hook 'ghostel-inhibit-anchor-functions
+                 #'evil-ghostel--anchor-inhibit t)
     (kill-local-variable 'ghostel-mark-activation-input-mode)
     (unless (evil-ghostel--any-active-elsewhere-p (current-buffer))
       (advice-remove 'ghostel--redraw #'evil-ghostel--around-redraw)

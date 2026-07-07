@@ -44,7 +44,7 @@ if "%EMACS_INCLUDE_DIR%"=="" (
 
 :: Build ghostel-module.dll (GNU ABI avoids MSVC libcpmt linking issues)
 echo Building ghostel-module.dll...
-zig build -Doptimize=%ZIG_OPT% -Dtarget=native-native-gnu
+zig build --prefix . -Doptimize=%ZIG_OPT% -Dtarget=native-native-gnu
 if errorlevel 1 (
     echo ERROR: Failed to build ghostel module.
     exit /b 1

@@ -53,11 +53,14 @@ pub fn init(
         posix.close(pipe[1]);
     }
 
+    var stream: @TypeOf(self.stream) = .initAlloc(alloc, .init(self, term));
+    errdefer stream.deinit();
+
     self.* = .{
         .process = process,
         .event_pipe = event_pipe,
         .term = term,
-        .stream = .initAlloc(alloc, .init(self, term)),
+        .stream = stream,
         .wake_pipe = pipe,
         .thread = try std.Thread.spawn(.{}, Self.run, .{self}),
     };
@@ -195,11 +198,12 @@ fn loopOnce(self: *Self) !bool {
         self.stream.nextSlice(buf[0..len]);
     }
 
+    try self.notifyVtUpdate();
+
     if (pollfds[0].revents & posix.POLL.HUP != 0) {
         return false;
     }
 
-    try self.notifyVtUpdate();
     return true;
 }
 

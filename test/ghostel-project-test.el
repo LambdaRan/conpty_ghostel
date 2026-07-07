@@ -61,6 +61,113 @@
       (should (equal (car captured) '(4)))
       (should (equal (cdr captured) "*myproj-ghostel*")))))
 
+(ert-deftest ghostel-test-project-buffer-name-remote ()
+  "`ghostel--project-buffer-name' host-qualifies remote roots (bug #344)."
+  (require 'project)
+  (let ((ghostel-buffer-name "*ghostel*"))
+    (cl-letf (((symbol-function 'project-prefixed-buffer-name)
+               (lambda (name) (format "*myproj-%s*" name))))
+      (should (equal (ghostel--project-buffer-name "/tmp/myproj/")
+                     "*myproj-ghostel*"))
+      (should (equal (ghostel--project-buffer-name
+                      "/ssh:user@host:/tmp/myproj/")
+                     "*myproj-ghostel@ssh:user@host*")))))
+
+(ert-deftest ghostel-test-project-remote-not-confused-with-local ()
+  "`ghostel-project' on a remote root ignores an equally named local buffer.
+Regression test for bug #344: a local and a remote project with the
+same name must get separate buffers."
+  (require 'project)
+  (let* ((ghostel-buffer-name "*ghostel*")
+         (local (generate-new-buffer "*myproj-ghostel*"))
+         (created (generate-new-buffer " *ghostel-test-remote-proj*"))
+         result)
+    (unwind-protect
+        (progn
+          (with-current-buffer local
+            (ghostel-mode)
+            (setq-local ghostel--buffer-identity "*myproj-ghostel*")
+            (setq-local ghostel--term 'fake-term))
+          (cl-letf (((symbol-function 'project-current)
+                     (lambda (&rest _)
+                       '(transient . "/ssh:user@host:/tmp/myproj/")))
+                    ((symbol-function 'project-root)
+                     (lambda (proj) (cdr proj)))
+                    ((symbol-function 'project-prefixed-buffer-name)
+                     (lambda (name) (format "*myproj-%s*" name)))
+                    ((symbol-function 'ghostel--load-module)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'ghostel--create)
+                     (lambda (&rest _) created))
+                    ((symbol-function 'ghostel--start-process) #'ignore))
+            (setq result (ghostel-project)))
+          (should (eq result created))
+          (with-current-buffer created
+            (should (equal ghostel--buffer-identity
+                           "*myproj-ghostel@ssh:user@host*"))))
+      (dolist (b (list local created))
+        (when (buffer-live-p b) (kill-buffer b))))))
+
+(ert-deftest ghostel-test-project-remote-reuses-remote ()
+  "`ghostel-project' reuses the buffer of the same remote project."
+  (require 'project)
+  (let* ((ghostel-buffer-name "*ghostel*")
+         (existing (generate-new-buffer "*myproj-ghostel@ssh:user@host*"))
+         (pre-count (length (buffer-list)))
+         popped)
+    (unwind-protect
+        (progn
+          (with-current-buffer existing
+            (ghostel-mode)
+            (setq-local ghostel--buffer-identity
+                        "*myproj-ghostel@ssh:user@host*")
+            (setq-local ghostel--term 'fake-term))
+          (cl-letf (((symbol-function 'project-current)
+                     (lambda (&rest _)
+                       '(transient . "/ssh:user@host:/tmp/myproj/")))
+                    ((symbol-function 'project-root)
+                     (lambda (proj) (cdr proj)))
+                    ((symbol-function 'project-prefixed-buffer-name)
+                     (lambda (name) (format "*myproj-%s*" name)))
+                    ((symbol-function 'ghostel--load-module)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (b &rest _) (setq popped b))))
+            (ghostel-project))
+          (should (eq popped existing))
+          (should (= pre-count (length (buffer-list)))))
+      (when (buffer-live-p existing) (kill-buffer existing)))))
+
+(ert-deftest ghostel-test-project-buffers-identity-scope-remote ()
+  "Identity scope separates local and remote projects of the same name."
+  (require 'project)
+  (let ((ghostel-buffer-name "*ghostel*")
+        (ghostel-project-buffer-scope 'identity)
+        (local (generate-new-buffer "*ghostel: local myproj*"))
+        (remote (generate-new-buffer "*ghostel: remote myproj*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer local
+            (ghostel-mode)
+            (setq-local ghostel--buffer-identity "*myproj-ghostel*"))
+          (with-current-buffer remote
+            (ghostel-mode)
+            (setq-local ghostel--buffer-identity
+                        "*myproj-ghostel@ssh:user@host*"))
+          (cl-letf (((symbol-function 'project-prefixed-buffer-name)
+                     (lambda (name) (format "*myproj-%s*" name)))
+                    ((symbol-function 'project-root)
+                     (lambda (proj) (cdr proj))))
+            (cl-letf (((symbol-function 'project-current)
+                       (lambda (&rest _) '(transient . "/tmp/myproj/"))))
+              (should (equal (ghostel--project-buffers) (list local))))
+            (cl-letf (((symbol-function 'project-current)
+                       (lambda (&rest _)
+                         '(transient . "/ssh:user@host:/tmp/myproj/"))))
+              (should (equal (ghostel--project-buffers) (list remote))))))
+      (dolist (b (list local remote))
+        (when (buffer-live-p b) (kill-buffer b))))))
+
 (ert-deftest ghostel-test-reuses-identity-match-after-rename ()
   "`ghostel' reuses an identity-matched buffer after a title-tracking rename."
   (let* ((ghostel-buffer-name "*ghostel*")

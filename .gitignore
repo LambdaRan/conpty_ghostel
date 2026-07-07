@@ -3,6 +3,7 @@ zig-out/
 zig-pkg/
 vendor/ghostty
 .build/
+.ghostel-build/
 .hypothesis/
 *.dylib
 *.so

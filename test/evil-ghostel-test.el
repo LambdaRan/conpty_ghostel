@@ -84,6 +84,8 @@ literal key."
    (should evil-ghostel-mode)
    (should (memq 'evil-ghostel--insert-state-entry
                  evil-insert-state-entry-hook))
+   (should (memq 'evil-ghostel--anchor-inhibit
+                 ghostel-inhibit-anchor-functions))
    (should (advice--p (advice--symbol-function 'ghostel--redraw)))
    (should (advice--p (advice--symbol-function 'ghostel--apply-cursor-style)))
    ;; Editing operators are bound via [remap evil-FOO] in normal state.
@@ -324,6 +326,89 @@ advice must not restore point or visual markers there."
    ;; Advice bypassed → the mock's point placement (point-min) wins.
    (should (= (point-min) (point)))))
 
+(ert-deftest evil-ghostel-test-around-redraw-keeps-point-in-scrollback ()
+  "Insert-state redraw keeps point put while reading scrollback (seam 2).
+When the window has scrolled off the live output, `evil-ghostel--around-redraw'
+must not drag point to the terminal cursor; when the window follows the bottom,
+it still snaps point to the cursor."
+  (let ((buf (generate-new-buffer " *evil-ghostel-test-seam2*"))
+        (previous-buffer (window-buffer (selected-window))))
+    (unwind-protect
+        (progn
+          (set-window-buffer (selected-window) buf)
+          (with-current-buffer buf
+            (ghostel-mode)
+            (evil-local-mode 1)
+            (evil-ghostel-mode 1)
+            (let ((rows (max 1 (window-body-height))))
+              (setq-local ghostel--term 'fake
+                          ghostel--term-rows rows)
+              (let ((inhibit-read-only t))
+                (dotimes (i (+ rows 20))
+                  (insert (format "row-%02d\n" i)))
+                (insert "$ ")))
+            (setq ghostel--cursor-char-pos (point))
+            ;; Viewport-relative cursor: last row, column past the prompt.
+            (setq ghostel--cursor-pos (cons (current-column) (1- ghostel--term-rows)))
+            (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                       (lambda (&rest _) nil)))
+              ;; Bind `evil-state' directly: entering insert via
+              ;; `evil-insert-state' would fire entry hooks that touch the
+              ;; (fake) native term.
+              (let ((win (selected-window))
+                    (evil-state 'insert))
+                ;; Scrolled into scrollback: point must stay put.
+                (goto-char (point-min))
+                (set-window-start win (point-min) t)
+                (should-not (ghostel--window-anchored-p win))
+                (evil-ghostel--around-redraw #'ignore 'fake)
+                (should (= (point) (point-min)))
+                ;; Following the bottom: point snaps to the live cursor.
+                (goto-char (point-max))
+                (ghostel--anchor-window win)
+                (should (ghostel--window-anchored-p win))
+                (goto-char (point-min))
+                (evil-ghostel--around-redraw #'ignore 'fake)
+                (should (/= (point) (point-min)))))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (evil-ghostel-mode -1)))
+      (set-window-buffer (selected-window) previous-buffer)
+      (kill-buffer buf))))
+
+(ert-deftest evil-ghostel-test-anchor-inhibit-predicate ()
+  "`evil-ghostel--anchor-inhibit' vetoes only when roaming off the cursor.
+Fires only where evil-ghostel drives PTY input (`evil-ghostel--active-p':
+semi-char, outside alt-screen).  There: non-nil in a motion-capable state with
+point off the live cursor and no FORCE; nil on the cursor, under FORCE, or in
+insert state.  Inert (never vetoes) when not active, e.g. in alt-screen."
+  (evil-ghostel-test--with-evil-buffer
+   (insert "one\ntwo\nthree\n$ ")
+   (setq-local ghostel--term 'fake)
+   (setq-local ghostel--cursor-char-pos (point))
+   (let ((off (point-min)))
+     ;; Active: semi-char input mode, not alt-screen.
+     (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                (lambda (&rest _) nil)))
+       (let ((evil-state 'normal))
+         ;; Normal state, point off the cursor: veto, unless FORCE.
+         (goto-char off)
+         (should (evil-ghostel--anchor-inhibit nil nil))
+         (should-not (evil-ghostel--anchor-inhibit nil t))
+         ;; Point back on the live cursor: no veto.
+         (goto-char ghostel--cursor-char-pos)
+         (should-not (evil-ghostel--anchor-inhibit nil nil)))
+       ;; Insert state roams point off the cursor but still follows: no veto.
+       (let ((evil-state 'insert))
+         (goto-char off)
+         (should-not (evil-ghostel--anchor-inhibit nil nil))))
+     ;; Not active (alt-screen): ghostel owns the anchor, never vetoed even
+     ;; while roaming off the cursor in a motion state.
+     (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                (lambda (&rest _) t)))
+       (let ((evil-state 'normal))
+         (goto-char off)
+         (should-not (evil-ghostel--anchor-inhibit nil nil)))))))
+
 ;; -----------------------------------------------------------------------
 ;; Test: reset-cursor-point
 ;; -----------------------------------------------------------------------
@@ -386,6 +471,76 @@ point in the scrollback region instead of the visible viewport."
               (current-column)))))
 
 ;; -----------------------------------------------------------------------
+;; Test: G (evil-ghostel-goto-cursor) is a linewise motion (#485)
+;; -----------------------------------------------------------------------
+;;
+;; The #485 defect lives in evil's *visual command-loop* handling, not in
+;; `evil-ghostel-goto-cursor''s body: a plain command makes evil expand the
+;; line-visual region before `G' and contract it after, snapping point back
+;; to the start line.  `evil-define-motion' supplies `:keep-visual t', which
+;; suppresses that expand/contract.  `execute-kbd-macro' does not dispatch
+;; commands under `--batch', so these drive `G' through the same hooks the
+;; real command loop runs (`evil-visual-pre-command' / `-post-command').
+
+(defun evil-ghostel-test--visual-goto-cursor (type)
+  "Select a TYPE visual region at point, then run `G' as the command loop would.
+TYPE is `line' or `char'.  Reproduces #485 without `execute-kbd-macro'."
+  (evil-visual-make-selection (point) (point) type)
+  (let ((this-command 'evil-ghostel-goto-cursor))
+    (evil-visual-pre-command 'evil-ghostel-goto-cursor)
+    (call-interactively 'evil-ghostel-goto-cursor)
+    (evil-visual-post-command 'evil-ghostel-goto-cursor)))
+
+(ert-deftest evil-ghostel-test-visual-line-goto-cursor-extends ()
+  "Regression for #485: `VG' extends the line-visual selection to the cursor.
+Pre-fix this reverted point to the start line; a linewise motion keeps it."
+  (evil-ghostel-test--with-buffer 8 40 "r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6"
+    (should (evil-ghostel--active-p))
+    (let ((cursor-line (save-excursion
+                         (evil-ghostel--reset-cursor-point)
+                         (line-number-at-pos))))
+      (evil-normal-state)
+      (goto-char (point-min))
+      (evil-ghostel-test--visual-goto-cursor 'line)
+      (should (evil-visual-state-p))
+      (should (= cursor-line (line-number-at-pos (point))))
+      (should (= 1 (line-number-at-pos evil-visual-beginning)))
+      (should (>= (line-number-at-pos evil-visual-end) cursor-line)))))
+
+(ert-deftest evil-ghostel-test-visual-char-goto-cursor-extends ()
+  "Guard for #485: `vG' (char-visual) still extends to the cursor row.
+This case always worked; keep it working while fixing the line-visual one."
+  (evil-ghostel-test--with-buffer 8 40 "r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6"
+    (let ((cursor-line (save-excursion
+                         (evil-ghostel--reset-cursor-point)
+                         (line-number-at-pos))))
+      (evil-normal-state)
+      (goto-char (point-min))
+      (evil-ghostel-test--visual-goto-cursor 'char)
+      (should (evil-visual-state-p))
+      (should (= cursor-line (line-number-at-pos (point))))
+      (should (= 1 (line-number-at-pos evil-visual-beginning))))))
+
+(ert-deftest evil-ghostel-test-goto-cursor-inactive-falls-back ()
+  "When evil-ghostel is inactive, `evil-ghostel-goto-cursor' acts like
+`evil-goto-line': honor a count, else go to the last line."
+  (evil-ghostel-test--with-buffer 8 40 "r1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6"
+    (setq-local ghostel--input-mode 'line)
+    (should-not (evil-ghostel--active-p))
+    ;; With a count: jump to that line.
+    (goto-char (point-min))
+    (evil-ghostel-goto-cursor 3)
+    (should (= 3 (line-number-at-pos)))
+    ;; Without a count: same landing spot as vanilla `evil-goto-line'.
+    (let ((expected (save-excursion
+                      (goto-char (point-min))
+                      (evil-goto-line nil)
+                      (point))))
+      (goto-char (point-min))
+      (evil-ghostel-goto-cursor nil)
+      (should (= expected (point))))))
+
+;; -----------------------------------------------------------------------
 ;; Test: evil-ghostel-goto-input-position end-to-end with the native module
 ;; -----------------------------------------------------------------------
 
@@ -412,16 +567,16 @@ algorithm; this one walks scrollback math and viewport offsets too)."
 line N must be converted to viewport row N-scrollback before
 diffing — otherwise dy is wrong by the scrollback line count."
   (skip-unless (fboundp 'ghostel--new))
-  (let ((term (ghostel--new 5 40 1000)))
-    ;; Push 12 rows so the viewport shows rows 8..12 plus a trailing
-    ;; cursor row.
-    (dotimes (i 12)
-      (ghostel--write-vt term (format "row-%02d\r\n" i)))
-    (ghostel--write-vt term "tail")
-    (with-temp-buffer
-      (ghostel-mode)
+  (with-temp-buffer
+    (ghostel-mode)
+    (let ((term (ghostel--new 5 40 1000)))
       (setq-local ghostel--term term)
       (setq-local ghostel--term-rows 5)
+      ;; Push 12 rows so the viewport shows rows 8..12 plus a trailing
+      ;; cursor row.
+      (dotimes (i 12)
+        (ghostel--write-vt term (format "row-%02d\r\n" i)))
+      (ghostel--write-vt term "tail")
       (evil-local-mode 1)
       (evil-ghostel-mode 1)
       (let ((inhibit-read-only t))
@@ -807,6 +962,72 @@ without a real native module."
         (evil-ghostel-goto-input-position ghostel--cursor-char-pos))
       (should (zerop (length keys-sent))))))
 
+(defmacro evil-ghostel-test--with-cursor-fixture (prompt typed trail &rest body)
+  "Mock terminal: PROMPT (`ghostel-prompt') + TYPED (`ghostel-input') + TRAIL,
+with `ghostel--cursor-char-pos' at the TYPED/TRAIL boundary so TRAIL occupies
+cells to the right of the cursor.  Runs BODY with evil + `evil-ghostel-mode'
+on and the terminal mocked."
+  (declare (indent 3))
+  `(let ((buf (generate-new-buffer " *evil-ghostel-test-cursor*")))
+     (unwind-protect
+         (with-current-buffer buf
+           (ghostel-mode)
+           (let ((inhibit-read-only t))
+             (insert (propertize ,prompt 'ghostel-prompt t))
+             (insert (propertize ,typed 'ghostel-input t))
+             (setq ghostel--cursor-char-pos (point))
+             (setq ghostel--cursor-pos (cons (current-column) 0))
+             (insert (propertize ,trail 'ghostel-input t)))
+           (setq ghostel--term 'fake)
+           (setq ghostel--term-rows 1)
+           (evil-local-mode 1)
+           (evil-ghostel-mode 1)
+           (cl-letf (((symbol-function 'ghostel--mode-enabled)
+                      (lambda (&rest _) nil)))
+             ,@body))
+       (kill-buffer buf))))
+
+;; The color-based suggestion detection (`suggestion-p'/`greyed-out-p') is not
+;; exercisable under `--batch' (`color-values' has no display frame), so these
+;; test the clamp contract directly by stubbing `evil-ghostel--input-end' — the
+;; boundary the clamp trims a rightward target to.
+
+(ert-deftest evil-ghostel-test-goto-clamps-rightward-into-suggestion ()
+  "A rightward target past `evil-ghostel--input-end' (a trailing autosuggestion)
+is clamped to it: no right arrows cross the boundary and no `C-_'/backspace
+correction is emitted (issue #493)."
+  (evil-ghostel-test--with-cursor-fixture "$ " "ls" " --all"
+    (let ((sent '()))
+      (cl-letf (((symbol-function 'ghostel--send-encoded)
+                 (lambda (key mods &rest _) (push (cons key mods) sent)))
+                ((symbol-function 'evil-ghostel--sync-render) #'ignore)
+                ;; Suggestion trails the cursor -> the input end is the cursor.
+                ((symbol-function 'evil-ghostel--input-end)
+                 (lambda () ghostel--cursor-char-pos)))
+        ;; Aim into the trailing "suggestion".
+        (evil-ghostel-goto-input-position (+ ghostel--cursor-char-pos 3)))
+      (should-not (cl-find "right" sent :key #'car :test #'equal))
+      (should-not (cl-find '("_" . "ctrl") sent :test #'equal))
+      (should-not (cl-find "backspace" sent :key #'car :test #'equal))
+      ;; Point clamped back to the cursor (start of the suggestion).
+      (should (= (point) ghostel--cursor-char-pos)))))
+
+(ert-deftest evil-ghostel-test-goto-rightward-within-input-sends-right ()
+  "Rightward motion within typed input still sends right arrows — the
+suggestion clamp does not over-restrict (issue #493)."
+  (evil-ghostel-test--with-cursor-fixture "$ " "hel" "lo"
+    (let ((sent '()))
+      (cl-letf (((symbol-function 'ghostel--send-encoded)
+                 (lambda (key mods &rest _) (push (cons key mods) sent)))
+                ((symbol-function 'evil-ghostel--sync-render) #'ignore)
+                ;; Real input end is two cells right of the cursor.
+                ((symbol-function 'evil-ghostel--input-end)
+                 (lambda () (+ ghostel--cursor-char-pos 2))))
+        (evil-ghostel-goto-input-position (+ ghostel--cursor-char-pos 2)))
+      (should (= 2 (cl-count "right" sent :key #'car :test #'equal)))
+      (should-not (cl-find '("_" . "ctrl") sent :test #'equal))
+      (should-not (cl-find "backspace" sent :key #'car :test #'equal)))))
+
 (ert-deftest evil-ghostel-test-sync-render-forces-deferred-redraw ()
   "`sync-render' force-runs `ghostel--redraw-now' after a bulk-output drain.
 The filter only takes the synchronous redraw path for small echoes
@@ -1099,6 +1320,24 @@ line)."
                  ((symbol-function 'ghostel--send-encoded) #'ignore))
          (evil-ghostel-paste-after 1))
        (should (equal "world" pasted))))))
+
+(ert-deftest evil-ghostel-test-paste-interactive-on-read-only ()
+  "Interactive p/P does not trip the read-only guard — paste goes via the PTY.
+Regression: `(interactive \"*P\")' barfed on the read-only ghostel buffer
+before the body ran, even though the live-terminal path writes nothing to it.
+`active-p' is stubbed so the test isolates the interactive spec, not the
+live-terminal detection."
+  (evil-ghostel-test--with-evil-buffer
+   (setq buffer-read-only t)
+   (let (pasted)
+     (cl-letf (((symbol-function 'evil-ghostel--active-p) (lambda () t))
+               ((symbol-function 'evil-ghostel--do-paste)
+                (lambda (&rest _) (setq pasted t))))
+       (call-interactively #'evil-ghostel-paste-after)
+       (should pasted)
+       (setq pasted nil)
+       (call-interactively #'evil-ghostel-paste-before)
+       (should pasted)))))
 
 ;; -----------------------------------------------------------------------
 ;; Test: insert-state Ctrl key passthrough

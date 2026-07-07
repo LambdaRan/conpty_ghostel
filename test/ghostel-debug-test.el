@@ -625,5 +625,44 @@ path: `ghostel--enable-vt-log' must route libghostty logs to
       (ghostel--disable-vt-log)
       (kill-buffer ghostel-debug--log-buffer))))
 
+(ert-deftest ghostel-test-debug-info-survives-key-probe ()
+  "The key-encoding probe must not wipe the report.
+`ghostel--new' is buffer-affine and erases the current buffer on init;
+a probe created with *ghostel-debug* current silently truncated the
+report to the tail of the key-encoding table."
+  :tags '(native)
+  (let ((display-buffer-overriding-action '(display-buffer-no-window))
+        (inhibit-message t)
+        (ghostel--terminfo-warned t))
+    (unwind-protect
+        (save-window-excursion
+          (with-temp-buffer
+            (ghostel-debug-info)
+            (with-current-buffer "*ghostel-debug*"
+              (let ((content (buffer-string)))
+                ;; Sections inserted before the probe survive it.
+                (should (string-match-p "--- System ---" content))
+                (should (string-match-p "--- Environment ---" content))
+                (should (string-match-p
+                         (regexp-quote "--- Key encoding (legacy mode) ---")
+                         content))
+                ;; Encoder-handled chords report actual bytes, not
+                ;; "(no output)" (the native encoder bypasses the elisp
+                ;; `ghostel--write-pty' the old capture hooked into).
+                (should (string-match-p "Backspace +→ 0x7f" content))
+                (should (string-match-p "C-h +→ 0x08" content))))))
+      (when (get-buffer "*ghostel-debug*")
+        (kill-buffer "*ghostel-debug*")))))
+
+(ert-deftest ghostel-test-encode-key-returns-bytes ()
+  "`ghostel--encode-key' returns the encoded bytes as a unibyte string.
+nil means the encoder produced nothing (plain Meta+letter without utf8
+defers to the elisp raw fallback)."
+  :tags '(native)
+  (with-temp-buffer
+    (let ((probe (ghostel--new 25 80 100)))
+      (should (equal (ghostel--encode-key probe "backspace" "" nil) "\x7f"))
+      (should-not (ghostel--encode-key probe "f" "meta" nil)))))
+
 (provide 'ghostel-debug-test)
 ;;; ghostel-debug-test.el ends here

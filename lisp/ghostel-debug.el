@@ -1109,40 +1109,49 @@ omit it when the connection itself is the suspected fault."
          ((not (fboundp 'ghostel--encode-key))
           (insert "(native module not loaded — cannot probe encoder)\n"))
          (t
-          (let ((probe (ignore-errors (ghostel--new 25 80 100)))
-                (sent nil))
-            (cond
-             ((null probe)
-              (insert "(could not create probe terminal)\n"))
-             (t
-              (cl-letf (((symbol-function 'ghostel--write-pty)
-                         (lambda (_term s) (setq sent s))))
-                (dolist (chord '(("backspace" ""          "Backspace")
-                                 ("backspace" "ctrl"      "C-Backspace")
-                                 ("backspace" "meta"      "M-Backspace")
-                                 ("f"         "meta"      "M-f")
-                                 ("b"         "meta"      "M-b")
-                                 ("."         "meta"      "M-.")
-                                 ("f"         "ctrl,meta" "C-M-f")
-                                 ("v"         "ctrl,meta" "C-M-v")
-                                 ("h"         "ctrl"      "C-h")))
-                  (setq sent nil)
-                  ;; Mirror `ghostel--send-encoded': try encoder, fall back
-                  ;; to the raw-key-sequence path on nil.  Encoder skips
-                  ;; plain Meta+letter when no utf8 is supplied (live
-                  ;; keystrokes don't supply it either) — the fallback
-                  ;; produces ESC + char.
-                  (unless (ghostel--encode-key probe (nth 0 chord)
-                                               (nth 1 chord) nil)
-                    (setq sent (ghostel--raw-key-sequence (nth 0 chord)
-                                                          (nth 1 chord))))
-                  (insert (format "  %-13s → %s\n"
-                                  (nth 2 chord)
+          ;; `ghostel--new' is buffer-affine: it initializes renderer state
+          ;; in the current buffer, erasing it.  Keep the probe terminal and
+          ;; all operations on it in a temp buffer so it can't wipe the
+          ;; report; only the formatted rows travel back.
+          (let ((rows
+                 (with-temp-buffer
+                   (when-let* ((probe (ignore-errors (ghostel--new 25 80 100))))
+                     (mapcar
+                      (lambda (chord)
+                        (pcase-let* ((`(,key ,mods ,label) chord)
+                                     ;; Mirror `ghostel--send-encoded': try
+                                     ;; encoder, fall back to the
+                                     ;; raw-key-sequence path on nil.  Encoder
+                                     ;; skips plain Meta+letter when no utf8
+                                     ;; is supplied (live keystrokes don't
+                                     ;; supply it either) — the fallback
+                                     ;; produces ESC + char.
+                                     (sent (or (ghostel--encode-key probe key mods nil)
+                                               (ghostel--raw-key-sequence key mods))))
+                          (format "  %-13s → %s\n"
+                                  label
                                   (cond ((null sent) "(no output)")
+                                        ;; Pre-0.41 modules return t, not the bytes.
+                                        ((not (stringp sent))
+                                         "(sent — module too old to report bytes)")
                                         ((string-empty-p sent) "(empty)")
                                         (t (mapconcat
                                             (lambda (b) (format "0x%02x" b))
-                                            (string-to-list sent) " ")))))))
+                                            (string-to-list sent) " "))))))
+                      '(("backspace" ""          "Backspace")
+                        ("backspace" "ctrl"      "C-Backspace")
+                        ("backspace" "meta"      "M-Backspace")
+                        ("f"         "meta"      "M-f")
+                        ("b"         "meta"      "M-b")
+                        ("."         "meta"      "M-.")
+                        ("f"         "ctrl,meta" "C-M-f")
+                        ("v"         "ctrl,meta" "C-M-v")
+                        ("h"         "ctrl"      "C-h")))))))
+            (cond
+             ((null rows)
+              (insert "(could not create probe terminal)\n"))
+             (t
+              (dolist (row rows) (insert row))
               (insert "\nReadline `.inputrc' rules expecting these byte streams:\n")
               (insert "  \"\\C-?\"     → 0x7f          (Backspace)\n")
               (insert "  \"\\C-\\b\"    → 0x08          (C-Backspace, also C-h in legacy)\n")
@@ -1786,7 +1795,7 @@ Bounded by `:send-cap'; sets `:send-truncated' once exceeded."
   "In-progress `ghostel-debug-keypress' capture, or nil.
 A plist with at least :buffer (the target ghostel buffer) and :calls
 \(an alist of (KIND . BYTES) reverse-collected during the captured
-command, where KIND is `:write-pty' or `:send-string').")
+command, where KIND is `:encode-key', `:write-pty', or `:send-string').")
 
 ;;;###autoload
 (defun ghostel-debug-keypress ()
@@ -1806,6 +1815,8 @@ during the command, terminal mode flags, and process state."
               #'ghostel--debug-kp-record-write-pty)
   (advice-add 'ghostel--send-string :before
               #'ghostel--debug-kp-record-send-string)
+  (advice-add 'ghostel--encode-key :filter-return
+              #'ghostel--debug-kp-record-encode-key)
   (add-hook 'pre-command-hook #'ghostel--debug-kp-pre-command)
   (message "ghostel-debug-keypress: armed — press a key in this buffer"))
 
@@ -1828,6 +1839,16 @@ during the command, terminal mode flags, and process state."
   (when (eq (current-buffer)
             (plist-get ghostel--debug-kp-state :buffer))
     (ghostel--debug-kp-add-call :send-string string)))
+
+(defun ghostel--debug-kp-record-encode-key (bytes)
+  "Record BYTES returned by `ghostel--encode-key'.
+`:filter-return' advice — the native encoder writes the PTY directly, so
+the bytes never pass through `ghostel--write-pty'."
+  (when (and (stringp bytes)
+             (eq (current-buffer)
+                 (plist-get ghostel--debug-kp-state :buffer)))
+    (ghostel--debug-kp-add-call :encode-key bytes))
+  bytes)
 
 (defun ghostel--debug-kp-pre-command ()
   "Capture event details just before the user's command runs."
@@ -1860,6 +1881,7 @@ during the command, terminal mode flags, and process state."
   "Remove all advice and hooks installed by `ghostel-debug-keypress'."
   (advice-remove 'ghostel--write-pty #'ghostel--debug-kp-record-write-pty)
   (advice-remove 'ghostel--send-string #'ghostel--debug-kp-record-send-string)
+  (advice-remove 'ghostel--encode-key #'ghostel--debug-kp-record-encode-key)
   (remove-hook 'pre-command-hook #'ghostel--debug-kp-pre-command)
   (remove-hook 'post-command-hook #'ghostel--debug-kp-post-command)
   (setq ghostel--debug-kp-state nil))
@@ -1901,7 +1923,8 @@ during the command, terminal mode flags, and process state."
         ;; Sends
         (insert "\n--- Sends during this command ---\n")
         (if (null calls)
-            (insert "(no calls to ghostel--send-string or ghostel--write-pty)\n")
+            (insert "(no bytes sent — no calls to ghostel--encode-key,\n"
+                    " ghostel--send-string, or ghostel--write-pty)\n")
           (cl-loop for (kind . data) in calls
                    for i from 1
                    do (insert (format "%d. %s: %s\n"

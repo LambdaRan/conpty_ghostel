@@ -139,6 +139,40 @@ It waits for the activation hook to deliver a genuine translator."
         (should (equal sent
                        (list (encode-coding-string text 'utf-8))))))))
 
+(ert-deftest ghostel-test-ime-wrap-composes-in-read-only-buffer ()
+  "IMEs that gate composition on `buffer-read-only' still compose and forward.
+`hangul2-input-method' (and the 3-Bulsik variants) open with
+  (if (or buffer-read-only ...) (list key) ...)
+and return the key untranslated whenever the buffer is read-only.  A bare
+`inhibit-read-only' bind lifts the modification barrier but leaves that
+variable set, so the IME never composes and the raw keystroke is forwarded
+instead of the syllable.  The wrapper must present a writable buffer."
+  (ghostel-test--with-compile-buffer buf
+    ;; Precondition: ghostel buffers are protected (read-only) by default.
+    (should buffer-read-only)
+    (let ((inhibit-read-only t))
+      (erase-buffer))
+    (let (sent gate-saw-writable)
+      ;; Fake IME mirroring hangul's read-only gate exactly.
+      (setq-local ghostel-ime--original-input-method-function
+                  (lambda (key)
+                    (if buffer-read-only
+                        (list key)
+                      (setq gate-saw-writable t)
+                      (insert "가")
+                      nil)))
+      (cl-letf (((symbol-function 'ghostel--terminal-input-mode-p)
+                 (lambda () t))
+                ((symbol-function 'ghostel--send-string)
+                 (lambda (string) (push string sent))))
+        (should (null (ghostel-ime--wrap-input-method ?r))))
+      ;; The IME saw a writable buffer, so it composed instead of passing through.
+      (should gate-saw-writable)
+      ;; Transient insertion removed locally; only the PTY sees the commit.
+      (should (equal (buffer-string) ""))
+      (should (equal sent
+                     (list (encode-coding-string "가" 'utf-8)))))))
+
 (ert-deftest ghostel-test-ime-wrap-discards-cjk-commits-in-protected-non-input-modes ()
   "Buffer-inserted IME commits in protected non-input modes are removed."
   (ghostel-test--with-compile-buffer buf

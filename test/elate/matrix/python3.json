@@ -1,0 +1,105 @@
+{
+  "name": "evil-ghostel-python3",
+  "comment": "evil-ghostel operator/motion matrix: python3 REPL (regex-detected '>>> ', no OSC 133). Separate from shells.json because the REPL has no `echo` and operator tokens don't word-split cleanly, so word-heavy ops (cw/D/C/3r/visual) are omitted. Each group types an expression, applies an Evil edit over the PTY, evaluates it, and asserts the result. Run with `elate run --keep-going` so every group reports; the `u` group is expected to fail (xfail).",
+  "session": {
+    "ui": "tty",
+    "size": "120x40",
+    "config": "minimal",
+    "eval": [
+      "(load \"/Users/daniel/.emacs.d/lib/ghostel/test/elate/lib/evil-ghostel-setup.el\")",
+      "(setq ghostel-shell \"python3\")"
+    ]
+  },
+  "steps": [
+    {"eval": "(ghostel)"},
+    {"wait": "text", "pattern": ">>> ", "buffer": "*ghostel*", "timeout": 15.0},
+
+    {"group": "i", "comment": "baseline typing + RET"},
+    {"type": "1000+7"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^1007$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "A", "comment": "append at end of input"},
+    {"type": "1000"},
+    {"keys": "<escape> A"},
+    {"type": "+8"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^1008$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "I", "comment": "insert at start of input"},
+    {"type": "9"},
+    {"keys": "<escape> I"},
+    {"type": "1000+"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^1009$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "x", "comment": "$ then x -- delete last char"},
+    {"type": "10100"},
+    {"keys": "<escape> $ x"},
+    {"keys": "A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^1010$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "2dw", "comment": "delete two words (count)"},
+    {"type": "100 + 900 + 11"},
+    {"keys": "<escape> ^ w 2 d w"},
+    {"keys": "A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^111$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "dd", "comment": "delete whole input line, then retype"},
+    {"type": "123+456"},
+    {"keys": "<escape> d d"},
+    {"keys": "i"},
+    {"type": "500+55"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^555$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "cc", "comment": "change whole input line"},
+    {"type": "1+1"},
+    {"keys": "<escape> c c"},
+    {"type": "600+66"},
+    {"keys": "<escape> A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^666$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "r", "comment": "replace single char"},
+    {"type": "889"},
+    {"keys": "<escape> $ r 8"},
+    {"keys": "A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^888$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "a", "comment": "append after cursor"},
+    {"type": "12"},
+    {"keys": "<escape> $ a"},
+    {"type": "3"},
+    {"keys": "<escape> A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^123$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "X", "comment": "delete char before cursor"},
+    {"type": "1203"},
+    {"keys": "<escape> $ X"},
+    {"keys": "A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^123$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "s", "comment": "substitute char (delete + insert)"},
+    {"type": "1Z3"},
+    {"keys": "<escape> ^ l s"},
+    {"type": "2"},
+    {"keys": "<escape> A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^123$", "buffer": "*ghostel*", "timeout": 8.0},
+
+    {"group": "u", "comment": "x then u -- undo restores the deleted char"},
+    {"type": "9990"},
+    {"keys": "<escape> $ x"},
+    {"keys": "u"},
+    {"keys": "A"},
+    {"keys": "RET"},
+    {"wait": "text", "pattern": "^9990$", "buffer": "*ghostel*", "timeout": 8.0,
+     "expect": "fail", "reason": "python3 PyREPL does not bind C-_ (readline undo) that evil-ghostel-undo sends"}
+  ]
+}

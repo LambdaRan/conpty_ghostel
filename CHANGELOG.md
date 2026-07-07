@@ -4,6 +4,91 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.41.0] — 2026-07-03
+
+### Fixed
+- Ghostel buffers substituted into the Emacs daemon's invisible 80x24 initial
+  frame no longer clamp the terminal to that dummy window (79x22): such windows
+  are filtered out of the window-size hook and their PTYs opt out of core's
+  process-window-size adjustment.
+  Fixes [#504](https://github.com/dakra/ghostel/issues/504).
+- A local and a remote (TRAMP) `ghostel-project` sharing a name no longer
+  collide on the same `*NAME-ghostel*` buffer; remote roots fold their
+  `method:user@host` prefix into the buffer identity.
+  Fixes [#344](https://github.com/dakra/ghostel/issues/344).
+- `ghostel-prompt-regexp` now matches prompts padded with a no-break space
+  (U+00A0) — such as Claude Code's `>` prompt — so column-aware motions no
+  longer land on the padding.
+- Text scaling now preserves window anchoring, and global text-scale changes
+  (`global-text-scale-adjust`) resize and re-anchor the terminal like local
+  `text-scale-mode`.
+- Leaving copy mode now forces a terminal resize, so size changes made while in
+  copy mode take effect on return.
+- The native PTY now flushes pending terminal updates before the child process
+  exits, so the last output before exit is no longer lost.
+- `ghostel-debug-info` no longer truncates the report to the key-encoding
+  section: the probe terminal (`ghostel--new` is buffer-affine and erases the
+  current buffer since 0.40.0) is now created in a temp buffer instead of
+  `*ghostel-debug*`.
+- The key-encoding probe and `ghostel-debug-keypress` report encoder bytes
+  again: `ghostel--encode-key` now returns the encoded bytes (the native PTY
+  path no longer routes them through the elisp `ghostel--write-pty`).
+
+### Internal
+- The native `ghostel--encode-key` now returns the encoded bytes instead of a
+  boolean; the minimum required native module version is bumped to 0.41.0.
+- The native module build now respects the Zig install prefix (`zig build
+  --prefix .`).
+- Added Ghostel window lookup helpers and store the allocator on the renderer.
+- Added an elate scenario suite for evil-ghostel shell editing and an
+  agent-output anchor test script.
+
+## [0.40.0] — 2026-07-02
+
+### Added
+- Shell integration now supports **nushell** alongside bash, zsh, and fish.
+  Directory tracking (OSC 7), prompt navigation (OSC 133), and title tracking
+  (OSC 2) come from nushell's built-in `$env.config.shell_integration`; ghostel
+  adds `ghostel_cmd` and the outbound `ssh` terminfo-install wrapper. Works with
+  auto-injection (`ghostel-shell-integration`), manual `source`, and remote
+  TRAMP sessions (`ghostel-tramp-shell-integration`).
+- `ghostel-inhibit-anchor-functions` lets integrations veto per-window redraw
+  anchoring. `evil-ghostel` uses it so normal, visual, operator, and motion state
+  navigation can roam away from the live cursor while terminal output continues.
+
+### Changed
+- Removed the `ghostel-full-redraw` user option.
+
+### Fixed
+- Clearing scrollback no longer leaves stale pre-clear content visible in the
+  Emacs buffer in some cases.
+- Oversized single-width glyphs now borrow an adjacent cell only when they are
+  standalone, keeping adjacent icon runs such as `⏵⏵` aligned.
+- `evil-ghostel-goto-cursor` is now a linewise Evil motion, so `VG` extends the
+  selection to the terminal cursor instead of snapping back.
+  Fixes [#485](https://github.com/dakra/ghostel/issues/485).
+- Rightward cursor moves in `evil-ghostel` now clamp before trailing shell
+  autosuggestions, so motions such as `$` no longer accept zsh/fish suggestions
+  and then undo unrelated readline state.
+  Fixes [#493](https://github.com/dakra/ghostel/issues/493).
+- `p`/`P` in `evil-ghostel` now paste into read-only ghostel buffers; the live
+  terminal path writes through the PTY instead of editing the buffer.
+- `evil-ghostel` no longer yanks point back to the live cursor on insert-state
+  redraws while the window is scrolled into scrollback.
+- `ghostel-keymap-exceptions` now honors `C-g`: adding `"C-g"` to the list leaves
+  it unbound in ghostel so it falls through to your global binding (e.g.
+  `keyboard-quit`) instead of forwarding `BEL` to the terminal.
+  Fixes [#489](https://github.com/dakra/ghostel/issues/489).
+
+### Internal
+- Renderer invalidation now validates scrollback clears before evicting old
+  pages, and the renderer owns font-query cache lifetime during redraws.
+- Added a GUI xctrace benchmark runner and removed obsolete full-redraw bench
+  cases.
+- Updated the Ghostty dependency.
+- Expanded Hypothesis terminal-sequence coverage and stabilized native PTY,
+  compile, and CI setup tests.
+
 ## [0.39.0] — 2026-06-26
 
 ### Added

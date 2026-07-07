@@ -617,5 +617,48 @@ rows in the viewport — with or without the trailing newline."
         (should (equal "hello" sent-text))
         (should (> (window-start) (point-min))))))
 
+(ert-deftest ghostel-test-anchor-window-inhibit-functions-veto ()
+  "`ghostel-inhibit-anchor-functions' vetoes anchoring per window.
+A non-nil-returning hook (honoring FORCE) leaves both point and the viewport
+put in semi-char mode, where the anchor would otherwise snap point to the live
+cursor and scroll to the bottom.  FORCE bypasses the veto."
+  (let ((buf (generate-new-buffer " *ghostel-test-anchor-inhibit*"))
+        (previous-buffer (window-buffer (selected-window))))
+    (unwind-protect
+        (progn
+          (set-window-buffer (selected-window) buf)
+          (with-current-buffer buf
+            (ghostel-mode)
+            (setq ghostel--term 'fake)
+            ;; Scrollback above the prompt so a bottom-anchor is observable.
+            (let ((rows (max 1 (window-body-height))))
+              (ghostel-test--with-rendered-output
+                (dotimes (i (+ rows 20))
+                  (insert (format "row-%02d\n" i)))))
+            ;; Prompt on the cursor's row; terminal cursor right after it.
+            (ghostel-test--insert-rendered "$ ")
+            (setq ghostel--cursor-char-pos (point))
+            (setq ghostel--cursor-pos (cons (current-column) 0))
+            (should (eq ghostel--input-mode 'semi-char))
+            (let* ((win (selected-window))
+                   ;; Park point up in the scrollback, off the live cursor.
+                   (parked (point-min))
+                   ;; Stub mirrors evil-ghostel: veto unless FORCE.
+                   (ghostel-inhibit-anchor-functions
+                    (list (lambda (_window force) (not force)))))
+              ;; Vetoed: neither point nor the viewport moves.
+              (goto-char parked)
+              (set-window-point win parked)
+              (set-window-start win (point-min) t)
+              (ghostel--anchor-window win)
+              (should (= (window-point win) parked))
+              (should (= (window-start win) (point-min)))
+              ;; FORCE bypasses the veto: point snaps, viewport scrolls.
+              (ghostel--anchor-window win t)
+              (should (= (window-point win) ghostel--cursor-char-pos))
+              (should (> (window-start win) (point-min))))))
+      (set-window-buffer (selected-window) previous-buffer)
+      (kill-buffer buf))))
+
 (provide 'ghostel-scroll-test)
 ;;; ghostel-scroll-test.el ends here
