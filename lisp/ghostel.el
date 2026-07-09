@@ -4,7 +4,7 @@
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
 ;; URL: https://github.com/dakra/ghostel
-;; Version: 0.41.0
+;; Version: 0.42.1
 ;; Keywords: terminals
 ;; Package-Requires: ((emacs "28.1") (compat "30.1.0.1"))
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -1666,13 +1666,17 @@ Detect that case via `this-command-keys-vector' and re-inject meta."
 
 ;;; Public input API
 
+(defun ghostel--ensure-ghostel-buffer ()
+  "Signal a `user-error' unless the current buffer is a ghostel buffer."
+  (unless (derived-mode-p 'ghostel-mode)
+    (user-error "Must be called from a ghostel buffer")))
+
 (defun ghostel-send-string (string)
   "Send STRING to the terminal process in the current ghostel buffer.
 Signals a `user-error' when called outside a ghostel buffer.  STRING
 is passed through unchanged, including any embedded control
 characters; callers are responsible for UTF-8 encoding if needed."
-  (unless (derived-mode-p 'ghostel-mode)
-    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--ensure-ghostel-buffer)
   (ghostel--on-user-input)
   (ghostel--send-string string))
 
@@ -1684,8 +1688,7 @@ nil for no modifiers.  The encoder respects the terminal's current
 mode (application cursor keys, Kitty keyboard protocol, etc.).
 
 Signals a `user-error' when called outside a ghostel buffer."
-  (unless (derived-mode-p 'ghostel-mode)
-    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--ensure-ghostel-buffer)
   (ghostel--on-user-input)
   (ghostel--send-encoded key-name (or mods "")))
 
@@ -1697,8 +1700,7 @@ Unlike `ghostel-send-string', this wraps STRING in bracketed paste
 markers (ESC [200~ / ESC [201~) when the terminal supports bracketed
 paste mode (mode 2004), so the shell treats the input as an atomic
 paste rather than character-by-character typed keystrokes."
-  (unless (derived-mode-p 'ghostel-mode)
-    (user-error "Must be called from a ghostel buffer"))
+  (ghostel--ensure-ghostel-buffer)
   (ghostel--on-user-input)
   (ghostel--paste-text string))
 
@@ -2085,7 +2087,8 @@ point to the live cursor and stays in semi-char (skipped when
      ((and active
            (= (event-click-count event) 1)
            (not ghostel--mouse-press-was-selected))
-      (goto-char (or ghostel--cursor-char-pos (point-max)))
+      (when ghostel--cursor-char-pos
+        (goto-char ghostel--cursor-char-pos))
       (deactivate-mark))
      ;; Multi-click, or a single click in an already-selected window: set
      ;; point/selection, then freeze (a focus click never reaches here).
@@ -2344,6 +2347,7 @@ Accepts an optional unused WINDOW argument so it can serve as a
 Most keys are sent to the terminal; keys in
 `ghostel-keymap-exceptions' pass through to Emacs."
   (interactive)
+  (ghostel--ensure-ghostel-buffer)
   (setq ghostel--line-mode-paused nil)
   (unless (eq ghostel--input-mode 'semi-char)
     (pcase ghostel--input-mode
@@ -2371,6 +2375,7 @@ Even keys listed in `ghostel-keymap-exceptions' (\\`C-c', \\`C-x',
 \\<ghostel-char-mode-map>The only way to exit is
 \\[ghostel-semi-char-mode]."
   (interactive)
+  (ghostel--ensure-ghostel-buffer)
   ;; Manual mode switch — see `ghostel-semi-char-mode' for why.
   (setq ghostel--line-mode-paused nil)
   (unless (eq ghostel--input-mode 'char)
@@ -2462,6 +2467,7 @@ in Emacs mode this exits back to the previous mode (mirroring
 command (`\\[ghostel-semi-char-mode]'), or \\`q'/\\`C-g'/any
 self-insert key when `ghostel-readonly-fast-exit' is non-nil."
   (interactive)
+  (ghostel--ensure-ghostel-buffer)
   (if (eq ghostel--input-mode 'emacs)
       (ghostel-readonly-exit)
     (ghostel--enter-readonly
@@ -2477,6 +2483,7 @@ across the full scrollback.  When `ghostel-readonly-fast-exit' is
 non-nil press \\`q' or \\[ghostel-readonly-exit] to exit; exiting
 returns to whichever input mode was active before."
   (interactive)
+  (ghostel--ensure-ghostel-buffer)
   (if (eq ghostel--input-mode 'copy)
       (ghostel-readonly-exit)
     (ghostel--enter-readonly 'copy t ":Copy"
@@ -4839,9 +4846,8 @@ opportunistic output redraws that may safely wait for the frame to end."
                    (inhibit-read-only t)
                    (inhibit-redisplay t)
                    (inhibit-modification-hooks t)
-                   ;; Raise GC threshold to defer GC during redraw.
-                   (gc-cons-threshold (min most-positive-fixnum
-                                           (* gc-cons-threshold 3))))
+                   ;; Disable GC during redraw.
+                   (gc-cons-threshold most-positive-fixnum))
               (with-selected-window render-win
                 ;; Line mode snapshots editable input out of the buffer;
                 ;; redraw fully so the prompt row is always rebuilt
@@ -4932,35 +4938,39 @@ If WINDOW was anchored to the live viewport before the size change,
 keep it anchored.  Redraw synchronously when the terminal size
 actually changes.  When FORCE is non-nil, run the resize/redraw
 path even when the row/column count is unchanged."
-  (when (and ghostel--term ghostel--process (ghostel--terminal-live-p))
-    (when (ghostel--window-anchored-p
-           window (window-old-body-pixel-height window))
-      (ghostel--anchor-window window))
-    (when-let* ((adjust-fn (or (default-value 'window-adjust-process-window-size-function)
-                               #'window-adjust-process-window-size-smallest))
-                (windows (ghostel--windows (current-buffer) t))
-                (size (funcall adjust-fn ghostel--process windows))
-                (width (car size))
-                (height (cdr size)))
-      (let* ((same-size-p (and (eql height ghostel--term-rows)
-                               (eql width ghostel--term-cols)))
-             ;; Don't resize on minibuffer-induced rows-only change.
-             ;; E.g. fish clears and re-emits its prompt on every SIGWINCH; a
-             ;; `consult-buffer'/`M-x' cycle that grows then shrinks the body
-             ;; would otherwise produce two prompt repaints in quick succession.
-             ;; Skip the deferral on the alt screen TUIs.
-             (minibuffer-excepted-p (and (active-minibuffer-window)
-                                         (eql width ghostel--term-cols)
-                                         (not (ghostel--alt-screen-p ghostel--term)))))
-        (when (or force (and (not same-size-p) (not minibuffer-excepted-p)))
-          (ghostel--set-size-with-cell-dims ghostel--term (max 1 height) (max 1 width))
-          (when (and (eq system-type 'windows-nt)
-                     (process-live-p ghostel--process))
-            (ghostel--conpty-proxy-resize ghostel--process width height))
-          (setq ghostel--force-next-redraw t)
-          ;; Redraw synchronously so the buffer is updated before
-          ;; Emacs displays the stale content at the new window size.
-          (ghostel--redraw-now (current-buffer)))))))
+  ;; Buffer-local `window-size-change-functions' are run by redisplay
+  ;; with an arbitrary buffer current, so the terminal state must be
+  ;; resolved from WINDOW's buffer.
+  (with-current-buffer (window-buffer window)
+    (when (and ghostel--term ghostel--process (ghostel--terminal-live-p))
+      (when (ghostel--window-anchored-p
+             window (window-old-body-pixel-height window))
+        (ghostel--anchor-window window))
+      (when-let* ((adjust-fn (or (default-value 'window-adjust-process-window-size-function)
+                                 #'window-adjust-process-window-size-smallest))
+                  (windows (ghostel--windows (current-buffer) t))
+                  (size (funcall adjust-fn ghostel--process windows))
+                  (width (car size))
+                  (height (cdr size)))
+        (let* ((same-size-p (and (eql height ghostel--term-rows)
+                                 (eql width ghostel--term-cols)))
+               ;; Don't resize on minibuffer-induced rows-only change.
+               ;; E.g. fish clears and re-emits its prompt on every SIGWINCH; a
+               ;; `consult-buffer'/`M-x' cycle that grows then shrinks the body
+               ;; would otherwise produce two prompt repaints in quick succession.
+               ;; Skip the deferral on the alt screen TUIs.
+               (minibuffer-excepted-p (and (active-minibuffer-window)
+                                           (eql width ghostel--term-cols)
+                                           (not (ghostel--alt-screen-p ghostel--term)))))
+          (when (or force (and (not same-size-p) (not minibuffer-excepted-p)))
+            (ghostel--set-size-with-cell-dims ghostel--term (max 1 height) (max 1 width))
+            (when (and (eq system-type 'windows-nt)
+                       (process-live-p ghostel--process))
+              (ghostel--conpty-proxy-resize ghostel--process width height))
+            (setq ghostel--force-next-redraw t)
+            ;; Redraw synchronously so the buffer is updated before
+            ;; Emacs displays the stale content at the new window size.
+            (ghostel--redraw-now (current-buffer))))))))
 
 (defun ghostel--around-font-scale (fn args &optional buffer)
   "Resize and re-anchor Ghostel windows around font scaling by FN with ARGS.

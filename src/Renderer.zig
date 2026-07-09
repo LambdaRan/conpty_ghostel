@@ -1,8 +1,3 @@
-/// RenderState-based terminal rendering to Emacs buffers.
-///
-/// Reads rows/cells from the ghostty render state, extracts text and
-/// style attributes, and inserts propertized text into the current
-/// Emacs buffer.  See `redraw' below for the per-redraw algorithm.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -33,14 +28,14 @@ alloc: Allocator,
 /// Terminal being rendered.
 term: *gt.Terminal,
 
-/// Render state for incremental screen updates.
-render_state: gt.RenderState,
-
 /// Tracked pin of which row to render down from.
-render_pin: ?*gt.Pin,
+active_pin: *gt.Pin,
 
-/// The screen that is currently rendered into the buffer.
-rendered_screen: *gt.Screen,
+/// Identity of the screen currently rendered into the buffer.
+rendered_screen: ScreenId,
+
+/// Pin of the last rendered cursor position
+rendered_cursor: ?gt.Pin,
 
 /// Number of libghostty rows already materialized into the Emacs buffer.
 rows_in_buffer: usize = 0,
@@ -51,8 +46,8 @@ pages_in_buffer: std.DoublyLinkedList = .{},
 /// Any pending resize as `.{cols, rows}`. Resizes are committed on next redraw.
 pending_resize: ?ViewportSize = null,
 
-/// Reusable instance of RowContent to reduce allocations
-row: RowContent,
+/// Accumulates adjacent dirty rows before inserting them into Emacs.
+span: SpanContent,
 
 /// Cached font metrics and rendering parameters that affect glyph layout.
 /// When any field changes between redraws the viewport is fully invalidated.
@@ -67,11 +62,15 @@ saved_markers: SavedBufferMarkers = .{},
 
 const PageSerial = @FieldType(gt.PageList.List.Node, "serial");
 
+const ScreenId = struct {
+    key: gt.ScreenSet.Key,
+    generation: usize,
+};
+
 const MaterializedPage = struct {
     node: std.DoublyLinkedList.Node = .{},
     serial: PageSerial,
-    char_len: usize = 0,
-    rows: usize = 0,
+    len: usize = 0,
 
     pub fn next(self: *@This()) ?*@This() {
         return if (self.node.next) |n|
@@ -97,37 +96,49 @@ const FontInfo = struct {
 pub fn init(alloc: Allocator, env: emacs.Env, term: *gt.Terminal) !Self {
     const s = emacs.sym;
 
-    _ = env.f("make-local-variable", .{s.@"ghostel--query-font-cache"});
-    _ = env.set("ghostel--query-font-cache", env.f("make-hash-table", .{
+    env.defvarLocal("ghostel--query-font-cache", env.f("make-hash-table", .{
         s.@":test",
         s.eq,
     }));
-
-    _ = env.f("make-local-variable", .{s.@"ghostel--rendered-font"});
-    _ = env.set("ghostel--rendered-font", env.nil());
+    env.defvarLocal("ghostel--rendered-font", env.nil());
 
     var renderer = Self{
         .alloc = alloc,
         .term = term,
-        .render_state = gt.RenderState.empty,
-        .render_pin = try term.screens.active.pages.trackPin(
+        .active_pin = try term.screens.active.pages.trackPin(
             term.screens.active.pages.getTopLeft(.screen),
         ),
-        .rendered_screen = term.screens.active,
+        .rendered_screen = currentScreenId(term),
+        .rendered_cursor = null,
         .pending_resize = .{ .cols = term.cols, .rows = term.rows, .cell_w = 1, .cell_h = 1 },
-        .row = .{ .alloc = alloc },
+        .span = .{ .alloc = alloc },
     };
-    _ = try renderer.commitResize(env);
+    try renderer.commitResize(env);
     return renderer;
 }
 
 pub fn deinit(self: *Self) void {
     self.saved_markers.deinit(self.alloc);
-    self.render_state.deinit(self.alloc);
-    self.row.deinit();
+    self.span.deinit();
     self.clearPages();
-    if (self.render_pin) |p| self.rendered_screen.pages.untrackPin(p);
+    self.untrackActivePinIfLive();
     if (self.font_info) |*fi| fi.deinit(self.alloc);
+}
+
+fn currentScreenId(term: *gt.Terminal) ScreenId {
+    return .{
+        .key = term.screens.active_key,
+        .generation = term.screens.generation(term.screens.active_key),
+    };
+}
+
+fn untrackActivePinIfLive(self: *Self) void {
+    if (self.term.screens.generation(self.rendered_screen.key) != self.rendered_screen.generation) {
+        return;
+    }
+
+    const screen = self.term.screens.get(self.rendered_screen.key) orelse return;
+    screen.pages.untrackPin(self.active_pin);
 }
 
 pub fn resize(self: *Self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) !void {
@@ -148,43 +159,41 @@ pub fn redraw(self: *Self, env: emacs.Env, force_full: bool) !void {
     self.is_rendering = true;
     defer self.is_rendering = false;
 
+    const screen = self.term.screens.active;
     try self.saved_markers.save(self.alloc, env);
-    defer self.saved_markers.restoreAndClear(self.term.screens.active, env);
+    defer self.saved_markers.restoreAndClear(screen, env);
 
     self.gotoActiveStart(env);
 
     if (force_full) try self.clear(env);
     try self.updateFontInfo(env);
     try self.commitResize(env);
-    if (self.rendered_screen != self.term.screens.active) {
+    if (!std.meta.eql(self.rendered_screen, currentScreenId(self.term))) {
         try self.clear(env);
     }
-    try self.validateScrollback(env);
+    try self.invalidate(env);
     self.evictScrollback(env);
 
-    try self.renderToEnd(
+    try self.render(
         env,
-        if (self.render_pin) |p|
-            p.*
+        if (screen.no_scrollback)
+            screen.pages.getTopLeft(.active)
         else
-            self.rendered_screen.pages.getTopLeft(.active),
+            self.active_pin.*,
     );
 
     try self.renderCursor(env);
 
-    if (self.render_pin) |p| p.* = self.rendered_screen.pages.getTopLeft(.active);
-
-    // Verify integrity in debug mode
-    std.debug.assert(self.rows_in_buffer == if (self.rendered_screen.no_scrollback)
-        self.term.rows
+    self.active_pin.* = screen.pages.getTopLeft(.active);
+    self.rows_in_buffer = if (screen.no_scrollback)
+        screen.pages.rows
     else
-        self.rendered_screen.pages.total_rows);
+        screen.pages.total_rows;
 }
 
-fn validateScrollback(self: *Self, env: emacs.Env) !void {
+fn invalidate(self: *Self, env: emacs.Env) !void {
     const scrollback_cleared = self.rows_in_buffer > self.term.rows and
-        self.render_pin != null and
-        self.render_pin.?.eql(self.rendered_screen.pages.getTopLeft(.screen));
+        self.active_pin.eql(self.term.screens.active.pages.getTopLeft(.screen));
 
     if (scrollback_cleared) {
         try self.clear(env);
@@ -289,51 +298,22 @@ fn resolveHyperlink(page: *const gt.page.Page, local_id: gt.size.HyperlinkCountI
     };
 }
 
-/// Read the style for the current cell from the render state.
-fn createCellProps(
-    self: *Self,
-    page: *const gt.Page,
-    key: CellPropKey,
-    cell: *const gt.RenderState.Cell,
-) ?CellProps {
-    var props: CellProps = .{};
-
-    const style: gt.Style = if (cell.raw.hasStyling()) cell.style else .{};
-
-    props.fg = style_face.resolveForeground(
-        &style,
-        &self.term.colors.palette.current,
-        self.bold_config,
-    );
-    props.bg = style.bg(&cell.raw, &self.render_state.colors.palette);
-    props.bold = style.flags.bold;
-    props.italic = style.flags.italic;
-    props.faint = style.flags.faint;
-    props.underline = style.flags.underline;
-    props.strikethrough = style.flags.strikethrough;
-    props.overline = style.flags.overline;
-    props.inverse = style.flags.inverse;
-    props.underline_color = style.underlineColor(&self.render_state.colors.palette);
-    props.hyperlink = resolveHyperlink(page, key.hyperlink_id);
-    props.semantic_content = cell.raw.semantic_content;
-
-    return if (props.isPlain()) null else props;
-}
-
 /// Apply text properties to a region of the buffer.
 fn applyProps(
+    self: *Self,
     env: emacs.Env,
-    start: i64,
-    end: i64,
-    props: CellProps,
+    start: usize,
+    end: usize,
+    node: *const gt.PageList.List.Node,
+    prop_key: *const CellPropKey,
 ) !void {
     if (start >= end) return;
     const s = emacs.sym;
 
-    const start_val = env.makeInteger(start);
-    const end_val = env.makeInteger(end);
+    const start_val = env.makeValue(start);
+    const end_val = env.makeValue(end);
 
-    if (try style_face.buildFacePlist(env, props)) |face| {
+    if (try self.getFace(env, node, prop_key)) |face| {
         _ = env.f("put-text-property", .{
             start_val,
             end_val,
@@ -342,7 +322,8 @@ fn applyProps(
         });
     }
 
-    if (props.hyperlink) |link| {
+    const hyperlink = resolveHyperlink(&node.data, prop_key.hyperlink_id);
+    if (hyperlink) |link| {
         _ = env.f("put-text-property", .{
             start_val,
             end_val,
@@ -383,7 +364,7 @@ fn applyProps(
         });
     }
 
-    switch (props.semantic_content) {
+    switch (prop_key.semantic_content) {
         .prompt => _ = env.f("put-text-property", .{
             start_val,
             end_val,
@@ -400,41 +381,81 @@ fn applyProps(
     }
 }
 
+fn getFace(
+    self: *Self,
+    env: emacs.Env,
+    node: *const gt.PageList.List.Node,
+    key: *const CellPropKey,
+) !?emacs.Value {
+    return if (key.style_id != 0)
+        try style_face.buildFacePlist(
+            env,
+            node.data.styles.get(node.data.memory, key.style_id),
+            &self.term.colors.palette.current,
+            self.bold_config,
+        )
+    else if (key.bg_color != .none)
+        try style_face.buildFacePlist(
+            env,
+            &gt.Style{ .bg_color = key.bg_color },
+            &self.term.colors.palette.current,
+            self.bold_config,
+        )
+    else
+        null;
+}
+
 // TODO: Style ID type is not exported from ghostty-vt for some reason.
 //       We should file an issue.
 const StyleId = @FieldType(gt.page.Cell, "style_id");
 
-/// Unique identifier that is cheaper to read and compare relative to `CellProps`.
-/// We read this first and if it differs from the previous cell, we read the full
-/// `CellProps`.
-const CellPropKey = packed struct {
+/// Compact key for deciding where Emacs text-property runs begin and end.
+const CellPropKey = struct {
     style_id: StyleId,
     hyperlink_id: gt.size.HyperlinkCountInt,
     semantic_content: gt.page.Cell.SemanticContent,
+    bg_color: gt.Style.Color,
 
-    fn create(page: *const gt.Page, cell: *const gt.page.Cell) CellPropKey {
+    fn create(page: *const gt.Page, cell: *const gt.page.Cell) ?CellPropKey {
+        const hyperlink_id = if (cell.hyperlink) page.lookupHyperlink(cell) else null;
+        const bg_color: gt.Style.Color = switch (cell.content_tag) {
+            .bg_color_palette => .{ .palette = cell.content.color_palette },
+            .bg_color_rgb => .{ .rgb = .{
+                .r = cell.content.color_rgb.r,
+                .g = cell.content.color_rgb.g,
+                .b = cell.content.color_rgb.b,
+            } },
+            else => .none,
+        };
+
+        if (cell.style_id == 0 and
+            hyperlink_id == null and
+            cell.semantic_content == .output and
+            bg_color == .none)
+        {
+            return null;
+        }
+
         return .{
             .style_id = cell.style_id,
-            .hyperlink_id = if (cell.hyperlink)
-                page.lookupHyperlink(cell) orelse 0
-            else
-                0,
+            .hyperlink_id = hyperlink_id orelse 0,
             .semantic_content = cell.semantic_content,
+            .bg_color = bg_color,
         };
     }
 };
 
-pub const RowContent = struct {
+pub const SpanContent = struct {
     const Run = struct {
         start_char: usize,
         end_char: usize,
-        props: ?CellProps,
+        key: ?CellPropKey,
     };
 
     const CellInfo = struct {
-        col: i64,
-        char_start: i64,
-        char_end: i64,
+        col: usize,
+        char_start: usize,
+        char_end: usize,
         text_start: usize,
         text_end: usize,
         wide: bool,
@@ -461,10 +482,13 @@ pub const RowContent = struct {
 
     alloc: Allocator,
 
-    /// The UTF-8 text content of the row
+    /// UTF-8 text for the accumulated rows.
     text: std.ArrayList(u8) = .empty,
 
-    /// Cells that need their glyphs metrics adjusted after insetions
+    /// The positions of any line wraps
+    line_wraps: std.ArrayList(usize) = .empty,
+
+    /// Cells whose glyph metrics need display-property adjustment.
     adjust_cells: std.ArrayList(CellInfo) = .empty,
 
     /// The number of codepoints (as opposed to bytes) in the text. Emacs
@@ -478,66 +502,77 @@ pub const RowContent = struct {
     /// The character position of the cursor
     cursor_char_pos: ?usize = null,
 
-    pub fn build(
-        self: *RowContent,
-        renderer: *Self,
-        row: *const gt.RenderState.Row,
-        cursor_col: ?u16,
-        adjustment_threshold: u32,
-    ) !void {
-        try self.clear();
+    /// The node this span comes from
+    node: ?*const gt.PageList.List.Node = null,
 
+    pub fn addRow(
+        self: *SpanContent,
+        renderer: *Self,
+        row_pin: gt.Pin,
+        adjustment_threshold: u32,
+    ) !usize {
+        if (self.node) |n| std.debug.assert(n == row_pin.node);
+        self.node = row_pin.node;
+
+        const term = renderer.term;
+        const screen = term.screens.active;
+
+        const row_start = self.char_len;
         // Position at the end of the last non-blank cell; final row length
         // is trimmed back to this. Any run of blank cells past the end is
         // discarded along with their default-style trailing padding.
-        var trim_byte_len: usize = 0;
-        var trim_char_len: usize = 0;
+        var trim_byte_len: usize = self.text.items.len;
+        var trim_char_len: usize = self.char_len;
 
-        const page = &row.pin.node.data;
+        const cursor_col = if (isSameRow(row_pin, screen.cursor.page_pin.*))
+            screen.cursor.page_pin.x
+        else
+            null;
+
+        const page = &row_pin.node.data;
+        const row = row_pin.rowAndCell().row;
         var current_prop_key: ?CellPropKey = null;
-        var col: u16 = 0;
-        while (col < row.cells.len) : (col += 1) {
-            const cell = row.cells.get(col);
-            const raw_cell = page.getRowAndCell(col, row.pin.y).cell;
-
-            const has_cursor = col == cursor_col;
+        var first_cell = true;
+        for (page.getCells(row), 0..) |*cell, col| {
+            const has_cursor = @as(u16, @intCast(col)) == cursor_col;
             if (has_cursor) self.cursor_char_pos = self.char_len;
 
-            if (cell.raw.wide == .spacer_tail or cell.raw.wide == .spacer_head) continue;
+            if (cell.wide == .spacer_tail or cell.wide == .spacer_head) continue;
 
             // We use a "key" that holds a minimum set of values that are cheap to
             // compare to detect style run breaks.
-            const prop_key = CellPropKey.create(&row.pin.node.data, raw_cell);
-            if (prop_key != current_prop_key) {
+            const prop_key = CellPropKey.create(&row_pin.node.data, cell);
+            if (first_cell or !std.meta.eql(prop_key, current_prop_key)) {
                 try self.runs.append(self.alloc, .{
                     .start_char = self.char_len,
                     .end_char = self.char_len,
-                    .props = createCellProps(renderer, page, prop_key, &cell),
+                    .key = prop_key,
                 });
                 current_prop_key = prop_key;
+                first_cell = false;
             }
 
             const byte_start = self.text.items.len;
             const char_start = self.char_len;
 
-            const codepoint: u21 = if (raw_cell.hasText()) raw_cell.codepoint() else ' ';
+            const codepoint: u21 = if (cell.hasText()) cell.codepoint() else ' ';
             try self.appendCodepoints(&[1]u21{codepoint});
-            if (raw_cell.hasGrapheme()) {
-                try self.appendCodepoints(cell.grapheme);
+            if (cell.hasGrapheme()) {
+                try self.appendCodepoints(page.lookupGrapheme(cell).?);
             }
 
             // If this is a grapheme cluster, or if the char is not covered by
             // the default font, we register it as needing font glyph adjustment
             // to fit into the monospace grid.
-            if (raw_cell.hasGrapheme() or codepoint >= adjustment_threshold) {
+            if (cell.hasGrapheme() or codepoint >= adjustment_threshold) {
                 try self.adjust_cells.append(self.alloc, .{
                     .col = @intCast(col),
                     .char_start = @intCast(char_start),
                     .char_end = @intCast(self.char_len),
                     .text_start = byte_start,
                     .text_end = self.text.items.len,
-                    .wide = raw_cell.wide == .wide,
-                    .page_serial = row.pin.node.serial,
+                    .wide = cell.wide == .wide,
+                    .page_serial = row_pin.node.serial,
                     .style_id = if (current_prop_key) |key| key.style_id else 0,
                 });
             }
@@ -548,7 +583,7 @@ pub const RowContent = struct {
             // We trim cells that neither have content nor styling. A blank
             // cursor cell only requires enough whitespace to place point at
             // the cursor column, not an extra rendered space under it.
-            if (raw_cell.hasText() or last_run.props != null) {
+            if (cell.hasText() or last_run.key != null) {
                 trim_byte_len = self.text.items.len;
                 trim_char_len = self.char_len;
             } else if (has_cursor) {
@@ -561,28 +596,15 @@ pub const RowContent = struct {
         // are clipped when properties are applied.
         self.text.shrinkRetainingCapacity(trim_byte_len);
         self.char_len = trim_char_len;
-        if (self.runs.items.len > 0) {
-            self.runs.items[self.runs.items.len - 1].end_char = trim_char_len;
-        }
+        self.runs.items[self.runs.items.len - 1].end_char = trim_char_len;
 
-        try self.text.append(self.alloc, '\n');
+        if (row.wrap) try self.line_wraps.append(self.alloc, self.char_len);
+        try self.appendCodepoints(&[1]u21{'\n'});
+
+        return self.char_len - row_start;
     }
 
-    pub fn deinit(self: *RowContent) void {
-        self.text.deinit(self.alloc);
-        self.adjust_cells.deinit(self.alloc);
-        self.runs.deinit(self.alloc);
-    }
-
-    fn clear(self: *RowContent) !void {
-        self.text.clearRetainingCapacity();
-        self.adjust_cells.clearRetainingCapacity();
-        self.runs.clearRetainingCapacity();
-        self.char_len = 0;
-        self.cursor_char_pos = null;
-    }
-
-    fn appendCodepoints(self: *RowContent, cluster: []const u21) !void {
+    fn appendCodepoints(self: *SpanContent, cluster: []const u21) !void {
         for (cluster) |cp| {
             const slice = try self.text.addManyAsSlice(
                 self.alloc,
@@ -592,20 +614,37 @@ pub const RowContent = struct {
             self.char_len += 1;
         }
     }
+
+    pub fn clear(self: *SpanContent) !void {
+        self.text.clearRetainingCapacity();
+        self.line_wraps.clearRetainingCapacity();
+        self.adjust_cells.clearRetainingCapacity();
+        self.runs.clearRetainingCapacity();
+        self.char_len = 0;
+        self.cursor_char_pos = null;
+        self.node = null;
+    }
+
+    pub fn deinit(self: *SpanContent) void {
+        self.text.deinit(self.alloc);
+        self.line_wraps.deinit(self.alloc);
+        self.adjust_cells.deinit(self.alloc);
+        self.runs.deinit(self.alloc);
+    }
 };
 
 fn adjustGlyphs(
     self: *Self,
     env: emacs.Env,
-    row_start: i64,
+    span_start: usize,
 ) !void {
-    if (self.row.adjust_cells.items.len == 0) return;
+    if (self.span.adjust_cells.items.len == 0) return;
     if (self.font_info == null) return;
     const window = env.f("selected-window", .{});
     if (env.isNil(window)) return;
 
-    for (self.row.adjust_cells.items) |*cell| {
-        try self.adjustGlyph(env, window, row_start, cell);
+    for (self.span.adjust_cells.items) |*cell| {
+        try self.adjustGlyph(env, window, span_start, cell);
     }
 }
 
@@ -613,15 +652,15 @@ fn adjustGlyph(
     self: *Self,
     env: emacs.Env,
     window: emacs.Value,
-    row_start: i64,
-    cell: *const RowContent.CellInfo,
+    span_start: usize,
+    cell: *const SpanContent.CellInfo,
 ) !void {
     const s = emacs.sym;
     const default_font_info = self.font_info.?;
 
-    const start_val = env.makeInteger(row_start + @as(i64, @intCast(cell.char_start)));
-    const end_val = env.makeInteger(row_start + @as(i64, @intCast(cell.char_end)));
-    const metrics = try self.getGlyphMetrics(env, window, row_start, cell) orelse return;
+    const start_val = env.makeValue(span_start + cell.char_start);
+    const end_val = env.makeValue(span_start + cell.char_end);
+    const metrics = try self.getGlyphMetrics(env, window, span_start, cell) orelse return;
 
     // Skip adjustments if size already matches perfectly
     const native_char_width: i64 = if (cell.wide) 2 else 1;
@@ -630,7 +669,7 @@ fn adjustGlyph(
         metrics.ascent == default_font_info.ascent and
         metrics.descent == default_font_info.descent) return;
 
-    const char_width = self.adjustWidth(env, row_start, cell, metrics);
+    const char_width = self.adjustWidth(env, span_start, cell, metrics);
     const slot_width = default_font_info.width * char_width;
 
     // Height is clamped per side, not on the sum: the row realizes
@@ -669,8 +708,8 @@ fn adjustGlyph(
 fn adjustWidth(
     self: *Self,
     env: emacs.Env,
-    row_start: i64,
-    cell: *const RowContent.CellInfo,
+    span_start: usize,
+    cell: *const SpanContent.CellInfo,
     metrics: GlyphMetricsCache.Metrics,
 ) i64 {
     const s = emacs.sym;
@@ -700,16 +739,17 @@ fn adjustWidth(
 
     // We don't let glyphs claim space unless it truly stands alone with space
     // on both sides since otherwise it leads to visually inconsistent sizing.
-    const preceding = cell.precedingByte(self.row.text.items);
-    const following = cell.followingByte(self.row.text.items);
-    const empty_before = preceding == null or preceding.? == ' ';
-    const empty_after = following == null or following.? == ' ';
+    // A newline is a span-local row boundary, equivalent to no neighboring cell.
+    const preceding = cell.precedingByte(self.span.text.items);
+    const following = cell.followingByte(self.span.text.items);
+    const empty_before = preceding == null or preceding.? == ' ' or preceding.? == '\n';
+    const empty_after = following == null or following.? == ' ' or following.? == '\n';
     if (!empty_before or !empty_after) return 1;
 
     // We can claim the space after, but if it's a space, we must first hide it.
     if (following) |c| {
         if (c == ' ') {
-            const claim_pos = row_start + cell.char_end;
+            const claim_pos = span_start + cell.char_end;
             _ = env.f("put-text-property", .{
                 claim_pos,
                 claim_pos + 1,
@@ -726,15 +766,15 @@ fn getGlyphMetrics(
     self: *Self,
     env: emacs.Env,
     window: emacs.Value,
-    row_start: i64,
-    cell: *const RowContent.CellInfo,
+    span_start: usize,
+    cell: *const SpanContent.CellInfo,
 ) !?GlyphMetricsCache.Metrics {
-    const key = cell.metricsKey(self.row.text.items);
+    const key = cell.metricsKey(self.span.text.items);
     if (self.font_info) |*fi| {
         if (fi.metrics_cache.get(key)) |metrics| return metrics;
     }
 
-    const gstring = findGlyphString(env, window, row_start, cell) orelse {
+    const gstring = findGlyphString(env, window, span_start, cell) orelse {
         return null;
     };
     // gstring is:
@@ -777,11 +817,11 @@ fn getGlyphMetrics(
 fn findGlyphString(
     env: emacs.Env,
     window: emacs.Value,
-    row_start: i64,
-    cell: *const RowContent.CellInfo,
+    span_start: usize,
+    cell: *const SpanContent.CellInfo,
 ) ?emacs.Value {
-    const start_val = env.makeInteger(row_start + cell.char_start);
-    const end_val = env.makeInteger(row_start + cell.char_end);
+    const start_val = env.makeValue(span_start + cell.char_start);
+    const end_val = env.makeValue(span_start + cell.char_end);
     const composition = env.f("find-composition", .{ start_val, end_val, env.nil(), env.t() });
     if (env.isNotNil(composition)) {
         const gstring = env.f("nth", .{ 2, composition });
@@ -799,187 +839,166 @@ fn findGlyphString(
     return if (env.isNil(gstring)) null else gstring;
 }
 
-/// Insert row text and apply property runs.
-fn insertRow(
-    self: *Self,
-    env: emacs.Env,
-    row: *const gt.RenderState.Row,
-    cursor_col: ?u16,
-) !usize {
-    try self.row.build(
+fn addRowToSpan(self: *Self, row_pin: gt.Pin) !usize {
+    return try self.span.addRow(
         self,
-        row,
-        cursor_col,
+        row_pin,
         if (self.font_info) |f| f.coverage else std.math.maxInt(u32),
     );
+}
 
-    const row_start = env.cast(i64, env.f("point", .{}));
-    _ = env.f("insert", .{self.row.text.items});
-    const row_end = env.cast(i64, env.f("point", .{}));
+fn flushSpan(self: *Self, env: emacs.Env) !void {
+    if (self.span.text.items.len == 0) return;
 
-    for (self.row.runs.items) |*run| {
-        if (run.end_char <= run.start_char) continue;
+    const span_start = env.cast(usize, env.f("point", .{}));
+    _ = env.f("insert", .{self.span.text.items});
 
-        const prop_start = row_start + @as(i64, @intCast(run.start_char));
-        const prop_end = row_start + @as(i64, @intCast(run.end_char));
-        if (run.props) |props| {
-            try applyProps(env, prop_start, prop_end, props);
+    for (self.span.runs.items) |*run| {
+        if (run.key) |*key| {
+            const prop_start = span_start + @as(usize, @intCast(run.start_char));
+            const prop_end = span_start + @as(usize, @intCast(run.end_char));
+            try self.applyProps(env, prop_start, prop_end, self.span.node.?, key);
         }
     }
 
-    try self.adjustGlyphs(env, row_start);
+    try self.adjustGlyphs(env, span_start);
 
-    if (row.raw.wrap) {
+    for (self.span.line_wraps.items) |offset| {
         // Mark newlines from soft-wrapped rows so copy mode can filter them
-        const point = env.f("point", .{});
         _ = env.f("put-text-property", .{
-            env.cast(i64, point) - 1,
-            point,
+            span_start + offset,
+            span_start + offset + 1,
             emacs.sym.@"ghostel-wrap",
             env.t(),
         });
     }
 
-    if (self.row.cursor_char_pos) |pos| {
+    if (self.span.cursor_char_pos) |pos| {
         env.set(
             "ghostel--cursor-char-pos",
-            @as(usize, @intCast(row_start)) + pos,
+            @as(usize, @intCast(span_start)) + pos,
         );
     }
+}
 
-    return @intCast(row_end - row_start);
+fn isSameRow(a: gt.Pin, b: gt.Pin) bool {
+    return a.node == b.node and a.y == b.y;
+}
+
+fn isRowDirty(self: *Self, pin: gt.Pin) bool {
+    if (pin.rowAndCell().row.dirty) return true;
+
+    const cursor: ?gt.Pin = self.term.screens.active.cursor.page_pin.*;
+
+    // Cursor movement requires rebuilding both the previous and current cursor rows.
+    if (!std.meta.eql(cursor, self.rendered_cursor)) {
+        if (cursor) |c| if (isSameRow(c, pin)) return true;
+        if (self.rendered_cursor) |c| if (isSameRow(c, pin)) return true;
+    }
+
+    return false;
 }
 
 fn render(
     self: *Self,
     env: emacs.Env,
-    pin: gt.Pin,
+    start_pin: gt.Pin,
 ) !void {
-    self.term.screens.active.pages.scroll(.{ .pin = pin });
-    try self.updateRenderState();
+    const term = self.term;
 
-    if (self.render_state.dirty != .false) {
-        const skip = switch (pin.downOverflow(self.term.rows)) {
-            .overflow => |of| of.remaining - 1,
-            else => 0,
-        };
+    var page = if (term.screens.active.no_scrollback)
+        null
+    else
+        try self.getOrAddPage(start_pin.node.serial);
 
-        var page = if (self.term.screens.active.no_scrollback)
-            null
-        else
-            try self.getOrAddPage(pin.node.serial);
+    var eob = false;
+    var current_span: ?struct {
+        start_val: emacs.Value,
+        node: *const gt.PageList.List.Node,
+        adjusted_line_start: usize,
+    } = null;
 
-        var i: usize = 0;
-        const row_dirty = self.render_state.row_data.items(.dirty);
-        while (i < self.render_state.rows) : ({
-            // Clear per-row dirty flag
-            row_dirty[i] = false;
-            i += 1;
-        }) {
-            if (i < skip) continue;
+    var it = start_pin.rowIterator(.right_down, null);
+    while (it.next()) |row_pin| {
+        const row = row_pin.rowAndCell().row;
+        eob = eob or env.isNotNil(env.f("eobp", .{}));
 
-            const row = self.render_state.row_data.get(i);
-            if (page) |p| {
-                if (p.serial != row.pin.node.serial) {
-                    page = p.next() orelse try self.addPage(row.pin.node.serial);
-                    std.debug.assert(page != null);
-                    std.debug.assert(page.?.serial == row.pin.node.serial);
-                }
+        if (page) |p| {
+            if (p.serial != row_pin.node.serial) {
+                page = p.next() orelse try self.addPage(row_pin.node.serial);
+                std.debug.assert(page != null);
+                std.debug.assert(page.?.serial == row_pin.node.serial);
             }
+        }
 
-            const dirty_row = self.render_state.dirty == .full or row_dirty[i];
-            // Only process dirty rows, or there's no existing row
-            const eob = env.isNotNil(env.f("eobp", .{}));
-            if (dirty_row or eob) {
-                const cursor_col = blk: {
-                    if (self.render_state.cursor.viewport) |vp| {
-                        if (vp.y == i) break :blk vp.x;
-                    }
+        const clean = !eob and !self.isRowDirty(row_pin);
+        if (current_span) |*span| {
+            if (clean or span.node != row_pin.node) {
+                _ = env.f("delete-region", .{ span.start_val, env.f("point", .{}) });
+                try self.flushSpan(env);
+                current_span = null;
+            }
+        }
 
-                    break :blk null;
+        const line_start_val = env.f("point", .{});
+        if (!eob) _ = env.f("forward-line", .{1});
+        const old_line_end_val = env.f("point", .{});
+
+        if (!clean) {
+            if (current_span == null) {
+                current_span = .{
+                    .start_val = line_start_val,
+                    .node = row_pin.node,
+                    .adjusted_line_start = env.cast(usize, line_start_val),
                 };
+                try self.span.clear();
+            }
 
-                if (eob) {
-                    // We're adding one line since we're at the end of the buffer
-                    const line_char_len = try self.insertRow(env, &row, cursor_col);
-                    self.rows_in_buffer += 1;
-                    if (page) |p| {
-                        p.rows += 1;
-                        p.char_len += line_char_len;
-                    }
-                } else {
-                    // Line is dirty and we're not at the end of the buffer,
-                    // so we're replacing the line.
-                    const line_start_val = env.f("point", .{});
-                    const line_start = env.cast(usize, line_start_val);
-                    const old_line_end_val = env.f("pos-bol", .{2});
-                    const old_line_len = env.cast(usize, old_line_end_val) - line_start;
-                    _ = env.f("delete-region", .{ line_start_val, old_line_end_val });
-                    const new_line_len = try self.insertRow(env, &row, cursor_col);
+            const new_line_len = try self.addRowToSpan(row_pin);
+            const line_start = env.cast(usize, line_start_val);
+            const old_line_len = env.cast(usize, old_line_end_val) - line_start;
+            if (old_line_len > 0) {
+                self.saved_markers.adjustRegion(
+                    current_span.?.adjusted_line_start,
+                    old_line_len,
+                    new_line_len,
+                );
+                current_span.?.adjusted_line_start += new_line_len;
+            }
 
-                    if (page) |p| {
-                        p.char_len -|= old_line_len;
-                        p.char_len += new_line_len;
-                    }
-                    self.saved_markers.adjustRegion(line_start, old_line_len, new_line_len);
-                }
-            } else {
-                _ = env.f("forward-line", .{1});
+            if (page) |p| {
+                p.len -|= old_line_len;
+                p.len += new_line_len;
             }
         }
 
-        // Reset dirty state
-        self.render_state.dirty = .false;
+        row.dirty = false;
     }
-}
 
-fn updateRenderState(self: *Self) !void {
-    const pre_cursor: ?gt.RenderState.Cursor.Viewport =
-        self.render_state.cursor.viewport;
-
-    try self.render_state.update(self.alloc, self.term);
-    if (self.render_state.dirty == .full) return;
-
-    const post_cursor: ?gt.RenderState.Cursor.Viewport =
-        self.render_state.cursor.viewport;
-
-    if (!std.meta.eql(pre_cursor, post_cursor)) {
-        // The cursor moved. Both the old row and the new row are dirty.
-        if (self.render_state.dirty == .false) {
-            self.render_state.dirty = .partial;
-        }
-        const row_dirty = self.render_state.row_data.items(.dirty);
-        if (pre_cursor) |vp| row_dirty[vp.y] = true;
-        if (post_cursor) |vp| row_dirty[vp.y] = true;
+    if (current_span) |*span| {
+        _ = env.f("delete-region", .{ span.start_val, env.f("point", .{}) });
+        try self.flushSpan(env);
     }
 }
 
 fn renderCursor(self: *Self, env: emacs.Env) !void {
-    if (self.render_state.cursor.viewport) |vp| {
-        _ = env.set("ghostel--cursor-pos", env.cons(vp.x, vp.y));
-    } else {
-        _ = env.set("ghostel--cursor-pos", env.nil());
-    }
+    const screen = self.term.screens.active;
+    _ = env.set("ghostel--cursor-pos", env.cons(screen.cursor.x, screen.cursor.y));
+    self.rendered_cursor = screen.cursor.page_pin.*;
 
-    _ = env.set("ghostel--cursor-blinking", if (self.render_state.cursor.blinking) env.t() else env.nil());
-
-    if (self.render_state.cursor.visible) {
+    if (self.term.modes.get(.cursor_visible)) {
         env.set(
             "ghostel--cursor-style",
-            @intFromEnum(self.render_state.cursor.visual_style),
+            @intFromEnum(screen.cursor.cursor_style),
         );
     } else {
         env.set("ghostel--cursor-style", env.nil());
     }
-}
 
-// Render all pages from start_pin through the end of the active area,
-// one viewport-sized chunk per page.
-fn renderToEnd(self: *Self, env: emacs.Env, start_pin: gt.Pin) !void {
-    var p: ?gt.Pin = start_pin;
-    while (p) |pin| : (p = pin.down(self.term.rows)) {
-        try self.render(env, pin);
-    }
+    _ = env.set("ghostel--cursor-blinking", if (self.term.modes.get(.cursor_blinking))
+        env.t()
+    else
+        env.nil());
 }
 
 fn commitResize(self: *Self, env: emacs.Env) !void {
@@ -1035,17 +1054,14 @@ fn addPage(self: *Self, serial: PageSerial) !*MaterializedPage {
 fn clear(self: *Self, env: emacs.Env) !void {
     _ = env.f("erase-buffer", .{});
     self.rows_in_buffer = 0;
-    self.render_state.dirty = .full;
     self.clearPages();
-    if (self.render_pin) |p| self.rendered_screen.pages.untrackPin(p);
-    self.render_pin = null;
 
-    self.rendered_screen = self.term.screens.active;
-    if (!self.rendered_screen.no_scrollback) {
-        self.render_pin = try self.rendered_screen.pages.trackPin(
-            self.rendered_screen.pages.getTopLeft(.screen),
-        );
-    }
+    const screen = self.term.screens.active;
+    const active_pin = try screen.pages.trackPin(screen.pages.getTopLeft(.screen));
+
+    self.untrackActivePinIfLive();
+    self.active_pin = active_pin;
+    self.rendered_screen = currentScreenId(self.term);
 }
 
 fn clearPages(self: *Self) void {
@@ -1056,24 +1072,21 @@ fn clearPages(self: *Self) void {
 
 fn evictScrollback(self: *Self, env: emacs.Env) void {
     var evicted_chars: usize = 0;
-    var evicted_rows: usize = 0;
 
     // Only evict whole pages. libghostty can erase partial pages when clearing
     // the scrollback, but we handle that by detecting clearing specifically and
     // clearing the whole screen instead.
-    const term_first_page = self.rendered_screen.pages.pages.first.?;
+    const term_first_page = self.term.screens.active.pages.pages.first.?;
     while (self.pages_in_buffer.first) |n| {
         const first_page: *MaterializedPage = @fieldParentPtr("node", n);
         if (first_page.serial == term_first_page.serial) break;
 
-        evicted_chars += first_page.char_len;
-        evicted_rows += first_page.rows;
+        evicted_chars += first_page.len;
 
         _ = self.pages_in_buffer.popFirst();
         self.alloc.destroy(first_page);
     }
 
-    self.rows_in_buffer -|= evicted_rows;
     if (evicted_chars > 0) {
         _ = env.f("delete-region", .{ 1, 1 + evicted_chars });
         self.saved_markers.adjustRegion(1, evicted_chars, 0);

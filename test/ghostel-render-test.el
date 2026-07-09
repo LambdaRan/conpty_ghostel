@@ -261,6 +261,24 @@ with TERM and must write MARK_TARGET, POINT_TARGET, and START_TARGET."
      (should (= old-mark (ghostel-test--token-position "MARK_TARGET")))
      (should (= old-point (ghostel-test--token-position "POINT_TARGET"))))))
 
+(ert-deftest ghostel-test-position-preservation-batched-changed-length-lines ()
+  "Adjacent changed-length dirty rows preserve later positions when batched."
+  :tags '(native)
+  (ghostel-test--with-position-preservation-case
+   (buf term 12 120 2000 (lambda (term)
+                           (ghostel--write-vt term
+                                              "aaaaaaaaaaaaaaaaaaaa mutable-one\r\n")
+                           (ghostel--write-vt term
+                                              "bbbbbbbbbbbbbbbbbbbb mutable-two\r\n")
+                           (ghostel--write-vt term "START_TARGET start-row\r\n")
+                           (ghostel--write-vt term "mark row MARK_TARGET here\r\n")
+                           (ghostel--write-vt term "point row POINT_TARGET here\r\n")
+                           (dotimes (i 3)
+                             (ghostel--write-vt term
+                                                (format "tail-%02d\r\n" i)))))
+   (ghostel--write-vt term "\e[1;1H\e[2Kx\e[2;1H\e[2Ky")
+   (ghostel--redraw term)))
+
 (ert-deftest ghostel-test-position-preservation-on-shortened-line-clamps ()
   "Positions past a shortened dirty row clamp to that row's end."
   :tags '(native)
@@ -391,6 +409,23 @@ with TERM and must write MARK_TARGET, POINT_TARGET, and START_TARGET."
   (let ((term (ghostel--new 25 80 1000)))
     (ghostel--write-vt term "\e[1;31mHELLO\e[0m normal")
     (should (equal "HELLO normal" (ghostel-test--row0 term)))))
+
+(ert-deftest ghostel-test-property-runs-stop-at-row-boundaries ()
+  "Background-only property runs must not leak onto following rows."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-prop-row-boundary*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 3 20 100))
+                 (inhibit-read-only t))
+            (ghostel--write-vt term "\e[H\e[2J\e[44mselected\e[K\e[0m\r\nplain")
+            (ghostel--redraw term t)
+            (goto-char (point-min))
+            (should (plist-get (get-text-property (point) 'face) :background))
+            (forward-line 1)
+            (should (looking-at-p "plain"))
+            (should-not (get-text-property (point) 'face))))
+      (kill-buffer buf))))
 
 (ert-deftest ghostel-test-dim-text ()
   "Test that SGR 2 (faint) produces a dimmed foreground color, not :weight light."
@@ -967,6 +1002,51 @@ scrolling libghostty's viewport."
               (should (string-prefix-p "$ " content)))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-full-reset-clears-everything ()
+  "RIS (ESC c) resets the terminal entirely: screen, scrollback, cursor,\nSGR styles, and alt-screen state all return to initial.\nThe renderer rebuilds the buffer from libghostty's reset state, so no\npre-reset content (scrollback, styled cells, or alt-screen rows) may\nsurvive in the Emacs buffer."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-full-reset*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 1000))
+                 (inhibit-read-only t))
+            ;; Seed every kind of state a partial clear might leave behind:
+            ;; scrollback, SGR-styled cells, a moved cursor, and alt screen.
+            (dotimes (i 12)
+              (ghostel--write-vt term (format "row-%02d\r\n" i)))
+            (ghostel--write-vt term "\e[1;31mRED\e[0m")
+            (ghostel--redraw term t)
+            ;; Sanity-check the pre-reset state has all the things we reset.
+            (let ((before (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "row-00" before))   ; scrollback present
+              (should (string-match-p "RED" before)))     ; styled text present
+            ;; Enter alt screen and fill it so the reset must exit it.
+            (ghostel--write-vt term "\e[?1049h\e[H\e[2J")
+            (dotimes (i 5)
+              (ghostel--write-vt term (format "\e[%d;1HALT-%d" (1+ i) i)))
+            (ghostel--redraw term t)
+            (should (string-match-p
+                    "ALT-"
+                    (buffer-substring-no-properties (point-min) (point-max))))
+            ;; Full reset (RIS) — everything returns to initial state.
+            (ghostel--write-vt term "\ec")
+            (ghostel--redraw term t)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Scrollback rows are gone.
+              (should-not (string-match-p "row-" content))
+              ;; Alt-screen rows are gone.
+              (should-not (string-match-p "ALT-" content))
+              ;; Styled text is gone — every rendered cell is blank.
+              (should (string-blank-p content))
+              ;; No SGR face survives on the first cell.
+              (goto-char (point-min))
+              (should-not (get-text-property (point) 'face))
+              ;; Cursor returned home (col 0, row 0).
+              (should (equal '(0 . 0) ghostel--cursor-pos))
+              ;; Buffer collapsed to the viewport with no scrollback.
+              (should (= 5 (count-lines (point-min) (point-max)))))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-scrollback-csi3j-then-refill ()
   "CSI 3 J must not leave stale pre-clear rows in the buffer.
 
@@ -1173,8 +1253,8 @@ already in scrollback must remain untouched."
 
 (ert-deftest ghostel-test-partial-redraw-only-dirty-row-rebuilt ()
   "Modifying one active row rebuilds only that row; unchanged rows are preserved.
-The incremental dirty-row path calls `delete-region' + re-insert for dirty rows
-and `forward-line' for clean ones.  Only the dirty row loses the sentinel."
+Dirty rows are replaced and clean rows are skipped.  Only the dirty row loses
+the sentinel."
   :tags '(native)
   (let ((buf (generate-new-buffer " *ghostel-test-partial-dirty*")))
     (unwind-protect
@@ -1198,6 +1278,74 @@ and `forward-line' for clean ones.  Only the dirty row loses the sentinel."
             (should (ghostel-test--line-clean-p 1))
             (should (ghostel-test--line-clean-p 3))
             (should (ghostel-test--line-clean-p 4))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-cursor-only-redraw-updates-char-pos ()
+  "Cursor movement without cell changes updates the buffer cursor position."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-cursor-only-redraw*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 3 10 100))
+                 (inhibit-read-only t))
+            (ghostel--write-vt term "abc")
+            (ghostel--redraw term t)
+            (should (equal '(3 . 0) ghostel--cursor-pos))
+            (should (= (+ (point-min) 3) ghostel--cursor-char-pos))
+            ;; Move the cursor within the same row.  No cell content changes, but
+            ;; `ghostel--cursor-char-pos' must still follow the terminal cursor.
+            (ghostel--write-vt term "\e[1;2H")
+            (ghostel--redraw term)
+            (should (equal '(1 . 0) ghostel--cursor-pos))
+            (should (= (+ (point-min) 1) ghostel--cursor-char-pos))
+            (should (equal "abc\n\n\n"
+                           (buffer-substring-no-properties
+                            (point-min) (point-max))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-hidden-cursor-keeps-logical-position ()
+  "Hiding the terminal cursor keeps its logical buffer position."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-hidden-cursor*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((term (ghostel--new 3 10 100))
+                (inhibit-read-only t))
+            (ghostel--write-vt term "abc")
+            (ghostel--redraw term t)
+            (should (equal '(3 . 0) ghostel--cursor-pos))
+            (should (= (+ (point-min) 3) ghostel--cursor-char-pos))
+            (ghostel--write-vt term "\e[?25l")
+            (ghostel--redraw term)
+            (should (equal '(3 . 0) ghostel--cursor-pos))
+            (should (= (+ (point-min) 3) ghostel--cursor-char-pos))
+            (should-not ghostel--cursor-style)
+            (ghostel--write-vt term "\e[1;2H")
+            (ghostel--redraw term)
+            (should (equal '(1 . 0) ghostel--cursor-pos))
+            (should (= (+ (point-min) 1) ghostel--cursor-char-pos))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-alt-screen-partial-redraw-only-dirty-row-rebuilt ()
+  "Incremental alt-screen redraw rebuilds only changed rows."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-alt-partial-dirty*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 1000))
+                 (inhibit-read-only t))
+            (ghostel--write-vt term "\e[?1049h\e[H\e[2J")
+            (dotimes (i 5)
+              (ghostel--write-vt term (format "\e[%d;1Hrow-%d" (1+ i) i)))
+            (ghostel--write-vt term "\e[3;1H")
+            (ghostel--redraw term t)
+            (should (= 5 (count-lines (point-min) (point-max))))
+            (ghostel-test--mark-all-lines-clean)
+            (ghostel--write-vt term "modified")
+            (ghostel--redraw term)
+            (should-not (ghostel-test--line-clean-p 2))
+            (dolist (row '(0 1 3 4))
+              (should (ghostel-test--line-clean-p row)))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-incremental-redraw ()
@@ -2023,6 +2171,31 @@ through; fully default text carries no face at all."
             (goto-char (point-min))
             (let ((face (get-text-property (point) 'face)))
               (should (equal "#123456" (plist-get face :background))))))
+      (kill-buffer buf))))
+
+(ert-deftest ghostel-test-render-bg-only-empty-cells-split-runs ()
+  "Adjacent bg-only empty cells with different colors render separately."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-bg-only-runs*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 1 6 100))
+                 (inhibit-read-only t))
+            (ghostel--write-vt
+             term
+             (concat "\e[48;2;17;34;51m\e[2K"
+                     "\e[4G\e[48;2;68;85;102m\e[K"))
+            (ghostel--redraw term)
+            (goto-char (point-min))
+            (should (equal "      " (buffer-substring-no-properties
+                                     (line-beginning-position)
+                                     (line-end-position))))
+            (let ((first-face (get-text-property (point-min) 'face))
+                  (second-face (get-text-property (+ (point-min) 3) 'face)))
+              (should (equal "#112233" (plist-get first-face :background)))
+              (should (equal "#445566" (plist-get second-face :background)))
+              (should (= (+ (point-min) 3)
+                         (next-single-property-change (point-min) 'face))))))
       (kill-buffer buf))))
 
 (ert-deftest ghostel-test-render-inverse-omits-fg-bg ()

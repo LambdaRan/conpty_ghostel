@@ -67,6 +67,11 @@ This is intended for GUI profiling runs where the trace should include
 window redisplay/font/rendering work, not only terminal parsing and buffer
 mutation.")
 
+(defvar ghostel-bench-reuse-backend-terminal nil
+  "When non-nil, keep one terminal alive for backend/* case iterations.
+This is intended for profiler runs where repeated native PTY reader
+thread creation would obscure the terminal output path being profiled.")
+
 (defvar ghostel-bench-min-duration 0.5
   "Minimum target duration in seconds for very fast benchmark cases.
 When the warmup trial shows a case is too fast to time reliably,
@@ -84,6 +89,17 @@ this many seconds.  Explicit `ghostel-bench-iterations' remains a floor.")
   "Force redisplay when `ghostel-bench-force-gui-redisplay' is non-nil."
   (when ghostel-bench-force-gui-redisplay
     (redisplay t)))
+
+(defun ghostel-bench--redraw (term full-p)
+  "Redraw ghostel TERM for renderer benchmarks.
+Use the same local bindings as production `ghostel--redraw-now' around
+raw `ghostel--redraw' calls so synthetic renderer measurements do not
+include GC or hook overhead that production redraws suppress."
+  (let ((inhibit-read-only t)
+        (inhibit-redisplay t)
+        (inhibit-modification-hooks t)
+        (gc-cons-threshold most-positive-fixnum))
+    (ghostel--redraw term full-p)))
 
 ;; ---------------------------------------------------------------------------
 ;; Data generators
@@ -625,6 +641,7 @@ covers the full read -> libghostty -> buffer pipeline."
     (unwind-protect
         (with-current-buffer buf
           (ghostel-mode)
+          (setq-local ghostel-detect-password-prompts nil)
           (setq ghostel--term (ghostel--new rows cols
                                             (* ghostel-bench-scrollback 1024))
                 ghostel--term-rows rows
@@ -645,6 +662,76 @@ covers the full read -> libghostty -> buffer pipeline."
       (when (buffer-live-p buf)
         (when ghostel--term
           (ignore-errors (ghostel--kill-native-process ghostel--term)))
+        (kill-buffer buf)))))
+
+(defun ghostel-bench--backend-send-string (native-p string)
+  "Send STRING to the current backend PTY.
+NATIVE-P selects the native Zig PTY writer; nil uses the Emacs process."
+  (if native-p
+      (ghostel--write-pty ghostel--term string)
+    (process-send-string ghostel--process string)))
+
+(defun ghostel-bench--buffer-contains-p (string)
+  "Return non-nil when the current buffer contains STRING."
+  (save-excursion
+    (goto-char (point-min))
+    (search-forward string nil t)))
+
+(defun ghostel-bench--with-persistent-cat (data-file native-p body-fn)
+  "Run BODY-FN with a reusable `cat DATA-FILE' backend driver.
+BODY-FN is called with a thunk that streams DATA-FILE through one live
+terminal process and waits until the corresponding completion marker is
+rendered.  NATIVE-P selects the native Zig PTY or Emacs process backend."
+  (let* ((rows 24) (cols 80)
+         (buf (generate-new-buffer " *ghostel-backend-bench*"))
+         (marker-prefix (format "__ghostel_bench_done_%s_"
+                                (md5 (format "%s%s" data-file (float-time)))))
+         (driver (format (concat "stty -echo 2>/dev/null || true; "
+                                 "i=0; while IFS= read -r file; do "
+                                 "cat \"$file\"; i=$((i + 1)); "
+                                 "printf '\\r\\n%s%%06d\\r\\n' \"$i\"; done")
+                         marker-prefix))
+         (counter 0)
+         (ghostel-use-native-pty native-p)
+         (ghostel-kill-buffer-on-exit nil)
+         (ghostel-shell-integration nil)
+         (ghostel-macos-login-shell nil)
+         (ghostel-enable-url-detection nil)
+         (ghostel-enable-file-detection nil)
+         (ghostel-shell (list "/bin/sh" "-c" driver)))
+    (unwind-protect
+        (with-current-buffer buf
+          (ghostel-mode)
+          (setq-local ghostel-detect-password-prompts nil)
+          (setq ghostel--term (ghostel--new rows cols
+                                            (* ghostel-bench-scrollback 1024))
+                ghostel--term-rows rows
+                ghostel--term-cols cols)
+          (when (window-live-p (selected-window))
+            (set-window-buffer (selected-window) buf))
+          (ghostel--start-process)
+          (funcall
+           body-fn
+           (lambda ()
+             (cl-incf counter)
+             (let ((marker (format "%s%06d" marker-prefix counter))
+                   (deadline (+ (float-time) 120)))
+               (ghostel-bench--backend-send-string
+                native-p (concat (expand-file-name data-file) "\n"))
+               (while (and (< (float-time) deadline)
+                           (not (ghostel-bench--buffer-contains-p marker)))
+                 (accept-process-output ghostel--process 0.01)
+                 (when (buffer-live-p buf)
+                   (ghostel--redraw-now buf)))
+               (unless (ghostel-bench--buffer-contains-p marker)
+                 (error "Timed out waiting for backend benchmark marker: %s"
+                        marker))))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when ghostel--term
+            (ignore-errors (ghostel--kill-native-process ghostel--term)))
+          (when (and ghostel--process (process-live-p ghostel--process))
+            (delete-process ghostel--process)))
         (kill-buffer buf)))))
 
 (defun ghostel-bench--run-backend-scenarios ()
@@ -714,7 +801,7 @@ terminal engine with periodic redraws, all in a tight loop."
                  (setq offset end)
                  (cl-incf chunk-count)
                  (when (zerop (% chunk-count redraw-every))
-                   (ghostel--redraw term nil)))))))))
+                   (ghostel-bench--redraw term nil)))))))))
     ;; ghostel full
     (ghostel-bench--with-bench-buffer
       (let* ((data (ghostel-bench--encode-for-backend raw-data 'ghostel))
@@ -731,7 +818,7 @@ terminal engine with periodic redraws, all in a tight loop."
                  (setq offset end)
                  (cl-incf chunk-count)
                  (when (zerop (% chunk-count redraw-every))
-                   (ghostel--redraw term t)))))))))
+                   (ghostel-bench--redraw term t)))))))))
     ;; ghostel default, no detection
     (ghostel-bench--with-bench-buffer
       (let* ((data (ghostel-bench--encode-for-backend raw-data 'ghostel))
@@ -750,7 +837,7 @@ terminal engine with periodic redraws, all in a tight loop."
                  (setq offset end)
                  (cl-incf chunk-count)
                  (when (zerop (% chunk-count redraw-every))
-                   (ghostel--redraw term nil)))))))))
+                   (ghostel-bench--redraw term nil)))))))))
     ;; vterm
     (when ghostel-bench-include-vterm
       (ghostel-bench--with-bench-buffer
@@ -813,7 +900,7 @@ terminal engine with periodic redraws, all in a tight loop."
 Measures how fast each backend can update a full screen of styled
 content — relevant for apps like htop, vim, claude-code."
   (message "\n--- TUI Frame Rendering (full-screen rewrites) ---")
-  (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "fps")
+  (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "MB/s")
   (message "  %s" (make-string 90 ?-))
   (let ((tui-iterations (* ghostel-bench-iterations 20)))
     (dolist (size ghostel-bench-terminal-sizes)
@@ -832,7 +919,7 @@ content — relevant for apps like htop, vim, claude-code."
                     (string-bytes frame) tui-iterations
                     (lambda ()
                       (ghostel--write-vt term frame)
-                      (ghostel--redraw term nil)))))
+                      (ghostel-bench--redraw term nil)))))
               (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
         ;; ghostel full
         (ghostel-bench--with-bench-buffer
@@ -845,7 +932,7 @@ content — relevant for apps like htop, vim, claude-code."
                     (string-bytes frame) tui-iterations
                     (lambda ()
                       (ghostel--write-vt term frame)
-                      (ghostel--redraw term t)))))
+                      (ghostel-bench--redraw term t)))))
               (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
         ;; vterm
         (when ghostel-bench-include-vterm
@@ -902,7 +989,7 @@ re-render unconditionally.  Here the static screen is rendered once and
 only the bottom row is rewritten per iteration — the workload that
 status bars, prompt redraws, and most TUI updates actually produce."
   (message "\n--- TUI Partial Update (bottom-row update over static screen) ---")
-  (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "fps")
+  (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "MB/s")
   (message "  %s" (make-string 90 ?-))
   (let ((partial-iters (* ghostel-bench-iterations 1000)))
     (dolist (size ghostel-bench-terminal-sizes)
@@ -920,7 +1007,7 @@ status bars, prompt redraws, and most TUI updates actually produce."
                  (inhibit-read-only t)
                  (counter 0))
             (ghostel--write-vt term static)
-            (ghostel--redraw term t)
+            (ghostel-bench--redraw term t)
             (let ((result
                    (ghostel-bench--measure
                     (format "tui-partial/ghostel-incr/%s" label)
@@ -929,7 +1016,7 @@ status bars, prompt redraws, and most TUI updates actually produce."
                       (cl-incf counter)
                      (ghostel--write-vt
                        term (format status-template (format "status #%d" counter)))
-                      (ghostel--redraw term nil)))))
+                      (ghostel-bench--redraw term nil)))))
               (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
         ;; ghostel full
         (ghostel-bench--with-bench-buffer
@@ -940,7 +1027,7 @@ status bars, prompt redraws, and most TUI updates actually produce."
                  (inhibit-read-only t)
                  (counter 0))
             (ghostel--write-vt term static)
-            (ghostel--redraw term t)
+            (ghostel-bench--redraw term t)
             (let ((result
                    (ghostel-bench--measure
                     (format "tui-partial/ghostel-full/%s" label)
@@ -949,7 +1036,7 @@ status bars, prompt redraws, and most TUI updates actually produce."
                       (cl-incf counter)
                      (ghostel--write-vt
                        term (format status-template (format "status #%d" counter)))
-                      (ghostel--redraw term t)))))
+                      (ghostel-bench--redraw term t)))))
               (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
         ;; vterm
         (when ghostel-bench-include-vterm
@@ -1037,7 +1124,7 @@ When RENDER-P is non-nil, also call redraw after write-input."
                (setq counter (1+ counter))
                (ghostel--write-vt term (format "\e[H%d\r\n" counter))
                (ghostel--write-vt term data)
-               (ghostel--redraw term nil))
+               (ghostel-bench--redraw term nil))
            (lambda () (ghostel--write-vt term data))))))
     ;; ghostel full
     (when render-p
@@ -1053,7 +1140,7 @@ When RENDER-P is non-nil, also call redraw after write-input."
              (setq counter (1+ counter))
              (ghostel--write-vt term (format "\e[H%d\r\n" counter))
              (ghostel--write-vt term data)
-             (ghostel--redraw term t))))))
+             (ghostel-bench--redraw term t))))))
     ;; vterm
     (when ghostel-bench-include-vterm
       (ghostel-bench--with-bench-buffer
@@ -1180,8 +1267,14 @@ real-world performance (see the end-to-end and backend benchmarks)."
                  (plist-get r :per-iter-ms)
                  (plist-get r :throughput-mbs))))
     (when backend-results
-      (message "\n  Native vs Emacs PTY backend (cat %s, real spawn):"
-               (ghostel-bench--human-size ghostel-bench-data-size))
+      (message "\n  Native vs Emacs PTY backend (cat %s, %s):"
+               (ghostel-bench--human-size ghostel-bench-data-size)
+               (if (cl-some (lambda (r)
+                              (eq (plist-get r :backend-mode)
+                                  'persistent-terminal))
+                            backend-results)
+                   "one persistent terminal"
+                 "real spawn"))
       (dolist (r (sort (copy-sequence backend-results)
                        (lambda (a b) (string< (plist-get a :name)
                                               (plist-get b :name)))))
@@ -1336,10 +1429,23 @@ backend-include flags do not apply."
                    ((string= backend "emacs") nil)
                    (t (error "Unknown backend benchmark backend: %s" backend)))))
     (unwind-protect
-        (ghostel-bench--measure
-         (format "backend/%s/%s" shape backend)
-         ghostel-bench-data-size ghostel-bench-iterations
-         (lambda () (ghostel-bench--spawn-cat data-file native-p)))
+        (if ghostel-bench-reuse-backend-terminal
+            (progn
+              (message "  [reusing one backend terminal for all iterations]")
+              (let ((result
+                     (ghostel-bench--with-persistent-cat
+                      data-file native-p
+                      (lambda (run-cat)
+                        (ghostel-bench--measure
+                         (format "backend/%s/%s" shape backend)
+                         ghostel-bench-data-size ghostel-bench-iterations
+                         run-cat)))))
+                (plist-put result :backend-mode 'persistent-terminal)
+                result))
+          (ghostel-bench--measure
+           (format "backend/%s/%s" shape backend)
+           ghostel-bench-data-size ghostel-bench-iterations
+           (lambda () (ghostel-bench--spawn-cat data-file native-p))))
       (delete-file data-file))))
 
 (defun ghostel-bench--parse-size (size)
@@ -1359,7 +1465,7 @@ backend-include flags do not apply."
          (raw-frame (ghostel-bench--gen-tui-frame rows cols))
          (frame (ghostel-bench--encode-for-backend raw-frame 'ghostel)))
     (message "\n--- TUI Frame Rendering (single case) ---")
-    (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "fps")
+    (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "MB/s")
     (message "  %s" (make-string 90 ?-))
     (ghostel-bench--with-bench-buffer
      (let ((term (ghostel-bench--make-ghostel rows cols))
@@ -1372,7 +1478,7 @@ backend-include flags do not apply."
                (string-bytes frame) ghostel-bench-iterations
                (lambda ()
                  (ghostel--write-vt term frame)
-                 (ghostel--redraw term nil)))))
+                 (ghostel-bench--redraw term nil)))))
          (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))))
 
 (defun ghostel-bench--run-one-tui-partial (size)
@@ -1385,7 +1491,7 @@ backend-include flags do not apply."
          (static (ghostel-bench--encode-for-backend static-frame 'ghostel))
          (status-template (format "\e[%d;1H\e[1;33;41m%%-%ds\e[0m" rows cols)))
     (message "\n--- TUI Partial Update (single case) ---")
-    (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "fps")
+    (message "  %-50s %5s  %8s  %10s  %8s" "SCENARIO" "ITERS" "TOTAL(s)" "ITER(ms)" "MB/s")
     (message "  %s" (make-string 90 ?-))
     (ghostel-bench--with-bench-buffer
      (let ((term (ghostel-bench--make-ghostel rows cols))
@@ -1394,7 +1500,7 @@ backend-include flags do not apply."
            (inhibit-read-only t)
            (counter 0))
        (ghostel--write-vt term static)
-       (ghostel--redraw term nil)
+       (ghostel-bench--redraw term nil)
        (let ((result
               (ghostel-bench--measure
                (format "tui-partial/%s" size)
@@ -1403,7 +1509,7 @@ backend-include flags do not apply."
                  (cl-incf counter)
                  (ghostel--write-vt
                   term (format status-template (format "status #%d" counter)))
-                 (ghostel--redraw term nil)))))
+                 (ghostel-bench--redraw term nil)))))
          (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))))
 
 (defun ghostel-bench--run-one-typing (backend)

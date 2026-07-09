@@ -17,14 +17,13 @@ const gt = @import("ghostty-vt");
 
 const emacs = @import("emacs.zig");
 const style_face = @import("style_face.zig");
-const parseHexColor = @import("utils.zig").parseHexColor;
 
 const Self = @This();
 
 const log = std.log.scoped(.comint_filter);
 
-/// One styled run within the output buffer.  If it has a hyperlink,
-/// `props.hyperlink.uri` is owned and freed on run-list reset.
+/// One styled run within the output buffer.  Hyperlink URIs are owned
+/// by the run and freed on run-list reset.
 ///
 /// Positions are *character* offsets (codepoints), not byte offsets:
 /// Emacs string positions are character-indexed for multibyte strings,
@@ -33,7 +32,8 @@ const log = std.log.scoped(.comint_filter);
 const Run = struct {
     start: usize, // character offset in the output string
     end: usize,
-    props: style_face.CellProps,
+    style: gt.Style,
+    hyperlink: ?[]u8 = null,
 };
 
 const Handler = struct {
@@ -49,7 +49,7 @@ const Handler = struct {
     style: gt.Style = .{},
 
     /// Current OSC 8 hyperlink URI (owned).  Null when no link is active.
-    link_uri: ?[]u8 = null,
+    hyperlink: ?[]u8 = null,
 
     /// Output bytes accumulated during the current `feed` call.
     text: std.ArrayList(u8) = .empty,
@@ -64,10 +64,6 @@ const Handler = struct {
     /// Character offset where the pending run started.
     pending_start: usize = 0,
 
-    /// Props active for the pending run.  Hyperlink URI slices here borrow
-    /// from `link_uri`; only closed runs own their copied URI strings.
-    pending_props: style_face.CellProps = .{},
-
     /// Cached Emacs env, valid only during `feed`.  Used by `.report_pwd`.
     env: ?emacs.Env = null,
 
@@ -75,70 +71,31 @@ const Handler = struct {
         self.clearRuns();
         self.text.deinit(self.alloc);
         self.runs.deinit(self.alloc);
-        if (self.link_uri) |uri| self.alloc.free(uri);
-        self.link_uri = null;
+        if (self.hyperlink) |uri| self.alloc.free(uri);
+        self.hyperlink = null;
     }
 
     /// Free per-run URIs and reset the runs list.
     fn clearRuns(self: *Handler) void {
-        for (self.runs.items) |run| if (run.props.hyperlink) |link| self.alloc.free(link.uri);
+        for (self.runs.items) |run| if (run.hyperlink) |link| self.alloc.free(link);
         self.runs.clearRetainingCapacity();
-    }
-
-    /// Compute the CellProps for the current style + hyperlink.
-    fn currentProps(self: *const Handler) style_face.CellProps {
-        return .{
-            .fg = style_face.resolveForeground(
-                &self.style,
-                &self.palette,
-                self.bold_config,
-            ),
-            .bg = switch (self.style.bg_color) {
-                .none => null,
-                .palette => |idx| self.palette[idx],
-                .rgb => |rgb| rgb,
-            },
-            .bold = self.style.flags.bold,
-            .italic = self.style.flags.italic,
-            .faint = self.style.flags.faint,
-            .underline = self.style.flags.underline,
-            .strikethrough = self.style.flags.strikethrough,
-            .overline = self.style.flags.overline,
-            .inverse = self.style.flags.inverse,
-            .underline_color = self.style.underlineColor(&self.palette),
-            .hyperlink = if (self.link_uri) |uri| .{
-                .id = .{ .implicit = 0 },
-                .uri = uri,
-            } else null,
-            // semantic_content stays default — comint has no notion of prompts here
-        };
-    }
-
-    /// Close the pending run if non-empty, then start a new pending run
-    /// with `props` at the current end of the output.
-    fn switchProps(self: *Handler, props: style_face.CellProps) !void {
-        try self.closePending();
-        self.pending_props = props;
     }
 
     /// Push the pending run onto `runs` if it has content.
     ///
-    /// `pending_props.hyperlink.uri` borrows from the current OSC 8 state;
-    /// duplicate it for the stored run because the active hyperlink can end
-    /// before Emacs properties are applied.
+    /// Duplicate the active OSC 8 URI for stored runs because the active
+    /// hyperlink can end before Emacs properties are applied.
     fn closePending(self: *Handler) !void {
         const here = self.text_chars;
         if (here > self.pending_start) {
-            var run_props = self.pending_props;
-            if (run_props.hyperlink) |*link| {
-                link.uri = try self.alloc.dupe(u8, link.uri);
-            }
-            errdefer if (run_props.hyperlink) |link| self.alloc.free(link.uri);
-
             try self.runs.append(self.alloc, .{
                 .start = self.pending_start,
                 .end = here,
-                .props = run_props,
+                .style = self.style,
+                .hyperlink = if (self.hyperlink) |link|
+                    try self.alloc.dupe(u8, link)
+                else
+                    null,
             });
         }
         self.pending_start = here;
@@ -226,17 +183,16 @@ const Handler = struct {
         value: gt.StreamAction.Value(action),
     ) void {
         switch (action) {
-            .print => {
-                const new_props = self.currentProps();
-                if (!std.meta.eql(new_props, self.pending_props)) {
-                    self.switchProps(new_props) catch |err| {
-                        log.warn("switchProps failed: {s}", .{@errorName(err)});
+            .print => self.appendCodepoint(value.cp) catch |err| {
+                log.warn("appendCodepoint failed: {s}", .{@errorName(err)});
+            },
+            .print_slice => {
+                for (value.cps) |cp| {
+                    self.appendCodepoint(@intCast(cp)) catch |err| {
+                        log.warn("appendCodepoint failed: {s}", .{@errorName(err)});
                         return;
                     };
                 }
-                self.appendCodepoint(value.cp) catch |err| {
-                    log.warn("appendCodepoint failed: {s}", .{@errorName(err)});
-                };
             },
 
             // C0 controls — pass through so comint's carriage-motion
@@ -257,28 +213,32 @@ const Handler = struct {
                 log.warn("BEL passthrough failed: {s}", .{@errorName(err)});
             },
 
-            .set_attribute => self.applyAttr(value),
+            .set_attribute => {
+                self.closePending() catch |err| {
+                    log.warn("closePending before start_hyperlink failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                self.applyAttr(value);
+            },
 
             .start_hyperlink => {
                 self.closePending() catch |err| {
                     log.warn("closePending before start_hyperlink failed: {s}", .{@errorName(err)});
                     return;
                 };
-                if (self.link_uri) |old| self.alloc.free(old);
-                self.link_uri = self.alloc.dupe(u8, value.uri) catch |err| blk: {
+                if (self.hyperlink) |old| self.alloc.free(old);
+                self.hyperlink = self.alloc.dupe(u8, value.uri) catch |err| blk: {
                     log.warn("start_hyperlink dupe failed: {s}", .{@errorName(err)});
                     break :blk null;
                 };
-                self.pending_props = self.currentProps();
             },
             .end_hyperlink => {
                 self.closePending() catch |err| {
                     log.warn("closePending before end_hyperlink failed: {s}", .{@errorName(err)});
                     return;
                 };
-                if (self.link_uri) |old| self.alloc.free(old);
-                self.link_uri = null;
-                self.pending_props = self.currentProps();
+                if (self.hyperlink) |old| self.alloc.free(old);
+                self.hyperlink = null;
             },
 
             .report_pwd => {
@@ -330,7 +290,6 @@ pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
     h.text_chars = 0;
     h.clearRuns();
     h.pending_start = 0;
-    h.pending_props = h.currentProps();
 
     h.env = env;
     defer h.env = null;
@@ -341,21 +300,23 @@ pub fn feed(self: *Self, env: emacs.Env, data: []const u8) !emacs.Value {
     const text_val = env.makeString(h.text.items);
     const s = &emacs.sym;
 
-    for (h.runs.items) |run| {
+    for (h.runs.items) |*run| {
         const start_val = env.makeInteger(@intCast(run.start));
         const end_val = env.makeInteger(@intCast(run.end));
 
-        if (try style_face.buildFacePlist(env, run.props)) |face| {
+        const face = try style_face.buildFacePlist(env, &run.style, &h.palette, h.bold_config);
+        if (face) |f| {
             _ = env.f("put-text-property", .{
                 start_val,
                 end_val,
                 s.face,
-                face,
+                f,
                 text_val,
             });
         }
-        if (run.props.hyperlink) |link| {
-            const uri_val = env.makeString(link.uri);
+
+        if (run.hyperlink) |link| {
+            const uri_val = env.makeString(link);
             _ = env.f("put-text-property", .{
                 start_val,
                 end_val,
@@ -465,7 +426,7 @@ pub const emacs_functions = [_]emacs.FunctionEntry{
                 var idx: usize = 0;
                 while (idx < 16) : (idx += 1) {
                     const pos = idx * 7;
-                    palette16[idx] = try parseHexColor(colors_str[pos .. pos + 7]);
+                    palette16[idx] = try gt.color.RGB.parse(colors_str[pos .. pos + 7]);
                 }
                 filter.setPalette16(palette16);
                 return env.t();
